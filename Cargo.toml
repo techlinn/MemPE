@@ -1,0 +1,29 @@
+[package]
+name = "mempe"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Windows PE memory dumper and rebuilder for reverse engineering"
+
+[dependencies]
+pelite = { version = "0.10.0", default-features = false, features = ["std"] }
+windows = { version = "0.62.2", default-features = false, features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ProcessSnapshotting",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Console",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"
