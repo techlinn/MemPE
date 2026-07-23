@@ -22,9 +22,15 @@ pub(crate) struct OutputPlan {
     policy: CollisionPolicy,
 }
 
-pub(crate) struct OutputFile {
+pub(crate) struct OutputFile<T> {
     pub(crate) preferred_name: String,
     pub(crate) bytes: Vec<u8>,
+    pub(crate) context: T,
+}
+
+pub(crate) struct WrittenFile<T> {
+    pub(crate) path: PathBuf,
+    pub(crate) context: T,
 }
 
 struct TempFile {
@@ -80,7 +86,7 @@ impl OutputPlan {
         &self.directory
     }
 
-    pub(crate) fn write_all(&self, files: Vec<OutputFile>) -> AppResult<Vec<PathBuf>> {
+    pub(crate) fn write_all<T>(&self, files: Vec<OutputFile<T>>) -> AppResult<Vec<WrittenFile<T>>> {
         if files.is_empty() {
             return Ok(Vec::new());
         }
@@ -105,11 +111,11 @@ impl OutputPlan {
                         temp_file.final_path.display()
                     ))
                 })?;
-            staged.push(temp_file);
+            staged.push((temp_file, file.context));
         }
 
         let mut written = Vec::with_capacity(staged.len());
-        for file in &mut staged {
+        for (mut file, context) in staged {
             if file.final_path.exists() {
                 if file.final_path.is_dir() {
                     return Err(AppError::new(format!(
@@ -133,12 +139,15 @@ impl OutputPlan {
                 ))
             })?;
             file.saved = true;
-            written.push(file.final_path.clone());
+            written.push(WrittenFile {
+                path: file.final_path.clone(),
+                context,
+            });
         }
         Ok(written)
     }
 
-    fn destinations(&self, files: &[OutputFile]) -> AppResult<Vec<PathBuf>> {
+    fn destinations<T>(&self, files: &[OutputFile<T>]) -> AppResult<Vec<PathBuf>> {
         let mut used = HashSet::with_capacity(files.len());
         let mut destinations = Vec::with_capacity(files.len());
         for file in files {
@@ -282,7 +291,10 @@ fn suffixed_name(name: &str, suffix: u32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{clean_name, suffixed_name};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{CollisionPolicy, OutputFile, OutputPlan, clean_name, suffixed_name};
 
     #[test]
     fn cleans_windows_names() -> Result<(), Box<dyn std::error::Error>> {
@@ -295,5 +307,39 @@ mod tests {
     fn suffix_stays_before_extension() {
         assert_eq!(suffixed_name("kernel32.dll", 2), "kernel32_2.dll");
         assert_eq!(suffixed_name("module", 3), "module_3");
+    }
+
+    #[test]
+    fn preserves_context_through_writes() -> Result<(), Box<dyn std::error::Error>> {
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("mempe-output-test-{}-{unique}", std::process::id()));
+        fs::create_dir(&directory)?;
+        let plan = OutputPlan {
+            directory: directory.clone(),
+            policy: CollisionPolicy::Rename,
+        };
+        let files = vec![
+            OutputFile {
+                preferred_name: "first.exe".to_owned(),
+                bytes: vec![1],
+                context: 41u32,
+            },
+            OutputFile {
+                preferred_name: "second.dll".to_owned(),
+                bytes: vec![2],
+                context: 42u32,
+            },
+        ];
+
+        let written = plan.write_all(files)?;
+
+        assert_eq!(written.len(), 2);
+        assert_eq!(written[0].context, 41);
+        assert_eq!(written[1].context, 42);
+        assert_eq!(fs::read(&written[0].path)?, [1]);
+        assert_eq!(fs::read(&written[1].path)?, [2]);
+        fs::remove_dir_all(directory)?;
+        Ok(())
     }
 }

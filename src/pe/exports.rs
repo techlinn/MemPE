@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
+use crate::pe::image;
 use crate::pe::parse::parse_memory_image;
+use crate::pe::{PeImage, Rva};
 
 const EXPORT_DIRECTORY: usize = 0;
 const EXPORT_HEADER_SIZE: usize = 40;
@@ -86,8 +88,8 @@ impl ExportIndex {
 }
 
 pub(crate) fn embedded_module_name(bytes: &[u8]) -> Option<String> {
-    let model = parse_memory_image(bytes).ok()?;
-    let (rva, size) = directory(bytes, &model, EXPORT_DIRECTORY)?;
+    let image = parse_memory_image(bytes).ok()?;
+    let (rva, size) = directory(&image, EXPORT_DIRECTORY)?;
     if size < EXPORT_HEADER_SIZE as u32 {
         return None;
     }
@@ -98,8 +100,9 @@ pub(crate) fn embedded_module_name(bytes: &[u8]) -> Option<String> {
 }
 
 fn parse_exports(base: usize, bytes: &[u8], fallback_name: Option<&str>) -> Option<ParsedExports> {
-    let model = parse_memory_image(bytes).ok()?;
-    let (directory_rva, directory_size) = directory(bytes, &model, EXPORT_DIRECTORY)?;
+    let image = parse_memory_image(bytes).ok()?;
+    let model = image.model();
+    let (directory_rva, directory_size) = directory(&image, EXPORT_DIRECTORY)?;
     if directory_size < EXPORT_HEADER_SIZE as u32 {
         return None;
     }
@@ -166,7 +169,7 @@ fn parse_exports(base: usize, bytes: &[u8], fallback_name: Option<&str>) -> Opti
                 }
                 continue;
             }
-            if function_rva < model.image_size
+            if function_rva < model.image_size()
                 && let Some(address) = base.checked_add(function_rva as usize)
             {
                 direct.push((address, symbol));
@@ -285,16 +288,9 @@ fn normalize_module(name: &str) -> String {
     }
 }
 
-fn directory(bytes: &[u8], model: &crate::pe::PeModel, index: usize) -> Option<(u32, u32)> {
-    if index >= model.directory_count {
-        return None;
-    }
-    let offset = model
-        .data_directory_offset
-        .checked_add(index.checked_mul(8)?)?;
-    let rva = read_u32(bytes, offset)?;
-    let size = read_u32(bytes, offset.checked_add(4)?)?;
-    (rva != 0 && size != 0).then_some((rva, size))
+fn directory(image: &PeImage<'_>, index: usize) -> Option<(u32, u32)> {
+    let directory = image.directory(index).ok()??;
+    Some((directory.rva().get(), directory.size()))
 }
 
 fn checked_array(bytes: &[u8], offset: usize, count: usize, width: usize) -> Option<()> {
@@ -303,28 +299,16 @@ fn checked_array(bytes: &[u8], offset: usize, count: usize, width: usize) -> Opt
 }
 
 fn read_ascii(bytes: &[u8], offset: usize) -> Option<String> {
-    let tail = bytes.get(offset..)?;
-    let length = tail
-        .iter()
-        .take(MAX_EXPORT_NAME)
-        .position(|byte| *byte == 0)?;
-    if length == 0 {
-        return None;
-    }
-    let value = tail.get(..length)?;
-    value
-        .is_ascii()
-        .then(|| String::from_utf8_lossy(value).into_owned())
+    let rva = u32::try_from(offset).ok().map(Rva)?;
+    image::read_ascii(bytes, rva, MAX_EXPORT_NAME).map(str::to_owned)
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
-    let value = bytes.get(offset..offset.checked_add(2)?)?;
-    Some(u16::from_le_bytes([value[0], value[1]]))
+    image::read_u16(bytes, offset).ok()
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
-    let value = bytes.get(offset..offset.checked_add(4)?)?;
-    Some(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
+    image::read_u32(bytes, offset).ok()
 }
 
 #[cfg(test)]

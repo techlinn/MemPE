@@ -1,4 +1,5 @@
-use crate::pe::{PeKind, PeModel, Rva, SectionModel};
+use crate::pe::image::{checked_add, read_u16, read_u32, require_range};
+use crate::pe::{PeImage, PeKind, PeModel, Rva, SectionModel};
 use crate::{AppError, AppResult};
 
 const DOS_MAGIC: u16 = 0x5A4D;
@@ -14,7 +15,7 @@ const MAX_SECTIONS: usize = 128;
 const MAX_IMAGE_SIZE: usize = 1024 * 1024 * 1024;
 const MAX_SALVAGE_SCAN: usize = 1024 * 1024;
 
-pub(super) fn parse_memory_image(bytes: &[u8]) -> AppResult<PeModel> {
+pub(super) fn parse_memory_image(bytes: &[u8]) -> AppResult<PeImage<'_>> {
     if bytes.len() < 64 {
         return Err(AppError::new("captured image is smaller than a DOS header"));
     }
@@ -27,7 +28,7 @@ pub(super) fn parse_memory_image(bytes: &[u8]) -> AppResult<PeModel> {
     };
     let normal_error = if normal_offset != usize::MAX {
         match parse_candidate(bytes, normal_offset, false, true) {
-            Ok(model) => return Ok(model),
+            Ok(model) => return Ok(PeImage::new(bytes, model)),
             Err(error) => error.to_string(),
         }
     } else {
@@ -40,7 +41,7 @@ pub(super) fn parse_memory_image(bytes: &[u8]) -> AppResult<PeModel> {
             continue;
         }
         if let Ok(model) = parse_candidate(bytes, offset, true, true) {
-            return Ok(model);
+            return Ok(PeImage::new(bytes, model));
         }
     }
 
@@ -255,35 +256,9 @@ fn validate_non_overlapping_sections(sections: &[SectionModel]) -> AppResult<()>
     Ok(())
 }
 
-fn read_u16(bytes: &[u8], offset: usize) -> AppResult<u16> {
-    let value = bytes
-        .get(offset..offset.saturating_add(2))
-        .ok_or_else(|| AppError::new("PE field lies outside the captured image"))?;
-    Ok(u16::from_le_bytes([value[0], value[1]]))
-}
-
-fn read_u32(bytes: &[u8], offset: usize) -> AppResult<u32> {
-    let value = bytes
-        .get(offset..offset.saturating_add(4))
-        .ok_or_else(|| AppError::new("PE field lies outside the captured image"))?;
-    Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
-}
-
 fn peek_u32(bytes: &[u8], offset: usize) -> u32 {
     let Some(value) = bytes.get(offset..offset.saturating_add(4)) else {
         return 0;
     };
     u32::from_le_bytes([value[0], value[1], value[2], value[3]])
-}
-
-fn require_range(bytes: &[u8], offset: usize, length: usize) -> AppResult<()> {
-    bytes
-        .get(offset..offset.saturating_add(length))
-        .map(|_| ())
-        .ok_or_else(|| AppError::new("PE structure lies outside the captured image"))
-}
-
-fn checked_add(left: usize, right: usize, field: &str) -> AppResult<usize> {
-    left.checked_add(right)
-        .ok_or_else(|| AppError::new(format!("{field} offset overflowed")))
 }

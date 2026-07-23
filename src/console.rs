@@ -81,16 +81,12 @@ impl Console {
 }
 
 fn enable_color(handle_name: windows::Win32::System::Console::STD_HANDLE) -> bool {
-    // SAFETY: The standard handle name is a Windows constant. The returned handle is only passed
-    // to console mode functions and is not closed because this code does not own it.
     let Ok(handle) = (unsafe { GetStdHandle(handle_name) }) else {
         return false;
     };
     let mut mode = Default::default();
-    // SAFETY: `mode` points to writable memory for the duration of this call.
     if unsafe { GetConsoleMode(handle, &mut mode) }.is_err() {
         return false;
     }
-    // SAFETY: `handle` was accepted by GetConsoleMode and the new mode only adds VT output.
     unsafe { SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) }.is_ok()
 }

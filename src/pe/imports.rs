@@ -1,5 +1,6 @@
 use crate::pe::exports::{ExportIndex, ResolvedExport};
-use crate::pe::{PeKind, PeModel};
+use crate::pe::image;
+use crate::pe::{PeImage, PeKind, Rva};
 
 const IMPORT_DIRECTORY: usize = 1;
 const IAT_DIRECTORY: usize = 12;
@@ -32,47 +33,48 @@ pub(super) struct ImportPlan {
 }
 
 pub(super) fn analyze(
-    memory: &[u8],
+    image: &PeImage<'_>,
     observed_base: usize,
-    model: &PeModel,
     exports: &ExportIndex,
 ) -> ImportPlan {
-    if existing_imports_are_valid(memory, model) {
+    let memory = image.bytes();
+    let model = image.model();
+    if existing_imports_are_valid(image) {
         return ImportPlan {
             existing_valid: true,
             ..ImportPlan::default()
         };
     }
     let mut plan = ImportPlan::default();
-    let declared_iat = directory(memory, model, IAT_DIRECTORY)
+    let declared_iat = directory(image, IAT_DIRECTORY)
         .and_then(|(rva, size)| rva.checked_add(size).map(|end| (rva, end)));
-    for section in &model.sections {
-        if section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0
-            || section.characteristics & (IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE) == 0
+    for section in model.sections() {
+        if section.characteristics() & IMAGE_SCN_MEM_EXECUTE != 0
+            || section.characteristics() & (IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE) == 0
         {
             continue;
         }
-        let section_start = section.virtual_address.get();
-        let section_end = section_start.saturating_add(section.virtual_size.max(section.raw_size));
+        let section_start = section.virtual_address().get();
+        let section_end = section_start.saturating_add(section.span());
         let trusted_range = declared_iat
             .and_then(|(start, end)| {
                 let overlap_start = start.max(section_start);
                 let overlap_end = end.min(section_end);
                 (overlap_start < overlap_end).then_some((overlap_start, overlap_end))
             })
-            .or_else(|| is_import_section(&section.name).then_some((section_start, section_end)));
+            .or_else(|| is_import_section(section.name()).then_some((section_start, section_end)));
         let Some((trusted_start, trusted_end)) = trusted_range else {
             continue;
         };
         let start = trusted_start as usize;
-        let length = section.virtual_size.max(section.raw_size) as usize;
+        let length = section.span() as usize;
         let end = (trusted_end as usize)
             .min((section_start as usize).saturating_add(length))
             .min(memory.len());
         scan_section(
             memory,
             observed_base,
-            model.kind,
+            model.kind(),
             exports,
             start,
             end,
@@ -244,8 +246,10 @@ fn decode_x86_thunk(memory: &[u8], base: usize, rva: usize) -> Option<usize> {
     None
 }
 
-fn existing_imports_are_valid(memory: &[u8], model: &PeModel) -> bool {
-    let Some((directory_rva, directory_size)) = directory(memory, model, IMPORT_DIRECTORY) else {
+fn existing_imports_are_valid(image: &PeImage<'_>) -> bool {
+    let memory = image.bytes();
+    let model = image.model();
+    let Some((directory_rva, directory_size)) = directory(image, IMPORT_DIRECTORY) else {
         return false;
     };
     if directory_size < IMPORT_DESCRIPTOR_SIZE as u32 {
@@ -276,7 +280,7 @@ fn existing_imports_are_valid(memory: &[u8], model: &PeModel) -> bool {
             return false;
         };
         if read_ascii(memory, name_rva as usize).is_none()
-            || !thunk_table_is_valid(memory, model.kind, original_thunk, first_thunk)
+            || !thunk_table_is_valid(memory, model.kind(), original_thunk, first_thunk)
         {
             return false;
         }
@@ -315,44 +319,27 @@ fn thunk_table_is_valid(memory: &[u8], kind: PeKind, original: u32, first: u32) 
     false
 }
 
-fn directory(bytes: &[u8], model: &PeModel, index: usize) -> Option<(u32, u32)> {
-    if index >= model.directory_count {
-        return None;
-    }
-    let offset = model
-        .data_directory_offset
-        .checked_add(index.checked_mul(8)?)?;
-    let rva = read_u32(bytes, offset)?;
-    let size = read_u32(bytes, offset.checked_add(4)?)?;
-    (rva != 0 && size != 0).then_some((rva, size))
+fn directory(image: &PeImage<'_>, index: usize) -> Option<(u32, u32)> {
+    let directory = image.directory(index).ok()??;
+    Some((directory.rva().get(), directory.size()))
 }
 
 fn read_ascii(bytes: &[u8], offset: usize) -> Option<()> {
-    let tail = bytes.get(offset..)?;
-    let length = tail
-        .iter()
-        .take(MAX_IMPORT_NAME)
-        .position(|byte| *byte == 0)?;
-    (length > 0 && tail.get(..length)?.is_ascii()).then_some(())
+    let rva = u32::try_from(offset).ok().map(Rva)?;
+    image::read_ascii(bytes, rva, MAX_IMPORT_NAME).map(|_| ())
 }
 
 fn read_pointer(bytes: &[u8], offset: usize, width: usize) -> Option<usize> {
-    match width {
-        4 => read_u32(bytes, offset).map(|value| value as usize),
-        8 => {
-            let value = bytes.get(offset..offset.checked_add(8)?)?;
-            usize::try_from(u64::from_le_bytes([
-                value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
-            ]))
-            .ok()
-        }
-        _ => None,
-    }
+    let kind = match width {
+        4 => PeKind::Pe32,
+        8 => PeKind::Pe32Plus,
+        _ => return None,
+    };
+    image::read_pointer(bytes, offset, kind).ok()
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
-    let value = bytes.get(offset..offset.checked_add(4)?)?;
-    Some(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
+    image::read_u32(bytes, offset).ok()
 }
 
 #[cfg(test)]
@@ -371,9 +358,9 @@ mod tests {
         let mut target = fixture_pe64(false);
         put_u64(&mut target, 0x2000, export_base as u64 + 0x1000);
         put_u64(&mut target, 0x2008, export_base as u64 + 0x1010);
-        let model = parse_memory_image(&target)?;
+        let image = parse_memory_image(&target)?;
 
-        let plan = analyze(&target, 0x0000_7FF6_0000_0000, &model, &index);
+        let plan = analyze(&image, 0x0000_7FF6_0000_0000, &index);
 
         assert_eq!(plan.recovered, 2);
         assert_eq!(plan.groups.len(), 1);
@@ -383,6 +370,12 @@ mod tests {
         assert_eq!(rebuilt.imports_rebuilt, 2);
         assert_eq!(rebuilt.section_count, 3);
         assert!(PeFile::from_bytes(&rebuilt.bytes).is_ok());
+        assert!(
+            rebuilt
+                .bytes
+                .windows(8)
+                .any(|window| window == b".mempe\0\0")
+        );
         Ok(())
     }
 

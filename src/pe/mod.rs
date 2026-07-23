@@ -1,4 +1,5 @@
 mod exports;
+mod image;
 mod imports;
 mod parse;
 mod rebuild;
@@ -31,6 +32,17 @@ impl Rva {
     fn get(self) -> u32 {
         self.0
     }
+}
+
+#[derive(Clone, Copy)]
+struct DataDirectory {
+    rva: Rva,
+    size: u32,
+}
+
+struct PeImage<'a> {
+    bytes: &'a [u8],
+    model: PeModel,
 }
 
 struct SectionModel {

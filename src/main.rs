@@ -1,21 +1,18 @@
 mod cli;
 mod console;
+mod dump;
 mod memory;
 mod output;
 mod pe;
 mod process;
 
 use std::fmt::{Display, Formatter};
-use std::fs::File;
-use std::io::Read;
-use std::path::Path;
 use std::process::ExitCode;
 
 use cli::Command;
 use console::Console;
-use memory::{Capture, CapturedImage};
-use output::{OutputFile, OutputPlan};
-use pe::{ExportIndex, ExportStats, PeKind, RebuiltImage};
+use dump::DumpOutcome;
+use output::OutputPlan;
 use process::{ProcessId, TargetProcess};
 
 pub(crate) type AppResult<T> = Result<T, AppError>;
@@ -73,34 +70,9 @@ fn run(console: &Console, command: Command) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    console.section("TARGET");
-    console.field("Name", format_args!("{}", target.name));
-    console.field("PID", format_args!("{}", target.pid.get()));
-    console.field("Arch", format_args!("{}", target.architecture));
-    console.field(
-        "Image",
-        format_args!(
-            "0x{:016X} ({})",
-            target.main_module.base,
-            format_size(target.main_module.size)
-        ),
-    );
-    console.blank();
-
+    render_target(console, &target);
     if watched {
-        match memory::wait_until_stable(&target) {
-            Ok(info) if info.settled => console.success(format_args!(
-                "Memory was stable after {} ms",
-                info.elapsed.as_millis()
-            )),
-            Ok(info) => console.warning(format_args!(
-                "Memory did not settle after {} ms; using the latest state",
-                info.elapsed.as_millis()
-            )),
-            Err(error) => {
-                console.warning(format_args!("Could not check memory stability: {error}"))
-            }
-        }
+        render_stability(console, &target);
     }
 
     let capture = match memory::capture(&target) {
@@ -127,328 +99,193 @@ fn run(console: &Console, command: Command) -> ExitCode {
     finish_dump(console, &output, &target, capture)
 }
 
-struct DumpInfo {
-    base: usize,
-    kind: PeKind,
-    sections: usize,
-    unreadable_pages: usize,
-    salvaged_headers: bool,
-    disk_headers_used: bool,
-    cleared_directories: usize,
-    invalid_unwind_entries: usize,
-    imports_rebuilt: usize,
-    ambiguous_imports: usize,
-    hidden: bool,
-    is_main: bool,
+fn render_target(console: &Console, target: &TargetProcess) {
+    console.section("TARGET");
+    console.field("Name", format_args!("{}", target.name));
+    console.field("PID", format_args!("{}", target.pid.get()));
+    console.field("Arch", format_args!("{}", target.architecture));
+    console.field(
+        "Image",
+        format_args!(
+            "0x{:016X} ({})",
+            target.main_module.base,
+            format_size(target.main_module.size)
+        ),
+    );
+    console.blank();
 }
 
-struct BuiltFiles {
-    files: Vec<OutputFile>,
-    info: Vec<DumpInfo>,
-    failures: Vec<BuildFailure>,
-    main_rebuilt: bool,
-    dll_failures: usize,
-    export_stats: ExportStats,
-}
-
-struct BuildFailure {
-    name: String,
-    base: usize,
-    error: AppError,
+fn render_stability(console: &Console, target: &TargetProcess) {
+    match memory::wait_until_stable(target) {
+        Ok(info) if info.settled => console.success(format_args!(
+            "Memory was stable after {} ms",
+            info.elapsed.as_millis()
+        )),
+        Ok(info) => console.warning(format_args!(
+            "Memory did not settle after {} ms; using the latest state",
+            info.elapsed.as_millis()
+        )),
+        Err(error) => console.warning(format_args!("Could not check memory stability: {error}")),
+    }
 }
 
 fn finish_dump(
     console: &Console,
     output: &OutputPlan,
     target: &TargetProcess,
-    capture: Capture,
+    capture: memory::Capture,
 ) -> ExitCode {
-    let private_count = capture.private_executable_allocations;
-    let hidden_private_images = capture.images.iter().filter(|image| image.hidden).count();
-    let built = build_files(target, capture.images);
-    let paths = match output.write_all(built.files) {
-        Ok(paths) => paths,
+    let outcome = match dump::build(target, capture).write(output) {
+        Ok(outcome) => outcome,
         Err(error) => {
             console.error(format_args!("Could not write mempe: {error}"));
             return ExitCode::from(2);
         }
     };
+    render_output(console, output, &outcome);
+    render_analysis(console, &outcome);
+    render_warnings(console, &outcome);
 
-    let mut total_unreadable_pages = 0usize;
-    let mut total_cleared_directories = 0usize;
-    let mut repaired_headers = 0usize;
-    let mut disk_header_repairs = 0usize;
-    let mut imports_rebuilt = 0usize;
-    let mut ambiguous_imports = 0usize;
-    let mut invalid_unwind_entries = 0usize;
-    let mut hidden_images = 0usize;
-    for info in &built.info {
-        if info.unreadable_pages > 0 {
-            total_unreadable_pages = total_unreadable_pages.saturating_add(info.unreadable_pages);
-        }
-        if info.salvaged_headers {
-            repaired_headers = repaired_headers.saturating_add(1);
-        }
-        if info.disk_headers_used {
-            disk_header_repairs = disk_header_repairs.saturating_add(1);
-        }
-        if info.hidden {
-            hidden_images = hidden_images.saturating_add(1);
-        }
-        imports_rebuilt = imports_rebuilt.saturating_add(info.imports_rebuilt);
-        ambiguous_imports = ambiguous_imports.saturating_add(info.ambiguous_imports);
-        invalid_unwind_entries = invalid_unwind_entries.saturating_add(info.invalid_unwind_entries);
-        total_cleared_directories =
-            total_cleared_directories.saturating_add(info.cleared_directories);
-    }
-
-    let dll_count = built.info.iter().filter(|info| !info.is_main).count();
-    let main = built.info.iter().zip(&paths).find(|(info, _)| info.is_main);
-    console.section("OUTPUT");
-    if let Some((info, path)) = main {
-        console.field("Main", format_args!("{}", path.display()));
-        console.field(
-            "Layout",
-            format_args!(
-                "{}, {} sections, base 0x{:016X}",
-                info.kind, info.sections, info.base
-            ),
-        );
-    }
-    console.field("DLLs", format_args!("{dll_count}"));
-    console.field("Hidden PEs", format_args!("{hidden_images}"));
-    console.field("Folder", format_args!("{}", output.directory().display()));
-    console.blank();
-
-    console.section("ANALYSIS");
-    console.field(
-        "Exports",
-        format_args!(
-            "{} modules, {} addresses",
-            built.export_stats.modules, built.export_stats.addresses
-        ),
-    );
-    console.field(
-        "Forwarders",
-        format_args!("{}", built.export_stats.forwarders),
-    );
-    console.field("Imports", format_args!("{imports_rebuilt} recovered"));
-    console.field(
-        "Private",
-        format_args!("{private_count} executable regions"),
-    );
-
-    let has_warnings = total_unreadable_pages > 0
-        || total_cleared_directories > 0
-        || repaired_headers > 0
-        || disk_header_repairs > 0
-        || ambiguous_imports > 0
-        || invalid_unwind_entries > 0
-        || built.export_stats.unresolved_forwarders > 0
-        || !built.failures.is_empty();
-    if has_warnings {
-        console.blank();
-        console.section("WARNINGS");
-    }
-    if total_unreadable_pages > 0 {
-        console.warning(format_args!(
-            "{total_unreadable_pages} unreadable pages were zero-filled"
-        ));
-    }
-    if total_cleared_directories > 0 {
-        console.warning(format_args!(
-            "{total_cleared_directories} invalid or file-only directories were cleared"
-        ));
-    }
-    if repaired_headers > 0 {
-        console.warning(format_args!(
-            "{repaired_headers} damaged PE headers were repaired"
-        ));
-    }
-    if disk_header_repairs > 0 {
-        console.warning(format_args!(
-            "{disk_header_repairs} images used disk headers; section data came from memory"
-        ));
-    }
-    if ambiguous_imports > 0 {
-        console.warning(format_args!(
-            "{ambiguous_imports} ambiguous import pointers were skipped"
-        ));
-    }
-    if invalid_unwind_entries > 0 {
-        console.warning(format_args!(
-            "{invalid_unwind_entries} invalid x64 unwind entries were removed"
-        ));
-    }
-    if built.export_stats.unresolved_forwarders > 0 {
-        console.warning(format_args!(
-            "{} forwarded exports did not match a loaded image",
-            built.export_stats.unresolved_forwarders
-        ));
-    }
-    for failure in &built.failures {
-        console.warning(format_args!(
-            "Could not rebuild {} at 0x{:016X}: {}",
-            failure.name, failure.base, failure.error
-        ));
-    }
-    if private_count > hidden_private_images {
-        console.warning(format_args!(
-            "{} executable private regions did not contain a full PE",
-            private_count.saturating_sub(hidden_private_images)
-        ));
-    }
-
-    if built.main_rebuilt && built.dll_failures == 0 {
+    if outcome.is_complete() {
         console.done(format_args!("Analysis-ready memory images"));
         ExitCode::SUCCESS
     } else {
         console.partial(format_args!(
             "Main rebuilt: {}; DLL failures: {}",
-            built.main_rebuilt, built.dll_failures
+            outcome.main_rebuilt(),
+            outcome.dll_failures()
         ));
         ExitCode::from(3)
     }
 }
 
-fn build_files(target: &TargetProcess, mut images: Vec<CapturedImage>) -> BuiltFiles {
-    images.sort_unstable_by_key(|image| (!image.is_main, image.base));
-    for image in &mut images {
-        if image.name.is_none() {
-            image.name = pe::embedded_module_name(&image.bytes);
-        }
-    }
-    let exports = ExportIndex::build(
-        images
-            .iter()
-            .map(|image| (image.base, image.bytes.as_slice(), image.name.as_deref())),
-    );
-    let export_stats = exports.stats();
-    let captured_bases = images.iter().map(|image| image.base).collect::<Vec<_>>();
-    let mut files = Vec::with_capacity(images.len());
-    let mut info = Vec::with_capacity(images.len());
-    let mut failures = Vec::new();
-    let mut main_rebuilt = false;
-    let mut dll_failures = target
-        .modules
+fn render_output(console: &Console, output: &OutputPlan, outcome: &DumpOutcome) {
+    console.section("OUTPUT");
+    if let Some(main) = outcome
+        .artifacts
         .iter()
-        .filter(|module| {
-            module.base != target.main_module.base && !captured_bases.contains(&module.base)
-        })
-        .count();
-
-    for image in images {
-        let known_module = image.name.is_some();
-        match rebuild_image(&image, &exports) {
-            Ok(rebuilt) if image.is_main || image.hidden || rebuilt.is_dll || known_module => {
-                let preferred_name = output_name(target, &image, &rebuilt);
-                main_rebuilt |= image.is_main;
-                info.push(DumpInfo {
-                    base: image.base,
-                    kind: rebuilt.kind,
-                    sections: rebuilt.section_count,
-                    unreadable_pages: image.unreadable_pages,
-                    salvaged_headers: rebuilt.salvaged_headers,
-                    disk_headers_used: rebuilt.disk_headers_used,
-                    cleared_directories: rebuilt.cleared_directories,
-                    invalid_unwind_entries: rebuilt.invalid_unwind_entries,
-                    imports_rebuilt: rebuilt.imports_rebuilt,
-                    ambiguous_imports: rebuilt.ambiguous_imports,
-                    hidden: image.hidden,
-                    is_main: image.is_main,
-                });
-                files.push(OutputFile {
-                    preferred_name,
-                    bytes: rebuilt.bytes,
-                });
-            }
-            Ok(_) => {}
-            Err(error) if image.is_main => {
-                failures.push(BuildFailure {
-                    name: target.name.clone(),
-                    base: image.base,
-                    error,
-                });
-            }
-            Err(error) if image.hidden => {
-                failures.push(BuildFailure {
-                    name: "hidden PE".to_owned(),
-                    base: image.base,
-                    error,
-                });
-            }
-            Err(error) if known_module => {
-                let name = image.name.as_deref().unwrap_or("unknown.dll");
-                failures.push(BuildFailure {
-                    name: name.to_owned(),
-                    base: image.base,
-                    error,
-                });
-                dll_failures = dll_failures.saturating_add(1);
-            }
-            Err(_) => {}
-        }
+        .find(|artifact| artifact.context.is_main)
+    {
+        console.field("Main", format_args!("{}", main.path.display()));
+        console.field(
+            "Layout",
+            format_args!(
+                "{}, {} sections, base 0x{:016X}",
+                main.context.kind, main.context.sections, main.context.base
+            ),
+        );
     }
+    console.field("DLLs", format_args!("{}", outcome.summary.dlls));
+    console.field(
+        "Hidden PEs",
+        format_args!("{}", outcome.summary.hidden_images),
+    );
+    console.field("Folder", format_args!("{}", output.directory().display()));
+    console.blank();
+}
 
-    BuiltFiles {
-        files,
-        info,
-        failures,
-        main_rebuilt,
-        dll_failures,
-        export_stats,
+fn render_analysis(console: &Console, outcome: &DumpOutcome) {
+    console.section("ANALYSIS");
+    console.field(
+        "Exports",
+        format_args!(
+            "{} modules, {} addresses",
+            outcome.export_stats.modules, outcome.export_stats.addresses
+        ),
+    );
+    console.field(
+        "Forwarders",
+        format_args!("{}", outcome.export_stats.forwarders),
+    );
+    console.field(
+        "Imports",
+        format_args!("{} recovered", outcome.summary.imports_rebuilt),
+    );
+    console.field(
+        "Private",
+        format_args!(
+            "{} executable regions",
+            outcome.private_executable_allocations
+        ),
+    );
+}
+
+fn render_warnings(console: &Console, outcome: &DumpOutcome) {
+    if !outcome.has_warnings() {
+        return;
+    }
+    console.blank();
+    console.section("WARNINGS");
+    render_repair_warnings(console, outcome);
+    render_import_warnings(console, outcome);
+    render_build_failures(console, outcome);
+    let missed_private = outcome
+        .private_executable_allocations
+        .saturating_sub(outcome.hidden_private_images);
+    if missed_private > 0 {
+        console.warning(format_args!(
+            "{missed_private} executable private regions did not contain a full PE"
+        ));
     }
 }
 
-fn rebuild_image(image: &CapturedImage, exports: &ExportIndex) -> AppResult<RebuiltImage> {
-    match pe::rebuild(&image.bytes, image.base, None, exports) {
-        Ok(rebuilt) => Ok(rebuilt),
-        Err(memory_error) => {
-            let Some(path) = &image.path else {
-                return Err(memory_error);
-            };
-            let disk_headers = read_disk_headers(path).map_err(|disk_error| {
-                AppError::new(format!(
-                    "{memory_error}; could not read disk headers from {}: {disk_error}",
-                    path.display()
-                ))
-            })?;
-            pe::rebuild(&image.bytes, image.base, Some(&disk_headers), exports)
-        }
+fn render_repair_warnings(console: &Console, outcome: &DumpOutcome) {
+    let summary = &outcome.summary;
+    if summary.unreadable_pages > 0 {
+        console.warning(format_args!(
+            "{} unreadable pages were zero-filled",
+            summary.unreadable_pages
+        ));
+    }
+    if summary.cleared_directories > 0 {
+        console.warning(format_args!(
+            "{} invalid or file-only directories were cleared",
+            summary.cleared_directories
+        ));
+    }
+    if summary.repaired_headers > 0 {
+        console.warning(format_args!(
+            "{} damaged PE headers were repaired",
+            summary.repaired_headers
+        ));
+    }
+    if summary.disk_header_repairs > 0 {
+        console.warning(format_args!(
+            "{} images used disk headers; section data came from memory",
+            summary.disk_header_repairs
+        ));
     }
 }
 
-fn read_disk_headers(path: &Path) -> AppResult<Vec<u8>> {
-    const MAX_DISK_HEADER_BYTES: u64 = 1024 * 1024;
-    let file = File::open(path)
-        .map_err(|error| AppError::new(format!("cannot open {}: {error}", path.display())))?;
-    let mut bytes = Vec::with_capacity(MAX_DISK_HEADER_BYTES as usize);
-    file.take(MAX_DISK_HEADER_BYTES)
-        .read_to_end(&mut bytes)
-        .map_err(|error| AppError::new(format!("cannot read {}: {error}", path.display())))?;
-    Ok(bytes)
-}
-
-fn output_name(target: &TargetProcess, image: &CapturedImage, rebuilt: &RebuiltImage) -> String {
-    if image.is_main {
-        return with_extension(&target.name, "exe");
+fn render_import_warnings(console: &Console, outcome: &DumpOutcome) {
+    let summary = &outcome.summary;
+    if summary.ambiguous_imports > 0 {
+        console.warning(format_args!(
+            "{} ambiguous import pointers were skipped",
+            summary.ambiguous_imports
+        ));
     }
-    let fallback = format!("module-{:016X}.dll", image.base);
-    let name = image.name.as_deref().unwrap_or(&fallback);
-    if rebuilt.is_dll {
-        with_extension(name, "dll")
-    } else {
-        with_extension(name, "exe")
+    if summary.invalid_unwind_entries > 0 {
+        console.warning(format_args!(
+            "{} invalid x64 unwind entries were removed",
+            summary.invalid_unwind_entries
+        ));
+    }
+    if outcome.export_stats.unresolved_forwarders > 0 {
+        console.warning(format_args!(
+            "{} forwarded exports did not match a loaded image",
+            outcome.export_stats.unresolved_forwarders
+        ));
     }
 }
 
-fn with_extension(name: &str, extension: &str) -> String {
-    let mut path = Path::new(name).to_path_buf();
-    path.set_extension(extension);
-    path.file_name()
-        .and_then(|value| value.to_str())
-        .map(str::to_owned)
-        .unwrap_or_else(|| format!("dump.{extension}"))
+fn render_build_failures(console: &Console, outcome: &DumpOutcome) {
+    for failure in &outcome.failures {
+        console.warning(format_args!(
+            "Could not rebuild {} at 0x{:016X}: {}",
+            failure.name, failure.base, failure.error
+        ));
+    }
 }
 
 fn find_target(console: &Console, command: Command) -> AppResult<TargetProcess> {

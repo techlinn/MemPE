@@ -97,6 +97,18 @@ struct Snapshot {
     clone: HANDLE,
 }
 
+enum AddressSpace {
+    Snapshot(Snapshot),
+    Live(OwnedHandle),
+}
+
+struct AcquiredAddressSpace {
+    space: AddressSpace,
+    mode: AcquisitionMode,
+    setup_elapsed: Duration,
+    fallback_reason: Option<String>,
+}
+
 impl Snapshot {
     fn capture(target: &TargetProcess) -> AppResult<(Self, Duration)> {
         let process = OwnedHandle::open(
@@ -109,8 +121,6 @@ impl Snapshot {
             | PSS_CREATE_USE_VM_ALLOCATIONS;
         let started = Instant::now();
         let mut snapshot = HPSS::default();
-        // SAFETY: process is a valid owned process handle, snapshot points to writable storage,
-        // and no thread context is requested by the selected capture flags.
         let status = unsafe { PssCaptureSnapshot(process.raw(), flags, None, &mut snapshot) };
         if status != ERROR_SUCCESS.0 {
             return Err(win32_status("PssCaptureSnapshot", status));
@@ -120,8 +130,6 @@ impl Snapshot {
         let mut clone = PSS_VA_CLONE_INFORMATION::default();
         let buffer_length = u32::try_from(size_of::<PSS_VA_CLONE_INFORMATION>())
             .map_err(|_| AppError::new("PSS clone information size does not fit u32"))?;
-        // SAFETY: snapshot is valid after a successful capture and clone is writable for the
-        // exact structure size passed to Windows.
         let query_status = unsafe {
             PssQuerySnapshot(
                 snapshot,
@@ -131,7 +139,6 @@ impl Snapshot {
             )
         };
         if query_status != ERROR_SUCCESS.0 || clone.VaCloneHandle.is_invalid() {
-            // SAFETY: snapshot was successfully created in this process and has not been freed.
             let _free_status = unsafe { PssFreeSnapshot(GetCurrentProcess(), snapshot) };
             if query_status != ERROR_SUCCESS.0 {
                 return Err(win32_status("PssQuerySnapshot", query_status));
@@ -152,49 +159,74 @@ impl Snapshot {
 
 impl Drop for Snapshot {
     fn drop(&mut self) {
-        // SAFETY: handle is a live snapshot descriptor created in this process and is freed once.
         let status = unsafe { PssFreeSnapshot(GetCurrentProcess(), self.handle) };
         debug_assert_eq!(status, ERROR_SUCCESS.0);
     }
 }
 
-pub(crate) fn capture(target: &TargetProcess) -> AppResult<Capture> {
-    match Snapshot::capture(target) {
-        Ok((snapshot, elapsed)) => {
-            let (images, private_count) = capture_from_handle(snapshot.clone, target)?;
-            Ok(Capture {
+impl AddressSpace {
+    fn acquire(target: &TargetProcess) -> AppResult<AcquiredAddressSpace> {
+        match Snapshot::capture(target) {
+            Ok((snapshot, setup_elapsed)) => Ok(AcquiredAddressSpace {
+                space: Self::Snapshot(snapshot),
                 mode: AcquisitionMode::PssClone,
-                setup_elapsed: elapsed,
+                setup_elapsed,
                 fallback_reason: None,
-                images,
-                private_executable_allocations: private_count,
-            })
+            }),
+            Err(snapshot_error) => {
+                let started = Instant::now();
+                let process =
+                    OwnedHandle::open(target.pid, PROCESS_QUERY_INFORMATION | PROCESS_VM_READ)?;
+                Ok(AcquiredAddressSpace {
+                    space: Self::Live(process),
+                    mode: AcquisitionMode::LiveRead,
+                    setup_elapsed: started.elapsed(),
+                    fallback_reason: Some(snapshot_error.to_string()),
+                })
+            }
         }
-        Err(snapshot_error) => {
-            let started = Instant::now();
-            let process =
-                OwnedHandle::open(target.pid, PROCESS_QUERY_INFORMATION | PROCESS_VM_READ)?;
-            let elapsed = started.elapsed();
-            let (images, private_count) = capture_from_handle(process.raw(), target)?;
-            Ok(Capture {
-                mode: AcquisitionMode::LiveRead,
-                setup_elapsed: elapsed,
-                fallback_reason: Some(snapshot_error.to_string()),
-                images,
-                private_executable_allocations: private_count,
-            })
+    }
+
+    fn open_live(target: &TargetProcess) -> AppResult<Self> {
+        OwnedHandle::open(target.pid, PROCESS_QUERY_INFORMATION | PROCESS_VM_READ).map(Self::Live)
+    }
+
+    fn handle(&self) -> HANDLE {
+        match self {
+            Self::Snapshot(snapshot) => snapshot.clone,
+            Self::Live(process) => process.raw(),
         }
+    }
+
+    fn regions(&self) -> AppResult<Vec<MemoryRegion>> {
+        list_regions(self.handle())
+    }
+
+    fn read_exact(&self, address: usize, destination: &mut [u8]) -> bool {
+        read_exact(self.handle(), address, destination)
     }
 }
 
+pub(crate) fn capture(target: &TargetProcess) -> AppResult<Capture> {
+    let acquired = AddressSpace::acquire(target)?;
+    let (images, private_count) = capture_from_space(&acquired.space, target)?;
+    Ok(Capture {
+        mode: acquired.mode,
+        setup_elapsed: acquired.setup_elapsed,
+        fallback_reason: acquired.fallback_reason,
+        images,
+        private_executable_allocations: private_count,
+    })
+}
+
 pub(crate) fn wait_until_stable(target: &TargetProcess) -> AppResult<StabilityInfo> {
-    let process = OwnedHandle::open(target.pid, PROCESS_QUERY_INFORMATION | PROCESS_VM_READ)?;
+    let space = AddressSpace::open_live(target)?;
     let started = Instant::now();
     let mut previous = None;
     let mut matches = 0usize;
     for _index in 0..STABLE_POLL_COUNT {
-        let regions = list_regions(process.raw())?;
-        let signature = memory_signature(process.raw(), &regions);
+        let regions = space.regions()?;
+        let signature = memory_signature(&space, &regions);
         if previous == Some(signature) {
             matches = matches.saturating_add(1);
             if matches >= STABLE_MATCH_COUNT {
@@ -215,7 +247,7 @@ pub(crate) fn wait_until_stable(target: &TargetProcess) -> AppResult<StabilityIn
     })
 }
 
-fn memory_signature(handle: HANDLE, regions: &[MemoryRegion]) -> u64 {
+fn memory_signature(space: &AddressSpace, regions: &[MemoryRegion]) -> u64 {
     let mut hash = DefaultHasher::new();
     let mut reads = 0usize;
     for region in regions {
@@ -229,7 +261,7 @@ fn memory_signature(handle: HANDLE, regions: &[MemoryRegion]) -> u64 {
         }
         let mut page = [0u8; PAGE_SIZE];
         let length = region.size.min(PAGE_SIZE);
-        if read_exact(handle, region.base, &mut page[..length]) {
+        if space.read_exact(region.base, &mut page[..length]) {
             page[..length].hash(&mut hash);
         } else {
             u64::MAX.hash(&mut hash);
@@ -239,15 +271,15 @@ fn memory_signature(handle: HANDLE, regions: &[MemoryRegion]) -> u64 {
     hash.finish()
 }
 
-fn capture_from_handle(
-    handle: HANDLE,
+fn capture_from_space(
+    space: &AddressSpace,
     target: &TargetProcess,
 ) -> AppResult<(Vec<CapturedImage>, usize)> {
-    let regions = list_regions(handle)?;
+    let regions = space.regions()?;
     let private_allocations = private_executable_allocations(&regions);
     let private_count = private_allocations.len();
     let groups = group_images(&regions, target)?;
-    let hidden = find_hidden_images(handle, &regions, &private_allocations)?;
+    let hidden = find_hidden_images(space, &regions, &private_allocations)?;
     let mut images = Vec::new();
     images
         .try_reserve_exact(groups.len().saturating_add(hidden.len()))
@@ -266,7 +298,7 @@ fn capture_from_handle(
         }
         add_image_size(&mut total_size, size)?;
         images.push(read_image(
-            handle,
+            space,
             target,
             base,
             size,
@@ -277,14 +309,7 @@ fn capture_from_handle(
     for (base, size) in hidden {
         add_image_size(&mut total_size, size)?;
         let image_regions = regions_in_range(&regions, base, size)?;
-        images.push(read_image(
-            handle,
-            target,
-            base,
-            size,
-            &image_regions,
-            true,
-        )?);
+        images.push(read_image(space, target, base, size, &image_regions, true)?);
     }
     if !images.iter().any(|image| image.is_main) {
         return Err(AppError::new(
@@ -311,8 +336,6 @@ fn list_regions(handle: HANDLE) -> AppResult<Vec<MemoryRegion>> {
     let mut address = 0usize;
     for _index in 0..MAX_MEMORY_REGIONS {
         let mut information = MEMORY_BASIC_INFORMATION::default();
-        // SAFETY: handle is valid for querying and information points to writable storage with
-        // the exact size supplied to Windows. address is used only as a remote numeric address.
         let returned = unsafe {
             VirtualQueryEx(
                 handle,
@@ -384,7 +407,7 @@ fn group_images(
 }
 
 fn read_image(
-    handle: HANDLE,
+    space: &AddressSpace,
     target: &TargetProcess,
     base: usize,
     size: usize,
@@ -424,7 +447,7 @@ fn read_image(
             continue;
         }
         unreadable_pages =
-            unreadable_pages.saturating_add(read_region(handle, read_base, destination));
+            unreadable_pages.saturating_add(read_region(space, read_base, destination));
     }
 
     let module = target.modules.iter().find(|module| module.base == base);
@@ -440,7 +463,7 @@ fn read_image(
 }
 
 fn find_hidden_images(
-    handle: HANDLE,
+    space: &AddressSpace,
     regions: &[MemoryRegion],
     executable_allocations: &BTreeSet<usize>,
 ) -> AppResult<Vec<(usize, usize)>> {
@@ -479,7 +502,7 @@ fn find_hidden_images(
                 return Err(AppError::new("private PE scan address overflowed"));
             };
             let mut magic = [0u8; 2];
-            if !read_exact(handle, base, &mut magic) || magic != *b"MZ" {
+            if !space.read_exact(base, &mut magic) || magic != *b"MZ" {
                 continue;
             }
             let Some(allocation_end) = allocation_ends.get(&region.allocation_base).copied() else {
@@ -488,7 +511,7 @@ fn find_hidden_images(
             let available = allocation_end.saturating_sub(base);
             let header_length = available.min(MAX_HEADER_READ);
             let mut header = vec![0u8; header_length];
-            if !read_exact(handle, base, &mut header) {
+            if !space.read_exact(base, &mut header) {
                 continue;
             }
             let Ok(image_size) = crate::pe::memory_image_size(&header) else {
@@ -526,13 +549,13 @@ fn regions_in_range(
         .collect())
 }
 
-fn read_region(handle: HANDLE, base: usize, destination: &mut [u8]) -> usize {
+fn read_region(space: &AddressSpace, base: usize, destination: &mut [u8]) -> usize {
     let mut unreadable_pages = 0usize;
     for (index, chunk) in destination.chunks_mut(READ_CHUNK).enumerate() {
         let offset = index.saturating_mul(READ_CHUNK);
-        if !read_exact(handle, base.saturating_add(offset), chunk) {
+        if !space.read_exact(base.saturating_add(offset), chunk) {
             unreadable_pages = unreadable_pages.saturating_add(read_pages(
-                handle,
+                space,
                 base.saturating_add(offset),
                 chunk,
             ));
@@ -541,11 +564,11 @@ fn read_region(handle: HANDLE, base: usize, destination: &mut [u8]) -> usize {
     unreadable_pages
 }
 
-fn read_pages(handle: HANDLE, base: usize, destination: &mut [u8]) -> usize {
+fn read_pages(space: &AddressSpace, base: usize, destination: &mut [u8]) -> usize {
     let mut unreadable = 0usize;
     for (index, page) in destination.chunks_mut(PAGE_SIZE).enumerate() {
         let offset = index.saturating_mul(PAGE_SIZE);
-        if !read_exact(handle, base.saturating_add(offset), page) {
+        if !space.read_exact(base.saturating_add(offset), page) {
             page.fill(0);
             unreadable = unreadable.saturating_add(1);
         }
@@ -558,8 +581,6 @@ fn read_exact(handle: HANDLE, address: usize, destination: &mut [u8]) -> bool {
         return true;
     }
     let mut read = 0usize;
-    // SAFETY: destination is writable for its full length, handle has VM_READ access, and address
-    // is passed as a numeric address in the remote process rather than dereferenced locally.
     let result = unsafe {
         ReadProcessMemory(
             handle,
@@ -618,4 +639,43 @@ fn is_executable(protect: u32) -> bool {
 fn win32_status(action: &str, status: u32) -> AppError {
     let detail = std::io::Error::from_raw_os_error(status as i32);
     AppError::new(format!("{action} failed: {detail} (error {status})"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MemoryRegion, regions_in_range};
+
+    fn region(base: usize, size: usize) -> MemoryRegion {
+        MemoryRegion {
+            base,
+            allocation_base: base,
+            size,
+            state: 0,
+            protect: 0,
+            kind: 0,
+        }
+    }
+
+    #[test]
+    fn selects_only_regions_overlapping_an_image() -> Result<(), Box<dyn std::error::Error>> {
+        let regions = [
+            region(0x1000, 0x1000),
+            region(0x2000, 0x1000),
+            region(0x3000, 0x1000),
+        ];
+
+        let selected = regions_in_range(&regions, 0x1800, 0x1000)?;
+
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].base, 0x1000);
+        assert_eq!(selected[1].base, 0x2000);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_an_overflowing_image_range() {
+        let result = regions_in_range(&[], usize::MAX, 2);
+
+        assert!(result.is_err());
+    }
 }

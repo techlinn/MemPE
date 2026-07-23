@@ -83,8 +83,6 @@ pub(crate) struct OwnedHandle(HANDLE);
 
 impl OwnedHandle {
     pub(crate) fn open(pid: ProcessId, rights: PROCESS_ACCESS_RIGHTS) -> AppResult<Self> {
-        // SAFETY: The PID and access mask are values, handle inheritance is disabled, and the
-        // returned owned handle is closed by Drop.
         let handle = unsafe { OpenProcess(rights, false, pid.get()) }
             .map_err(|error| windows_error("OpenProcess", error))?;
         Ok(Self(handle))
@@ -97,7 +95,6 @@ impl OwnedHandle {
 
 impl Drop for OwnedHandle {
     fn drop(&mut self) {
-        // SAFETY: OwnedHandle owns a valid Windows handle and closes it only once.
         let result = unsafe { CloseHandle(self.0) };
         debug_assert!(result.is_ok());
     }
@@ -164,7 +161,6 @@ fn list_processes() -> AppResult<Vec<ProcessEntry>> {
         dwSize: size_of::<PROCESSENTRY32W>() as u32,
         ..Default::default()
     };
-    // SAFETY: entry points to writable storage of the required size and snapshot is valid.
     unsafe { Process32FirstW(snapshot.raw(), &mut entry) }
         .map_err(|error| windows_error("Process32FirstW", error))?;
 
@@ -176,7 +172,6 @@ fn list_processes() -> AppResult<Vec<ProcessEntry>> {
                 name: wide_string(&entry.szExeFile),
             });
         }
-        // SAFETY: entry remains writable and snapshot remains valid for this bounded walk.
         match unsafe { Process32NextW(snapshot.raw(), &mut entry) } {
             Ok(()) => {}
             Err(error) if error.code() == ERROR_NO_MORE_FILES.to_hresult() => return Ok(entries),
@@ -187,7 +182,6 @@ fn list_processes() -> AppResult<Vec<ProcessEntry>> {
 }
 
 fn process_snapshot() -> AppResult<OwnedHandle> {
-    // SAFETY: The process ID is ignored for TH32CS_SNAPPROCESS and the returned handle is owned.
     let handle = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }
         .map_err(|error| windows_error("CreateToolhelp32Snapshot(processes)", error))?;
     Ok(OwnedHandle(handle))
@@ -217,7 +211,6 @@ fn find_new_target(
 
 fn wait_until_capture_time(created: u64) {
     let deadline = created.saturating_add(CAPTURE_DELAY_FILETIME);
-    // SAFETY: GetSystemTimePreciseAsFileTime has no pointer parameters or preconditions.
     let now = filetime_value(unsafe { GetSystemTimePreciseAsFileTime() });
     let remaining = deadline.saturating_sub(now);
     if remaining > 0 {
@@ -229,7 +222,6 @@ fn get_path(handle: &OwnedHandle) -> AppResult<PathBuf> {
     let mut buffer = vec![0u16; MAX_PATH_CHARS];
     let mut length = u32::try_from(buffer.len())
         .map_err(|_| AppError::new("process path buffer does not fit the Windows API"))?;
-    // SAFETY: buffer is writable for length UTF-16 code units and length points to valid storage.
     unsafe {
         QueryFullProcessImageNameW(
             handle.raw(),
@@ -253,7 +245,6 @@ fn get_path(handle: &OwnedHandle) -> AppResult<PathBuf> {
 fn get_architecture(handle: &OwnedHandle) -> AppResult<TargetArchitecture> {
     let mut process_machine = IMAGE_FILE_MACHINE_UNKNOWN;
     let mut native_machine = IMAGE_FILE_MACHINE_UNKNOWN;
-    // SAFETY: Both output pointers refer to initialized writable values for the call duration.
     unsafe {
         IsWow64Process2(
             handle.raw(),
@@ -285,7 +276,6 @@ fn get_creation_time(handle: &OwnedHandle) -> AppResult<u64> {
     let mut exited = FILETIME::default();
     let mut kernel = FILETIME::default();
     let mut user = FILETIME::default();
-    // SAFETY: All FILETIME pointers refer to writable values for the call duration.
     unsafe {
         GetProcessTimes(
             handle.raw(),
@@ -305,14 +295,12 @@ fn get_modules(pid: ProcessId) -> AppResult<Vec<ModuleInfo>> {
         dwSize: size_of::<MODULEENTRY32W>() as u32,
         ..Default::default()
     };
-    // SAFETY: entry points to writable storage of the required size and snapshot is valid.
     unsafe { Module32FirstW(snapshot.raw(), &mut entry) }
         .map_err(|error| windows_error("Module32FirstW", error))?;
 
     let mut modules = Vec::with_capacity(64);
     for _index in 0..MAX_MODULES {
         modules.push(module_from_entry(&entry));
-        // SAFETY: entry remains writable and snapshot remains valid for this bounded walk.
         match unsafe { Module32NextW(snapshot.raw(), &mut entry) } {
             Ok(()) => {}
             Err(error) if error.code() == ERROR_NO_MORE_FILES.to_hresult() => return Ok(modules),
@@ -325,7 +313,6 @@ fn get_modules(pid: ProcessId) -> AppResult<Vec<ModuleInfo>> {
 fn module_snapshot(pid: ProcessId) -> AppResult<OwnedHandle> {
     let flags = TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32;
     for _attempt in 0..MAX_MODULE_SNAPSHOT_TRIES {
-        // SAFETY: pid is valid and the returned snapshot handle is owned on success.
         match unsafe { CreateToolhelp32Snapshot(flags, pid.get()) } {
             Ok(handle) => return Ok(OwnedHandle(handle)),
             Err(error) if error.code() == ERROR_BAD_LENGTH.to_hresult() => {

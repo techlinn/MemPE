@@ -1,9 +1,10 @@
 use pelite::PeFile;
 
 use crate::pe::exports::ExportIndex;
+use crate::pe::image::{read_u16, read_u32, write_u16, write_u32, write_u64};
 use crate::pe::imports::{ImportPlan, analyze};
 use crate::pe::parse::parse_memory_image;
-use crate::pe::{PeKind, PeModel, SectionModel};
+use crate::pe::{PeKind, PeModel, Rva, SectionModel};
 use crate::{AppError, AppResult};
 
 const DOS_LFANEW_OFFSET: usize = 0x3c;
@@ -17,7 +18,7 @@ const IAT_DIRECTORY: usize = 12;
 const MAX_DISK_HEADERS: usize = 1024 * 1024;
 const RUNTIME_FUNCTION_SIZE: usize = 12;
 const IMPORT_DESCRIPTOR_SIZE: usize = 20;
-const PDIMP_CHARACTERISTICS: u32 = 0xC000_0040;
+const MEMPE_IMPORT_CHARACTERISTICS: u32 = 0xC000_0040;
 
 pub(crate) struct RebuiltImage {
     pub(crate) bytes: Vec<u8>,
@@ -46,28 +47,30 @@ pub(crate) fn rebuild(
     exports: &ExportIndex,
 ) -> AppResult<RebuiltImage> {
     let repaired;
-    let (memory, model, disk_headers_used) = match parse_memory_image(memory) {
-        Ok(model) => (memory, model, false),
+    let (image, disk_headers_used) = match parse_memory_image(memory) {
+        Ok(image) => (image, false),
         Err(memory_error) => {
             let Some(disk_headers) = disk_headers else {
                 return Err(memory_error);
             };
             repaired = restore_disk_headers(memory, disk_headers)?;
-            let model = parse_memory_image(&repaired).map_err(|disk_error| {
+            let image = parse_memory_image(&repaired).map_err(|disk_error| {
                 AppError::new(format!(
                     "memory headers are invalid ({memory_error}); disk header repair failed ({disk_error})"
                 ))
             })?;
-            (&repaired[..], model, true)
+            (image, true)
         }
     };
+    let memory = image.bytes();
+    let model = image.model();
     let section_table_end = model
         .sections
         .last()
         .map(|section| section.header_offset.saturating_add(SECTION_HEADER_SIZE))
         .ok_or_else(|| AppError::new("PE has no section headers"))?;
     let header_size = align_up(section_table_end, model.file_alignment as usize)?;
-    let layouts = layout_sections(&model, memory.len(), header_size)?;
+    let layouts = layout_sections(model, memory.len(), header_size)?;
     let output_size = layouts
         .iter()
         .map(|layout| layout.raw_offset.saturating_add(layout.raw_size))
@@ -94,8 +97,8 @@ pub(crate) fn rebuild(
         u32::try_from(model.nt_offset)
             .map_err(|_| AppError::new("NT header offset does not fit a PE field"))?,
     )?;
-    write_image_base(&mut output, &model, observed_base)?;
-    let image_size = rebuilt_image_size(&model)?;
+    write_image_base(&mut output, model, observed_base)?;
+    let image_size = rebuilt_image_size(model)?;
     write_u32(&mut output, model.size_of_image_offset, image_size)?;
     write_u32(
         &mut output,
@@ -140,15 +143,14 @@ pub(crate) fn rebuild(
         destination.copy_from_slice(source);
     }
 
-    let mut cleared_directories =
-        clear_bad_directories(&mut output, &model, &layouts, header_size)?;
+    let mut cleared_directories = clear_bad_directories(&mut output, model, &layouts, header_size)?;
     let invalid_unwind_entries =
-        repair_exception_directory(&mut output, &model, &layouts, header_size)?;
-    let import_plan = analyze(memory, observed_base, &model, exports);
+        repair_exception_directory(&mut output, model, &layouts, header_size)?;
+    let import_plan = analyze(&image, observed_base, exports);
     if !import_plan.groups.is_empty() {
-        append_import_section(&mut output, &model, &import_plan)?;
+        append_import_section(&mut output, model, &import_plan)?;
     } else if !import_plan.existing_valid {
-        cleared_directories = clear_directory(&mut output, &model, IMPORT_DIRECTORY)?
+        cleared_directories = clear_directory(&mut output, model, IMPORT_DIRECTORY)?
             .saturating_add(cleared_directories);
     }
     PeFile::from_bytes(&output).map_err(|error| {
@@ -244,9 +246,8 @@ fn clear_bad_directories(
     let mut cleared = 0usize;
     for index in 0..model.directory_count {
         let entry_offset = model
-            .data_directory_offset
-            .checked_add(index.saturating_mul(8))
-            .ok_or_else(|| AppError::new("data-directory offset overflowed"))?;
+            .directory_offset(index)?
+            .ok_or_else(|| AppError::new("data-directory slot is missing"))?;
         let rva = read_u32(output, entry_offset)?;
         let size = read_u32(output, entry_offset.saturating_add(4))?;
         if rva == 0 && size == 0 {
@@ -309,9 +310,8 @@ fn repair_exception_directory(
         return Ok(0);
     }
     let entry_offset = model
-        .data_directory_offset
-        .checked_add(EXCEPTION_DIRECTORY.saturating_mul(8))
-        .ok_or_else(|| AppError::new("exception-directory offset overflowed"))?;
+        .directory_offset(EXCEPTION_DIRECTORY)?
+        .ok_or_else(|| AppError::new("exception-directory slot is missing"))?;
     let rva = read_u32(output, entry_offset)?;
     let size = read_u32(output, entry_offset.saturating_add(4))? as usize;
     if rva == 0 || size == 0 {
@@ -386,7 +386,7 @@ fn runtime_function_is_valid(
     let Ok(unwind) = read_u32(entry, 8) else {
         return false;
     };
-    if begin >= end || !executable_rva(begin, model) || !executable_rva(end - 1, model) {
+    if begin >= end || !model.executable_rva(Rva(begin)) || !model.executable_rva(Rva(end - 1)) {
         return false;
     }
     let Some(unwind_offset) = rva_to_file(unwind, layouts, header_size) else {
@@ -396,14 +396,6 @@ fn runtime_function_is_valid(
         return false;
     };
     matches!(first & 0x07, 1 | 2)
-}
-
-fn executable_rva(rva: u32, model: &PeModel) -> bool {
-    model.sections.iter().any(|section| {
-        let start = section.virtual_address.get();
-        let end = start.saturating_add(section.virtual_size.max(section.raw_size));
-        section.characteristics & 0x2000_0000 != 0 && rva >= start && rva < end
-    })
 }
 
 fn append_import_section(
@@ -459,7 +451,7 @@ fn append_import_section(
     let name = output
         .get_mut(section_header..section_header.saturating_add(8))
         .ok_or_else(|| AppError::new("new section name lies outside the PE headers"))?;
-    name.copy_from_slice(b".pdimp\0\0");
+    name.copy_from_slice(b".mempe\0\0");
     write_u32(
         output,
         section_header.saturating_add(8),
@@ -480,7 +472,7 @@ fn append_import_section(
     write_u32(
         output,
         section_header.saturating_add(36),
-        PDIMP_CHARACTERISTICS,
+        MEMPE_IMPORT_CHARACTERISTICS,
     )?;
     let section_count_offset = model.nt_offset.saturating_add(6);
     let section_count = read_u16(output, section_count_offset)?
@@ -619,25 +611,17 @@ fn write_directory(
     rva: u32,
     size: u32,
 ) -> AppResult<()> {
-    if index >= model.directory_count {
-        return Err(AppError::new("PE has no requested data-directory slot"));
-    }
     let offset = model
-        .data_directory_offset
-        .checked_add(index.saturating_mul(8))
-        .ok_or_else(|| AppError::new("data-directory offset overflowed"))?;
+        .directory_offset(index)?
+        .ok_or_else(|| AppError::new("PE has no requested data-directory slot"))?;
     write_u32(output, offset, rva)?;
     write_u32(output, offset.saturating_add(4), size)
 }
 
 fn clear_directory(output: &mut [u8], model: &PeModel, index: usize) -> AppResult<usize> {
-    if index >= model.directory_count {
+    let Some(offset) = model.directory_offset(index)? else {
         return Ok(0);
-    }
-    let offset = model
-        .data_directory_offset
-        .checked_add(index.saturating_mul(8))
-        .ok_or_else(|| AppError::new("data-directory offset overflowed"))?;
+    };
     let was_set =
         read_u32(output, offset)? != 0 || read_u32(output, offset.saturating_add(4))? != 0;
     write_u32(output, offset, 0)?;
@@ -698,44 +682,6 @@ fn align_up_u64(value: u64, alignment: u64) -> AppResult<u64> {
         .checked_add(alignment - 1)
         .map(|result| result & !(alignment - 1))
         .ok_or_else(|| AppError::new("PE alignment overflowed"))
-}
-
-fn read_u32(bytes: &[u8], offset: usize) -> AppResult<u32> {
-    let value = bytes
-        .get(offset..offset.saturating_add(4))
-        .ok_or_else(|| AppError::new("PE field lies outside the rebuilt image"))?;
-    Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
-}
-
-fn read_u16(bytes: &[u8], offset: usize) -> AppResult<u16> {
-    let value = bytes
-        .get(offset..offset.saturating_add(2))
-        .ok_or_else(|| AppError::new("PE field lies outside the rebuilt image"))?;
-    Ok(u16::from_le_bytes([value[0], value[1]]))
-}
-
-fn write_u16(bytes: &mut [u8], offset: usize, value: u16) -> AppResult<()> {
-    let destination = bytes
-        .get_mut(offset..offset.saturating_add(2))
-        .ok_or_else(|| AppError::new("PE field lies outside the rebuilt image"))?;
-    destination.copy_from_slice(&value.to_le_bytes());
-    Ok(())
-}
-
-fn write_u32(bytes: &mut [u8], offset: usize, value: u32) -> AppResult<()> {
-    let destination = bytes
-        .get_mut(offset..offset.saturating_add(4))
-        .ok_or_else(|| AppError::new("PE field lies outside the rebuilt image"))?;
-    destination.copy_from_slice(&value.to_le_bytes());
-    Ok(())
-}
-
-fn write_u64(bytes: &mut [u8], offset: usize, value: u64) -> AppResult<()> {
-    let destination = bytes
-        .get_mut(offset..offset.saturating_add(8))
-        .ok_or_else(|| AppError::new("PE field lies outside the rebuilt image"))?;
-    destination.copy_from_slice(&value.to_le_bytes());
-    Ok(())
 }
 
 #[cfg(test)]
