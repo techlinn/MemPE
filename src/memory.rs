@@ -14,7 +14,7 @@ use windows::Win32::System::Diagnostics::ProcessSnapshotting::{
     PssCaptureSnapshot, PssFreeSnapshot, PssQuerySnapshot,
 };
 use windows::Win32::System::Memory::{
-    MEM_COMMIT, MEM_IMAGE, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE, PAGE_EXECUTE_READ,
+    MEM_COMMIT, MEM_IMAGE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE, PAGE_EXECUTE_READ,
     PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS, PAGE_READONLY,
     PAGE_READWRITE, PAGE_WRITECOPY, VirtualQueryEx,
 };
@@ -23,6 +23,7 @@ use windows::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
 };
 
+use crate::pe::RegionEvidence;
 use crate::process::{OwnedHandle, TargetProcess};
 use crate::{AppError, AppResult};
 
@@ -33,7 +34,7 @@ const MAX_TOTAL_IMAGE_BYTES: usize = 4 * 1024 * 1024 * 1024;
 const READ_CHUNK: usize = 64 * 1024;
 const PAGE_SIZE: usize = 4 * 1024;
 const MAX_HEADER_READ: usize = 64 * 1024;
-const MAX_PRIVATE_SCAN_PAGES: usize = 262_144;
+const MAX_NON_IMAGE_SCAN_PAGES: usize = 262_144;
 const STABLE_POLL_COUNT: usize = 30;
 const STABLE_MATCH_COUNT: usize = 3;
 const STABLE_POLL_DELAY: Duration = Duration::from_millis(100);
@@ -56,6 +57,7 @@ impl Display for AcquisitionMode {
 pub(crate) struct CapturedImage {
     pub(crate) base: usize,
     pub(crate) bytes: Vec<u8>,
+    pub(crate) regions: Vec<RegionEvidence>,
     pub(crate) unreadable_pages: usize,
     pub(crate) name: Option<String>,
     pub(crate) path: Option<PathBuf>,
@@ -68,7 +70,7 @@ pub(crate) struct Capture {
     pub(crate) setup_elapsed: Duration,
     pub(crate) fallback_reason: Option<String>,
     pub(crate) images: Vec<CapturedImage>,
-    pub(crate) private_executable_allocations: usize,
+    pub(crate) executable_non_image_allocations: usize,
 }
 
 pub(crate) struct StabilityInfo {
@@ -209,13 +211,13 @@ impl AddressSpace {
 
 pub(crate) fn capture(target: &TargetProcess) -> AppResult<Capture> {
     let acquired = AddressSpace::acquire(target)?;
-    let (images, private_count) = capture_from_space(&acquired.space, target)?;
+    let (images, non_image_count) = capture_from_space(&acquired.space, target)?;
     Ok(Capture {
         mode: acquired.mode,
         setup_elapsed: acquired.setup_elapsed,
         fallback_reason: acquired.fallback_reason,
         images,
-        private_executable_allocations: private_count,
+        executable_non_image_allocations: non_image_count,
     })
 }
 
@@ -249,26 +251,64 @@ pub(crate) fn wait_until_stable(target: &TargetProcess) -> AppResult<StabilityIn
 
 fn memory_signature(space: &AddressSpace, regions: &[MemoryRegion]) -> u64 {
     let mut hash = DefaultHasher::new();
-    let mut reads = 0usize;
-    for region in regions {
+    for region in regions.iter().filter(|region| is_stability_region(region)) {
         region.hash(&mut hash);
-        if reads >= MAX_STABILITY_READS
-            || region.state != MEM_COMMIT.0
-            || !is_readable(region.protect)
-            || !is_executable(region.protect)
-        {
-            continue;
-        }
+    }
+    for (address, length) in stability_pages(regions) {
         let mut page = [0u8; PAGE_SIZE];
-        let length = region.size.min(PAGE_SIZE);
-        if space.read_exact(region.base, &mut page[..length]) {
+        if space.read_exact(address, &mut page[..length]) {
             page[..length].hash(&mut hash);
         } else {
             u64::MAX.hash(&mut hash);
         }
-        reads = reads.saturating_add(1);
     }
     hash.finish()
+}
+
+fn stability_pages(regions: &[MemoryRegion]) -> Vec<(usize, usize)> {
+    let total_pages = regions
+        .iter()
+        .filter(|region| is_stability_region(region))
+        .map(|region| region.size.div_ceil(PAGE_SIZE))
+        .fold(0usize, usize::saturating_add);
+    let sample_count = total_pages.min(MAX_STABILITY_READS);
+    let mut pages = Vec::with_capacity(sample_count);
+    let mut first_page = 0usize;
+    let mut sample = 0usize;
+    for region in regions.iter().filter(|region| is_stability_region(region)) {
+        let region_pages = region.size.div_ceil(PAGE_SIZE);
+        let past_region = first_page.saturating_add(region_pages);
+        while sample < sample_count {
+            let target = sample_page(sample, total_pages, sample_count);
+            if target >= past_region {
+                break;
+            }
+            let page = target.saturating_sub(first_page);
+            let offset = page.saturating_mul(PAGE_SIZE);
+            let address = region.base.saturating_add(offset);
+            let length = region.size.saturating_sub(offset).min(PAGE_SIZE);
+            pages.push((address, length));
+            sample = sample.saturating_add(1);
+        }
+        first_page = past_region;
+    }
+    pages
+}
+
+fn sample_page(sample: usize, total_pages: usize, sample_count: usize) -> usize {
+    if sample_count <= 1 {
+        return 0;
+    }
+    let numerator = (sample as u128) * (total_pages.saturating_sub(1) as u128);
+    let denominator = sample_count.saturating_sub(1) as u128;
+    (numerator / denominator) as usize
+}
+
+fn is_stability_region(region: &MemoryRegion) -> bool {
+    region.state == MEM_COMMIT.0
+        && is_readable(region.protect)
+        && ((region.kind == MEM_IMAGE.0 && is_writable(region.protect))
+            || is_executable(region.protect))
 }
 
 fn capture_from_space(
@@ -276,10 +316,10 @@ fn capture_from_space(
     target: &TargetProcess,
 ) -> AppResult<(Vec<CapturedImage>, usize)> {
     let regions = space.regions()?;
-    let private_allocations = private_executable_allocations(&regions);
-    let private_count = private_allocations.len();
+    let non_image_allocations = executable_non_image_allocations(&regions);
+    let non_image_count = non_image_allocations.len();
     let groups = group_images(&regions, target)?;
-    let hidden = find_hidden_images(space, &regions, &private_allocations)?;
+    let hidden = find_hidden_images(space, &regions, &non_image_allocations)?;
     let mut images = Vec::new();
     images
         .try_reserve_exact(groups.len().saturating_add(hidden.len()))
@@ -316,7 +356,7 @@ fn capture_from_space(
             "the main image allocation was not present in the captured address space",
         ));
     }
-    Ok((images, private_count))
+    Ok((images, non_image_count))
 }
 
 fn add_image_size(total: &mut usize, size: usize) -> AppResult<()> {
@@ -419,6 +459,7 @@ fn read_image(
         .try_reserve_exact(size)
         .map_err(|_| AppError::new(format!("not enough memory for image at 0x{base:016X}")))?;
     bytes.resize(size, 0);
+    let mut evidence = Vec::with_capacity(regions.len());
     let mut unreadable_pages = 0usize;
     let image_end = base
         .checked_add(size)
@@ -439,6 +480,13 @@ fn read_image(
         }
         let offset = read_base.saturating_sub(base);
         let length = read_end.saturating_sub(read_base);
+        evidence.push(RegionEvidence {
+            offset,
+            size: length,
+            readable: is_readable(region.protect),
+            writable: is_writable(region.protect),
+            executable: is_executable(region.protect),
+        });
         let destination = bytes
             .get_mut(offset..offset.saturating_add(length))
             .ok_or_else(|| AppError::new("image region lies outside its output buffer"))?;
@@ -454,6 +502,7 @@ fn read_image(
     Ok(CapturedImage {
         base,
         bytes,
+        regions: evidence,
         unreadable_pages,
         name: module.map(|value| value.name.clone()),
         path: module.map(|value| value.path.clone()),
@@ -475,7 +524,7 @@ fn find_hidden_images(
         let end = region
             .base
             .checked_add(region.size)
-            .ok_or_else(|| AppError::new("private allocation address overflowed"))?;
+            .ok_or_else(|| AppError::new("non-image allocation address overflowed"))?;
         allocation_ends
             .entry(region.allocation_base)
             .and_modify(|current| *current = (*current).max(end))
@@ -493,13 +542,13 @@ fn find_hidden_images(
         }
         for offset in (0..region.size).step_by(PAGE_SIZE) {
             scanned_pages = scanned_pages.saturating_add(1);
-            if scanned_pages > MAX_PRIVATE_SCAN_PAGES {
+            if scanned_pages > MAX_NON_IMAGE_SCAN_PAGES {
                 return Err(AppError::new(
-                    "private PE scan exceeds the 262144-page safety limit",
+                    "non-image PE scan exceeds the 262144-page safety limit",
                 ));
             }
             let Some(base) = region.base.checked_add(offset) else {
-                return Err(AppError::new("private PE scan address overflowed"));
+                return Err(AppError::new("non-image PE scan address overflowed"));
             };
             let mut magic = [0u8; 2];
             if !space.read_exact(base, &mut magic) || magic != *b"MZ" {
@@ -520,7 +569,12 @@ fn find_hidden_images(
             if image_size > available {
                 continue;
             }
-            found.push((base, image_size));
+            if available > MAX_IMAGE_SIZE {
+                return Err(AppError::new(format!(
+                    "hidden image allocation at 0x{base:016X} exceeds the 1 GiB image safety limit"
+                )));
+            }
+            found.push((base, available));
             if found.len() > MAX_IMAGES {
                 return Err(AppError::new(
                     "hidden image count exceeds the 4096-image safety limit",
@@ -593,12 +647,12 @@ fn read_exact(handle: HANDLE, address: usize, destination: &mut [u8]) -> bool {
     result.is_ok() && read == destination.len()
 }
 
-fn private_executable_allocations(regions: &[MemoryRegion]) -> BTreeSet<usize> {
+fn executable_non_image_allocations(regions: &[MemoryRegion]) -> BTreeSet<usize> {
     regions
         .iter()
         .filter(|region| {
             region.state == MEM_COMMIT.0
-                && region.kind == MEM_PRIVATE.0
+                && region.kind != MEM_IMAGE.0
                 && is_executable(region.protect)
         })
         .map(|region| region.allocation_base)
@@ -636,6 +690,20 @@ fn is_executable(protect: u32) -> bool {
     .contains(&base)
 }
 
+fn is_writable(protect: u32) -> bool {
+    if protect & (PAGE_GUARD.0 | PAGE_NOACCESS.0) != 0 {
+        return false;
+    }
+    let base = protect & 0xff;
+    [
+        PAGE_READWRITE.0,
+        PAGE_WRITECOPY.0,
+        PAGE_EXECUTE_READWRITE.0,
+        PAGE_EXECUTE_WRITECOPY.0,
+    ]
+    .contains(&base)
+}
+
 fn win32_status(action: &str, status: u32) -> AppError {
     let detail = std::io::Error::from_raw_os_error(status as i32);
     AppError::new(format!("{action} failed: {detail} (error {status})"))
@@ -643,7 +711,14 @@ fn win32_status(action: &str, status: u32) -> AppError {
 
 #[cfg(test)]
 mod tests {
-    use super::{MemoryRegion, regions_in_range};
+    use windows::Win32::System::Memory::{
+        MEM_COMMIT, MEM_IMAGE, MEM_MAPPED, MEM_PRIVATE, PAGE_EXECUTE_READ, PAGE_READWRITE,
+    };
+
+    use super::{
+        MAX_STABILITY_READS, MemoryRegion, PAGE_SIZE, executable_non_image_allocations,
+        regions_in_range, stability_pages,
+    };
 
     fn region(base: usize, size: usize) -> MemoryRegion {
         MemoryRegion {
@@ -677,5 +752,69 @@ mod tests {
         let result = regions_in_range(&[], usize::MAX, 2);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn samples_content_across_large_relevant_regions() {
+        let regions = [
+            MemoryRegion {
+                base: 0x1000,
+                allocation_base: 0x1000,
+                size: PAGE_SIZE * 512,
+                state: MEM_COMMIT.0,
+                protect: PAGE_EXECUTE_READ.0,
+                kind: MEM_IMAGE.0,
+            },
+            MemoryRegion {
+                base: 0x400000,
+                allocation_base: 0x400000,
+                size: PAGE_SIZE,
+                state: MEM_COMMIT.0,
+                protect: PAGE_READWRITE.0,
+                kind: MEM_PRIVATE.0,
+            },
+        ];
+
+        let pages = stability_pages(&regions);
+
+        assert_eq!(pages.len(), MAX_STABILITY_READS);
+        assert_eq!(pages.first(), Some(&(0x1000, PAGE_SIZE)));
+        assert_eq!(pages.last(), Some(&(0x1000 + PAGE_SIZE * 511, PAGE_SIZE)));
+    }
+
+    #[test]
+    fn includes_executable_mapped_and_private_allocations() {
+        let regions = [
+            MemoryRegion {
+                base: 0x1000,
+                allocation_base: 0x1000,
+                size: PAGE_SIZE,
+                state: MEM_COMMIT.0,
+                protect: PAGE_EXECUTE_READ.0,
+                kind: MEM_PRIVATE.0,
+            },
+            MemoryRegion {
+                base: 0x2000,
+                allocation_base: 0x2000,
+                size: PAGE_SIZE,
+                state: MEM_COMMIT.0,
+                protect: PAGE_EXECUTE_READ.0,
+                kind: MEM_MAPPED.0,
+            },
+            MemoryRegion {
+                base: 0x3000,
+                allocation_base: 0x3000,
+                size: PAGE_SIZE,
+                state: MEM_COMMIT.0,
+                protect: PAGE_EXECUTE_READ.0,
+                kind: MEM_IMAGE.0,
+            },
+        ];
+
+        let allocations = executable_non_image_allocations(&regions);
+
+        assert_eq!(allocations.len(), 2);
+        assert!(allocations.contains(&0x1000));
+        assert!(allocations.contains(&0x2000));
     }
 }

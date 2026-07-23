@@ -2,9 +2,9 @@ use pelite::PeFile;
 
 use crate::pe::exports::ExportIndex;
 use crate::pe::image::{read_u16, read_u32, write_u16, write_u32, write_u64};
-use crate::pe::imports::{ImportPlan, analyze};
-use crate::pe::parse::parse_memory_image;
-use crate::pe::{PeKind, PeModel, Rva, SectionModel};
+use crate::pe::imports::{ImportPlan, build_plan};
+use crate::pe::parse::{parse_disk_image, parse_memory_image};
+use crate::pe::{EntryPointRva, PeKind, PeModel, RegionEvidence, Rva, SectionModel};
 use crate::{AppError, AppResult};
 
 const DOS_LFANEW_OFFSET: usize = 0x3c;
@@ -19,6 +19,13 @@ const MAX_DISK_HEADERS: usize = 1024 * 1024;
 const RUNTIME_FUNCTION_SIZE: usize = 12;
 const IMPORT_DESCRIPTOR_SIZE: usize = 20;
 const MEMPE_IMPORT_CHARACTERISTICS: u32 = 0xC000_0040;
+const IMAGE_SCN_CNT_CODE: u32 = 0x0000_0020;
+const IMAGE_SCN_CNT_INITIALIZED_DATA: u32 = 0x0000_0040;
+const IMAGE_SCN_CNT_UNINITIALIZED_DATA: u32 = 0x0000_0080;
+const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+const IMAGE_SCN_MEM_READ: u32 = 0x4000_0000;
+const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
+const PAGE_SIZE: usize = 4 * 1024;
 
 pub(crate) struct RebuiltImage {
     pub(crate) bytes: Vec<u8>,
@@ -42,18 +49,20 @@ struct SectionLayout<'a> {
 
 pub(crate) fn rebuild(
     memory: &[u8],
+    regions: &[RegionEvidence],
     observed_base: usize,
     disk_headers: Option<&[u8]>,
     exports: &ExportIndex,
+    entry_point: Option<EntryPointRva>,
 ) -> AppResult<RebuiltImage> {
     let repaired;
-    let (image, disk_headers_used) = match parse_memory_image(memory) {
+    let (initial_image, disk_headers_used) = match parse_memory_image(memory) {
         Ok(image) => (image, false),
         Err(memory_error) => {
             let Some(disk_headers) = disk_headers else {
                 return Err(memory_error);
             };
-            repaired = restore_disk_headers(memory, disk_headers)?;
+            repaired = merge_header_evidence(memory, disk_headers)?;
             let image = parse_memory_image(&repaired).map_err(|disk_error| {
                 AppError::new(format!(
                     "memory headers are invalid ({memory_error}); disk header repair failed ({disk_error})"
@@ -61,6 +70,15 @@ pub(crate) fn rebuild(
             })?;
             (image, true)
         }
+    };
+    let recovered = recover_section_headers(initial_image.bytes(), initial_image.model(), regions)?;
+    let image = match &recovered {
+        Some(bytes) => parse_memory_image(bytes).map_err(|error| {
+            AppError::new(format!(
+                "memory-region header recovery produced an invalid PE: {error}"
+            ))
+        })?,
+        None => initial_image,
     };
     let memory = image.bytes();
     let model = image.model();
@@ -146,13 +164,15 @@ pub(crate) fn rebuild(
     let mut cleared_directories = clear_bad_directories(&mut output, model, &layouts, header_size)?;
     let invalid_unwind_entries =
         repair_exception_directory(&mut output, model, &layouts, header_size)?;
-    let import_plan = analyze(&image, observed_base, exports);
+    let import_plan = build_plan(&image, observed_base, exports);
     if !import_plan.groups.is_empty() {
         append_import_section(&mut output, model, &import_plan)?;
     } else if !import_plan.existing_valid {
         cleared_directories = clear_directory(&mut output, model, IMPORT_DIRECTORY)?
             .saturating_add(cleared_directories);
     }
+    apply_entry_point(&mut output, model, entry_point)?;
+    write_derived_header_fields(&mut output, model)?;
     PeFile::from_bytes(&output).map_err(|error| {
         AppError::new(format!("rebuilt PE failed independent reparse: {error}"))
     })?;
@@ -172,6 +192,153 @@ pub(crate) fn rebuild(
         imports_rebuilt: import_plan.recovered,
         ambiguous_imports: import_plan.ambiguous,
     })
+}
+
+fn recover_section_headers(
+    memory: &[u8],
+    model: &PeModel,
+    regions: &[RegionEvidence],
+) -> AppResult<Option<Vec<u8>>> {
+    if regions.is_empty() {
+        return Ok(None);
+    }
+    let mut sections = model.sections.iter().collect::<Vec<_>>();
+    sections.sort_unstable_by_key(|section| section.virtual_address);
+    let mut recovered = None;
+    let mut image_end = model.image_size as usize;
+    for (index, section) in sections.iter().enumerate() {
+        let start = section.virtual_address.get() as usize;
+        let limit = sections
+            .get(index + 1)
+            .map(|next| next.virtual_address.get() as usize)
+            .unwrap_or(memory.len())
+            .min(memory.len());
+        if start >= limit {
+            continue;
+        }
+        let declared = section.virtual_size.max(section.raw_size) as usize;
+        let expanded = expanded_section_length(memory, regions, start, limit, declared);
+        let section_end = start.saturating_add(expanded).min(limit);
+        let characteristics =
+            recovered_characteristics(section.characteristics, regions, start, section_end);
+        if expanded > declared {
+            let virtual_size = u32::try_from(expanded)
+                .map_err(|_| AppError::new("recovered section size exceeds u32"))?;
+            let output = recovered.get_or_insert_with(|| memory.to_vec());
+            write_u32(
+                output,
+                section.header_offset.saturating_add(8),
+                virtual_size,
+            )?;
+            image_end = image_end.max(start.saturating_add(expanded));
+        }
+        if characteristics != section.characteristics {
+            let output = recovered.get_or_insert_with(|| memory.to_vec());
+            write_u32(
+                output,
+                section.header_offset.saturating_add(36),
+                characteristics,
+            )?;
+        }
+    }
+    if image_end > model.image_size as usize {
+        let image_size = align_up(image_end, model.section_alignment as usize)?;
+        let image_size = u32::try_from(image_size)
+            .map_err(|_| AppError::new("recovered image size exceeds u32"))?;
+        let output = recovered.get_or_insert_with(|| memory.to_vec());
+        write_u32(output, model.size_of_image_offset, image_size)?;
+    }
+    Ok(recovered)
+}
+
+fn expanded_section_length(
+    memory: &[u8],
+    regions: &[RegionEvidence],
+    start: usize,
+    limit: usize,
+    declared: usize,
+) -> usize {
+    let scan_start = start.saturating_add(declared).min(limit);
+    let mut last_byte = scan_start;
+    for region in regions.iter().filter(|region| region.readable) {
+        let region_end = region.offset.saturating_add(region.size);
+        let range_start = scan_start.max(region.offset);
+        let range_end = limit.min(region_end).min(memory.len());
+        if range_start >= range_end {
+            continue;
+        }
+        let Some(bytes) = memory.get(range_start..range_end) else {
+            continue;
+        };
+        if let Some(index) = bytes.iter().rposition(|byte| *byte != 0) {
+            last_byte = last_byte.max(range_start.saturating_add(index).saturating_add(1));
+        }
+    }
+    last_byte.saturating_sub(start).max(declared)
+}
+
+fn recovered_characteristics(
+    characteristics: u32,
+    regions: &[RegionEvidence],
+    start: usize,
+    end: usize,
+) -> u32 {
+    let coverage = ProtectionCoverage::measure(regions, start, end);
+    let mut recovered = characteristics;
+    if coverage.executable > 0 {
+        recovered |= IMAGE_SCN_MEM_EXECUTE;
+    }
+    if coverage.readable > 0 {
+        recovered |= IMAGE_SCN_MEM_READ;
+    }
+    if coverage.write_is_substantial(end.saturating_sub(start)) {
+        recovered |= IMAGE_SCN_MEM_WRITE;
+    }
+    recovered
+}
+
+#[derive(Default)]
+struct ProtectionCoverage {
+    committed: usize,
+    readable: usize,
+    writable: usize,
+    executable: usize,
+}
+
+impl ProtectionCoverage {
+    fn measure(regions: &[RegionEvidence], start: usize, end: usize) -> Self {
+        let mut coverage = Self::default();
+        for region in regions {
+            let region_end = region.offset.saturating_add(region.size);
+            let overlap_start = start.max(region.offset);
+            let overlap_end = end.min(region_end);
+            let bytes = overlap_end.saturating_sub(overlap_start);
+            if bytes == 0 {
+                continue;
+            }
+            coverage.committed = coverage.committed.saturating_add(bytes);
+            if region.readable {
+                coverage.readable = coverage.readable.saturating_add(bytes);
+            }
+            if region.writable {
+                coverage.writable = coverage.writable.saturating_add(bytes);
+            }
+            if region.executable {
+                coverage.executable = coverage.executable.saturating_add(bytes);
+            }
+        }
+        coverage
+    }
+
+    fn write_is_substantial(&self, section_size: usize) -> bool {
+        if self.committed == 0 || self.writable == 0 {
+            return false;
+        }
+        let unanimous = self.writable >= section_size && self.committed >= section_size;
+        let substantial = self.writable >= PAGE_SIZE.saturating_mul(2)
+            && self.writable.saturating_mul(2) >= section_size;
+        unanimous || substantial
+    }
 }
 
 fn layout_sections<'a>(
@@ -265,8 +432,11 @@ fn clear_bad_directories(
     Ok(cleared)
 }
 
-fn restore_disk_headers(memory: &[u8], disk: &[u8]) -> AppResult<Vec<u8>> {
-    let header_size = disk_header_size(disk)?;
+fn merge_header_evidence(memory: &[u8], disk: &[u8]) -> AppResult<Vec<u8>> {
+    let disk_image = parse_disk_image(disk)?;
+    let model = disk_image.model();
+    let memory_entry_point = validate_header_evidence(memory, model)?;
+    let header_size = disk_header_size(disk, model)?;
     if header_size > memory.len() {
         return Err(AppError::new(
             "disk PE headers are larger than the captured image",
@@ -280,24 +450,146 @@ fn restore_disk_headers(memory: &[u8], disk: &[u8]) -> AppResult<Vec<u8>> {
         .get_mut(..header_size)
         .ok_or_else(|| AppError::new("captured PE header range is missing"))?;
     destination.copy_from_slice(source);
+    if let Some(entry_point) = memory_entry_point {
+        write_u32(&mut repaired, model.entry_point_offset, entry_point)?;
+    }
     Ok(repaired)
 }
 
-fn disk_header_size(disk: &[u8]) -> AppResult<usize> {
-    let _image_size = crate::pe::memory_image_size(disk)?;
-    let nt_offset = usize::try_from(read_u32(disk, DOS_LFANEW_OFFSET)?)
-        .map_err(|_| AppError::new("disk e_lfanew does not fit memory"))?;
-    let optional_offset = nt_offset
-        .checked_add(24)
-        .ok_or_else(|| AppError::new("disk optional-header offset overflowed"))?;
-    let size = usize::try_from(read_u32(disk, optional_offset.saturating_add(60))?)
-        .map_err(|_| AppError::new("disk header size does not fit memory"))?;
-    if size == 0 || size > MAX_DISK_HEADERS || size > disk.len() {
+fn validate_header_evidence(memory: &[u8], model: &PeModel) -> AppResult<Option<u32>> {
+    if model.image_size as usize > memory.len() {
+        return Err(AppError::new("disk SizeOfImage exceeds the captured image"));
+    }
+    let memory_machine = read_u16(memory, model.nt_offset.saturating_add(4)).unwrap_or(0);
+    let disk_machine = match model.kind {
+        PeKind::Pe32 => 0x014C,
+        PeKind::Pe32Plus => 0x8664,
+    };
+    if matches!(memory_machine, 0x014C | 0x8664) && memory_machine != disk_machine {
+        return Err(AppError::new(
+            "disk headers conflict with the captured image architecture",
+        ));
+    }
+    let memory_magic = read_u16(memory, model.entry_point_offset.saturating_sub(16)).unwrap_or(0);
+    let disk_magic = match model.kind {
+        PeKind::Pe32 => 0x010B,
+        PeKind::Pe32Plus => 0x020B,
+    };
+    if matches!(memory_magic, 0x010B | 0x020B) && memory_magic != disk_magic {
+        return Err(AppError::new(
+            "disk headers conflict with the captured optional-header format",
+        ));
+    }
+    let matching_structure = memory_machine == disk_machine || memory_magic == disk_magic;
+    let entry_point = read_u32(memory, model.entry_point_offset)
+        .ok()
+        .filter(|rva| matching_structure && model.executable_rva(Rva(*rva)));
+    Ok(entry_point)
+}
+
+fn disk_header_size(disk: &[u8], model: &PeModel) -> AppResult<usize> {
+    let section_table_end = model
+        .sections
+        .last()
+        .and_then(|section| section.header_offset.checked_add(SECTION_HEADER_SIZE))
+        .ok_or_else(|| AppError::new("disk PE has no complete section table"))?;
+    let size = align_up(section_table_end, model.file_alignment as usize)?;
+    if size > MAX_DISK_HEADERS || size > disk.len() {
         return Err(AppError::new(
             "disk PE header size is outside the 1 MiB safety limit",
         ));
     }
     Ok(size)
+}
+
+fn apply_entry_point(
+    output: &mut [u8],
+    model: &PeModel,
+    entry_point: Option<EntryPointRva>,
+) -> AppResult<()> {
+    let Some(entry_point) = entry_point else {
+        return Ok(());
+    };
+    let rva = Rva(entry_point.get());
+    if !model.executable_rva(rva) {
+        return Err(AppError::new(format!(
+            "manual entry point RVA 0x{:X} is not inside an executable section",
+            entry_point.get()
+        )));
+    }
+    write_u32(output, model.entry_point_offset, entry_point.get())
+}
+
+fn write_derived_header_fields(output: &mut [u8], model: &PeModel) -> AppResult<()> {
+    let section_count = usize::from(read_u16(output, model.nt_offset.saturating_add(6))?);
+    let maximum_section_count = model.sections.len().saturating_add(1);
+    if section_count < model.sections.len() || section_count > maximum_section_count {
+        return Err(AppError::new("rebuilt PE has an invalid section count"));
+    }
+    let first_section = model
+        .sections
+        .first()
+        .map(|section| section.header_offset)
+        .ok_or_else(|| AppError::new("rebuilt PE has no section table"))?;
+    let mut sizes = DerivedSizes::default();
+    for index in 0..section_count {
+        let offset = first_section
+            .checked_add(index.saturating_mul(SECTION_HEADER_SIZE))
+            .ok_or_else(|| AppError::new("rebuilt section header offset overflowed"))?;
+        sizes.add_section(output, offset, model.file_alignment)?;
+    }
+    write_u32(output, model.size_of_code_offset, sizes.code)?;
+    write_u32(
+        output,
+        model.size_of_initialized_data_offset,
+        sizes.initialized_data,
+    )?;
+    write_u32(
+        output,
+        model.size_of_uninitialized_data_offset,
+        sizes.uninitialized_data,
+    )?;
+    write_u32(output, model.base_of_code_offset, sizes.base_of_code)
+}
+
+#[derive(Default)]
+struct DerivedSizes {
+    code: u32,
+    initialized_data: u32,
+    uninitialized_data: u32,
+    base_of_code: u32,
+}
+
+impl DerivedSizes {
+    fn add_section(&mut self, output: &[u8], offset: usize, file_alignment: u32) -> AppResult<()> {
+        let virtual_size = read_u32(output, offset.saturating_add(8))?;
+        let virtual_address = read_u32(output, offset.saturating_add(12))?;
+        let raw_size = read_u32(output, offset.saturating_add(16))?;
+        let characteristics = read_u32(output, offset.saturating_add(36))?;
+        if characteristics & IMAGE_SCN_CNT_CODE != 0 {
+            self.code = add_size(self.code, raw_size, "code size")?;
+            if self.base_of_code == 0 || virtual_address < self.base_of_code {
+                self.base_of_code = virtual_address;
+            }
+        }
+        if characteristics & IMAGE_SCN_CNT_INITIALIZED_DATA != 0 {
+            self.initialized_data =
+                add_size(self.initialized_data, raw_size, "initialized-data size")?;
+        }
+        if characteristics & IMAGE_SCN_CNT_UNINITIALIZED_DATA != 0 {
+            let aligned = align_up_u64(u64::from(virtual_size), u64::from(file_alignment))?;
+            let aligned = u32::try_from(aligned)
+                .map_err(|_| AppError::new("uninitialized-data size exceeds u32"))?;
+            self.uninitialized_data =
+                add_size(self.uninitialized_data, aligned, "uninitialized-data size")?;
+        }
+        Ok(())
+    }
+}
+
+fn add_size(left: u32, right: u32, name: &str) -> AppResult<u32> {
+    left.checked_add(right)
+        .ok_or_else(|| AppError::new(format!("{name} overflowed")))
 }
 
 fn repair_exception_directory(
@@ -688,17 +980,22 @@ fn align_up_u64(value: u64, alignment: u64) -> AppResult<u64> {
 mod tests {
     use pelite::PeFile;
 
-    use super::rebuild;
-    use crate::pe::{ExportIndex, PeKind};
+    use super::{
+        IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE,
+        rebuild, recovered_characteristics,
+    };
+    use crate::pe::{EntryPointRva, ExportIndex, PeKind, RegionEvidence};
 
     #[test]
     fn rebuilds_a_memory_layout_pe32_plus() -> Result<(), Box<dyn std::error::Error>> {
         let memory = fixture_pe64();
         let rebuilt = rebuild(
             &memory,
+            &[],
             0x0000_7FF6_0000_0000,
             None,
             &ExportIndex::default(),
+            None,
         )?;
 
         assert!(!rebuilt.is_dll);
@@ -711,7 +1008,14 @@ mod tests {
     #[test]
     fn rebuilds_a_memory_layout_pe32_dll() -> Result<(), Box<dyn std::error::Error>> {
         let memory = fixture_pe32();
-        let rebuilt = rebuild(&memory, 0x0040_0000, None, &ExportIndex::default())?;
+        let rebuilt = rebuild(
+            &memory,
+            &[],
+            0x0040_0000,
+            None,
+            &ExportIndex::default(),
+            None,
+        )?;
 
         assert!(rebuilt.is_dll);
         assert_eq!(rebuilt.kind, PeKind::Pe32);
@@ -722,20 +1026,118 @@ mod tests {
 
     #[test]
     fn restores_damaged_headers_from_disk_structure() -> Result<(), Box<dyn std::error::Error>> {
-        let disk = fixture_pe64();
+        let mut disk = fixture_pe64();
+        put_u32(&mut disk, 0x98 + 60, 0x000F_0000);
         let mut memory = disk.clone();
         memory[..0x200].fill(0);
 
         let rebuilt = rebuild(
             &memory,
+            &[],
             0x0000_7FF6_0000_0000,
             Some(&disk),
             &ExportIndex::default(),
+            None,
         )?;
 
         assert!(rebuilt.disk_headers_used);
         assert!(PeFile::from_bytes(&rebuilt.bytes).is_ok());
         assert_eq!(&rebuilt.bytes[0x200..0x204], &[0x90, 0x90, 0xC3, 0]);
+        Ok(())
+    }
+
+    #[test]
+    fn preserves_valid_memory_entry_point_during_disk_merge()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let disk = fixture_pe64();
+        let mut memory = disk.clone();
+        put_u32(&mut memory, 0x80, 0);
+        put_u32(&mut memory, 0x98 + 16, 0x1001);
+
+        let rebuilt = rebuild(
+            &memory,
+            &[],
+            0x0000_7FF6_0000_0000,
+            Some(&disk),
+            &ExportIndex::default(),
+            None,
+        )?;
+
+        assert!(rebuilt.disk_headers_used);
+        assert_eq!(get_u32(&rebuilt.bytes, 0x98 + 16), 0x1001);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_disk_headers_that_conflict_with_memory_architecture() {
+        let disk = fixture_pe64();
+        let mut memory = disk.clone();
+        put_u32(&mut memory, 0x80, 0);
+        put_u16(&mut memory, 0x84, 0x014C);
+
+        let result = rebuild(
+            &memory,
+            &[],
+            0x0000_7FF6_0000_0000,
+            Some(&disk),
+            &ExportIndex::default(),
+            None,
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn applies_only_valid_manual_entry_points() -> Result<(), Box<dyn std::error::Error>> {
+        let memory = fixture_pe64();
+        let valid = EntryPointRva::new(0x1002).ok_or("valid entry point is missing")?;
+        let invalid = EntryPointRva::new(0x180).ok_or("invalid test entry point is missing")?;
+
+        let rebuilt = rebuild(
+            &memory,
+            &[],
+            0x0000_7FF6_0000_0000,
+            None,
+            &ExportIndex::default(),
+            Some(valid),
+        )?;
+        let invalid_result = rebuild(
+            &memory,
+            &[],
+            0x0000_7FF6_0000_0000,
+            None,
+            &ExportIndex::default(),
+            Some(invalid),
+        );
+
+        assert_eq!(get_u32(&rebuilt.bytes, 0x98 + 16), 0x1002);
+        assert!(invalid_result.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn recalculates_derived_optional_header_fields() -> Result<(), Box<dyn std::error::Error>> {
+        let mut memory = fixture_pe64();
+        let section = 0x98 + 0xF0;
+        put_u32(&mut memory, 0x98 + 4, 1);
+        put_u32(&mut memory, 0x98 + 8, 2);
+        put_u32(&mut memory, 0x98 + 12, 3);
+        put_u32(&mut memory, 0x98 + 20, 4);
+        put_u32(&mut memory, section + 36, 0xE000_00E0);
+
+        let rebuilt = rebuild(
+            &memory,
+            &[],
+            0x0000_7FF6_0000_0000,
+            None,
+            &ExportIndex::default(),
+            None,
+        )?;
+
+        assert_eq!(get_u32(&rebuilt.bytes, 0x98 + 4), 0x1000);
+        assert_eq!(get_u32(&rebuilt.bytes, 0x98 + 8), 0x1000);
+        assert_eq!(get_u32(&rebuilt.bytes, 0x98 + 12), 0x1000);
+        assert_eq!(get_u32(&rebuilt.bytes, 0x98 + 20), 0x1000);
         Ok(())
     }
 
@@ -751,13 +1153,105 @@ mod tests {
 
         let rebuilt = rebuild(
             &memory,
+            &[],
             0x0000_7FF6_0000_0000,
             None,
             &ExportIndex::default(),
+            None,
         )?;
 
         assert_eq!(rebuilt.invalid_unwind_entries, 1);
         assert!(PeFile::from_bytes(&rebuilt.bytes).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn recovers_section_access_from_committed_memory() -> Result<(), Box<dyn std::error::Error>> {
+        let mut memory = fixture_pe64();
+        let section = 0x98 + 0xF0;
+        put_u32(&mut memory, section + 36, IMAGE_SCN_CNT_CODE);
+        let regions = [RegionEvidence {
+            offset: 0x1000,
+            size: 0x1000,
+            readable: true,
+            writable: false,
+            executable: true,
+        }];
+
+        let rebuilt = rebuild(
+            &memory,
+            &regions,
+            0x0000_7FF6_0000_0000,
+            None,
+            &ExportIndex::default(),
+            None,
+        )?;
+        let characteristics = get_u32(&rebuilt.bytes, section + 36);
+
+        assert_ne!(characteristics & IMAGE_SCN_MEM_EXECUTE, 0);
+        assert_ne!(characteristics & IMAGE_SCN_MEM_READ, 0);
+        assert_eq!(characteristics & IMAGE_SCN_MEM_WRITE, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn requires_substantial_write_coverage() {
+        let mut regions = [
+            RegionEvidence {
+                offset: 0x1000,
+                size: 0x1000,
+                readable: true,
+                writable: true,
+                executable: false,
+            },
+            RegionEvidence {
+                offset: 0x2000,
+                size: 0x3000,
+                readable: true,
+                writable: false,
+                executable: false,
+            },
+        ];
+
+        let sparse = recovered_characteristics(0, &regions, 0x1000, 0x5000);
+        let retained = recovered_characteristics(IMAGE_SCN_MEM_WRITE, &regions, 0x1000, 0x5000);
+        regions[0].size = 0x2000;
+        regions[1].offset = 0x3000;
+        regions[1].size = 0x2000;
+        let substantial = recovered_characteristics(0, &regions, 0x1000, 0x5000);
+
+        assert_eq!(sparse & IMAGE_SCN_MEM_WRITE, 0);
+        assert_ne!(retained & IMAGE_SCN_MEM_WRITE, 0);
+        assert_ne!(substantial & IMAGE_SCN_MEM_WRITE, 0);
+    }
+
+    #[test]
+    fn recovers_runtime_data_beyond_declared_image_size() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut memory = fixture_pe64();
+        memory.resize(0x3000, 0);
+        memory[0x2500] = 0xC3;
+        let regions = [RegionEvidence {
+            offset: 0x1000,
+            size: 0x2000,
+            readable: true,
+            writable: false,
+            executable: true,
+        }];
+
+        let rebuilt = rebuild(
+            &memory,
+            &regions,
+            0x0000_7FF6_0000_0000,
+            None,
+            &ExportIndex::default(),
+            None,
+        )?;
+        let section = 0x98 + 0xF0;
+
+        assert_eq!(get_u32(&rebuilt.bytes, section + 8), 0x1501);
+        assert_eq!(get_u32(&rebuilt.bytes, 0x98 + 56), 0x3000);
+        assert_eq!(rebuilt.bytes[0x1700], 0xC3);
         Ok(())
     }
 
@@ -827,5 +1321,14 @@ mod tests {
 
     fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
         bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn get_u32(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ])
     }
 }

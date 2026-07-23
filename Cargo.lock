@@ -10,7 +10,7 @@ checksum = "daba87f72c730b508641c9fb6411fc9bba73939eed2cab611c399500511880d0"
 
 [[package]]
 name = "mempe"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "pelite",
  "windows",

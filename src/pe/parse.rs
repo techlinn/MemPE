@@ -50,6 +50,16 @@ pub(super) fn parse_memory_image(bytes: &[u8]) -> AppResult<PeImage<'_>> {
     )))
 }
 
+pub(super) fn parse_disk_image(bytes: &[u8]) -> AppResult<PeImage<'_>> {
+    if bytes.len() < 64 || read_u16(bytes, 0)? != DOS_MAGIC {
+        return Err(AppError::new("disk DOS MZ signature is missing"));
+    }
+    let nt_offset = usize::try_from(read_u32(bytes, 0x3c)?)
+        .map_err(|_| AppError::new("disk e_lfanew does not fit memory"))?;
+    let model = parse_candidate(bytes, nt_offset, false, false)?;
+    Ok(PeImage::new(bytes, model))
+}
+
 pub(crate) fn memory_image_size(bytes: &[u8]) -> AppResult<usize> {
     if bytes.len() < 64 || read_u16(bytes, 0)? != DOS_MAGIC {
         return Err(AppError::new("DOS MZ signature is missing"));
@@ -183,6 +193,15 @@ fn parse_candidate(
         kind,
         is_dll: characteristics & IMAGE_FILE_DLL != 0,
         nt_offset,
+        size_of_code_offset: checked_add(optional_offset, 4, "code size")?,
+        size_of_initialized_data_offset: checked_add(optional_offset, 8, "initialized-data size")?,
+        size_of_uninitialized_data_offset: checked_add(
+            optional_offset,
+            12,
+            "uninitialized-data size",
+        )?,
+        entry_point_offset: checked_add(optional_offset, 16, "entry point")?,
+        base_of_code_offset: checked_add(optional_offset, 20, "base of code")?,
         image_base_offset: checked_add(optional_offset, image_base_relative, "image base")?,
         size_of_image_offset,
         size_of_headers_offset,

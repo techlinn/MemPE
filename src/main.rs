@@ -9,7 +9,7 @@ mod process;
 use std::fmt::{Display, Formatter};
 use std::process::ExitCode;
 
-use cli::Command;
+use cli::{Command, Request};
 use console::Console;
 use dump::DumpOutcome;
 use output::OutputPlan;
@@ -53,7 +53,11 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(console: &Console, command: Command) -> ExitCode {
+fn run(console: &Console, request: Request) -> ExitCode {
+    let Request {
+        command,
+        entry_point,
+    } = request;
     let watched = matches!(&command, Command::Watch(_));
     let output = match output::prepare() {
         Ok(Some(plan)) => plan,
@@ -96,7 +100,7 @@ fn run(console: &Console, command: Command) -> ExitCode {
     }
     console.blank();
 
-    finish_dump(console, &output, &target, capture)
+    finish_dump(console, &output, &target, capture, entry_point)
 }
 
 fn render_target(console: &Console, target: &TargetProcess) {
@@ -134,8 +138,9 @@ fn finish_dump(
     output: &OutputPlan,
     target: &TargetProcess,
     capture: memory::Capture,
+    entry_point: Option<pe::EntryPointRva>,
 ) -> ExitCode {
-    let outcome = match dump::build(target, capture).write(output) {
+    let outcome = match dump::build(target, capture, entry_point).write(output) {
         Ok(outcome) => outcome,
         Err(error) => {
             console.error(format_args!("Could not write mempe: {error}"));
@@ -202,10 +207,10 @@ fn render_analysis(console: &Console, outcome: &DumpOutcome) {
         format_args!("{} recovered", outcome.summary.imports_rebuilt),
     );
     console.field(
-        "Private",
+        "Non-image",
         format_args!(
-            "{} executable regions",
-            outcome.private_executable_allocations
+            "{} executable allocations",
+            outcome.executable_non_image_allocations
         ),
     );
 }
@@ -219,12 +224,12 @@ fn render_warnings(console: &Console, outcome: &DumpOutcome) {
     render_repair_warnings(console, outcome);
     render_import_warnings(console, outcome);
     render_build_failures(console, outcome);
-    let missed_private = outcome
-        .private_executable_allocations
-        .saturating_sub(outcome.hidden_private_images);
-    if missed_private > 0 {
+    let unmatched_non_image = outcome
+        .executable_non_image_allocations
+        .saturating_sub(outcome.hidden_non_image_images);
+    if unmatched_non_image > 0 {
         console.warning(format_args!(
-            "{missed_private} executable private regions did not contain a full PE"
+            "{unmatched_non_image} executable non-image allocations did not contain a full PE"
         ));
     }
 }

@@ -1,6 +1,10 @@
+<p align="center">
+  <img src="assets/banner.png" alt="MemPE banner" width="550">
+</p>
+
 # mempe
 
-mempe dumps Windows executables and DLLs from a running process, then rebuilds each image into a file that regular PE tools can parse. It also checks executable private memory for manually mapped PEs.
+mempe dumps Windows executables and DLLs from a running process, then rebuilds each image into a file that regular PE tools can parse. It also checks executable non-image memory for manually mapped PEs.
 
 Use it for reverse engineering and unpacking. mempe is a dumper, not a malware scanner, and its output is meant for analysis rather than execution.
 
@@ -8,11 +12,15 @@ Use it for reverse engineering and unpacking. mempe is a dumper, not a malware s
 
 - Dumps PE32 and PE32+ images from x86 and x64 processes
 - Accepts a PID or waits for a new process with a given name
-- Finds loader-mapped modules and page-aligned PEs in executable private memory
+- Checks distributed executable and writable-image page samples for stability before a watched dump
+- Finds loader-mapped modules and page-aligned PEs in executable non-image memory
 - Converts in-memory sections back to a normal file layout
-- Recovers imports by matching IAT entries against exports from captured modules
+- Adds observed section access flags and recovers nonzero runtime data beyond damaged section bounds
+- Recovers imports by matching IAT entries and direct x86/x64 IAT call sites against exports from captured modules
 - Handles named exports, ordinal exports, forwarded exports, and common API-set forwarders
-- Repairs damaged headers from the original file when it is still available on disk
+- Merges damaged headers with validated structural evidence from the original file when available
+- Recalculates derived optional-header sizes from the final rebuilt section table
+- Accepts a validated manual entry-point RVA for unpacked main images
 - Clears directories that no longer point to valid data and removes broken x64 unwind entries
 - Zero-fills unreadable pages and reports them in the final summary
 
@@ -37,6 +45,14 @@ mempe.exe -w target.exe
 ```
 
 Watch mode ignores matching processes that are already running. Once a new one appears, mempe waits briefly for its executable mappings to settle before dumping it.
+
+Set a known entry-point RVA for the main image:
+
+```text
+mempe.exe -p 4216 --entry-point 0x31A20
+```
+
+The value is an RVA, not a virtual address. mempe rejects it unless it lies inside a captured executable section.
 
 Show the built-in help:
 
@@ -80,7 +96,7 @@ mempe needs permission to open and read the target process. An elevated target m
 ## Limitations
 
 - Import recovery is based on the IAT and the exports available in the captured process. Packed files, custom loaders, API hashing, and unusual thunk layouts may leave imports unresolved.
-- Private images are found by looking for page aligned PE headers inside executable allocations. Headerless payloads and raw shellcode are not dumped.
+- Hidden images are found by looking for page-aligned PE headers inside executable non-image allocations. Headerless payloads and raw shellcode are not dumped.
 - Unreadable memory is replaced with zeroes. The warning count tells you how much data was lost.
 - A structurally valid PE is useful for static analysis, but it may still need manual work before it can run.
 - Only x86 and x64 Windows PE images are supported.

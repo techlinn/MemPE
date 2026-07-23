@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::memory::{Capture, CapturedImage};
 use crate::output::{OutputFile, OutputPlan, WrittenFile};
-use crate::pe::{self, ExportIndex, ExportStats, PeKind, RebuiltImage};
+use crate::pe::{self, EntryPointRva, ExportIndex, ExportStats, PeKind, RebuiltImage};
 use crate::process::TargetProcess;
 use crate::{AppError, AppResult};
 
@@ -50,8 +50,8 @@ pub(crate) struct BuildReport {
     main_rebuilt: bool,
     dll_failures: usize,
     export_stats: ExportStats,
-    private_executable_allocations: usize,
-    hidden_private_images: usize,
+    executable_non_image_allocations: usize,
+    hidden_non_image_images: usize,
 }
 
 pub(crate) struct DumpOutcome {
@@ -59,8 +59,8 @@ pub(crate) struct DumpOutcome {
     pub(crate) failures: Vec<BuildFailure>,
     pub(crate) summary: DumpSummary,
     pub(crate) export_stats: ExportStats,
-    pub(crate) private_executable_allocations: usize,
-    pub(crate) hidden_private_images: usize,
+    pub(crate) executable_non_image_allocations: usize,
+    pub(crate) hidden_non_image_images: usize,
     main_rebuilt: bool,
     dll_failures: usize,
 }
@@ -74,8 +74,8 @@ impl BuildReport {
             failures: self.failures,
             summary,
             export_stats: self.export_stats,
-            private_executable_allocations: self.private_executable_allocations,
-            hidden_private_images: self.hidden_private_images,
+            executable_non_image_allocations: self.executable_non_image_allocations,
+            hidden_non_image_images: self.hidden_non_image_images,
             main_rebuilt: self.main_rebuilt,
             dll_failures: self.dll_failures,
         })
@@ -104,7 +104,7 @@ impl DumpOutcome {
             || self.summary.invalid_unwind_entries > 0
             || self.export_stats.unresolved_forwarders > 0
             || !self.failures.is_empty()
-            || self.private_executable_allocations > self.hidden_private_images
+            || self.executable_non_image_allocations > self.hidden_non_image_images
     }
 }
 
@@ -140,9 +140,13 @@ impl DumpSummary {
     }
 }
 
-pub(crate) fn build(target: &TargetProcess, capture: Capture) -> BuildReport {
-    let private_executable_allocations = capture.private_executable_allocations;
-    let hidden_private_images = capture.images.iter().filter(|image| image.hidden).count();
+pub(crate) fn build(
+    target: &TargetProcess,
+    capture: Capture,
+    entry_point: Option<EntryPointRva>,
+) -> BuildReport {
+    let executable_non_image_allocations = capture.executable_non_image_allocations;
+    let hidden_non_image_images = capture.images.iter().filter(|image| image.hidden).count();
     let mut images = capture.images;
     prepare_images(&mut images);
 
@@ -156,11 +160,23 @@ pub(crate) fn build(target: &TargetProcess, capture: Capture) -> BuildReport {
         target,
         &images,
         export_stats,
-        private_executable_allocations,
-        hidden_private_images,
+        executable_non_image_allocations,
+        hidden_non_image_images,
     );
+    if entry_point.is_some() && !images.iter().any(|image| image.is_main) {
+        report.failures.push(BuildFailure {
+            name: target.name.clone(),
+            base: target.main_module.base,
+            error: AppError::new("manual entry point requires a captured main image"),
+        });
+        return report;
+    }
     for image in images {
-        build_image(target, image, &exports, &mut report);
+        let validates_manual_entry_point = image.is_main && entry_point.is_some();
+        build_image(target, image, &exports, entry_point, &mut report);
+        if validates_manual_entry_point && !report.main_rebuilt {
+            break;
+        }
     }
     report
 }
@@ -178,8 +194,8 @@ fn empty_report(
     target: &TargetProcess,
     images: &[CapturedImage],
     export_stats: ExportStats,
-    private_executable_allocations: usize,
-    hidden_private_images: usize,
+    executable_non_image_allocations: usize,
+    hidden_non_image_images: usize,
 ) -> BuildReport {
     let captured_bases = images.iter().map(|image| image.base).collect::<Vec<_>>();
     let dll_failures = target
@@ -195,8 +211,8 @@ fn empty_report(
         main_rebuilt: false,
         dll_failures,
         export_stats,
-        private_executable_allocations,
-        hidden_private_images,
+        executable_non_image_allocations,
+        hidden_non_image_images,
     }
 }
 
@@ -204,10 +220,12 @@ fn build_image(
     target: &TargetProcess,
     image: CapturedImage,
     exports: &ExportIndex,
+    entry_point: Option<EntryPointRva>,
     report: &mut BuildReport,
 ) {
     let known_module = image.name.is_some();
-    match rebuild_image(&image, exports) {
+    let image_entry_point = if image.is_main { entry_point } else { None };
+    match rebuild_image(&image, exports, image_entry_point) {
         Ok(rebuilt) if should_write(&image, &rebuilt, known_module) => {
             report.main_rebuilt |= image.is_main;
             let preferred_name = output_name(target, &image, &rebuilt);
@@ -273,16 +291,28 @@ fn record_failure(
     });
 }
 
-fn rebuild_image(image: &CapturedImage, exports: &ExportIndex) -> AppResult<RebuiltImage> {
-    match pe::rebuild(&image.bytes, image.base, None, exports) {
+fn rebuild_image(
+    image: &CapturedImage,
+    exports: &ExportIndex,
+    entry_point: Option<EntryPointRva>,
+) -> AppResult<RebuiltImage> {
+    match pe::rebuild(
+        &image.bytes,
+        &image.regions,
+        image.base,
+        None,
+        exports,
+        entry_point,
+    ) {
         Ok(rebuilt) => Ok(rebuilt),
-        Err(memory_error) => rebuild_with_disk_headers(image, exports, memory_error),
+        Err(memory_error) => rebuild_with_disk_headers(image, exports, entry_point, memory_error),
     }
 }
 
 fn rebuild_with_disk_headers(
     image: &CapturedImage,
     exports: &ExportIndex,
+    entry_point: Option<EntryPointRva>,
     memory_error: AppError,
 ) -> AppResult<RebuiltImage> {
     let Some(path) = &image.path else {
@@ -294,7 +324,14 @@ fn rebuild_with_disk_headers(
             path.display()
         ))
     })?;
-    pe::rebuild(&image.bytes, image.base, Some(&disk_headers), exports)
+    pe::rebuild(
+        &image.bytes,
+        &image.regions,
+        image.base,
+        Some(&disk_headers),
+        exports,
+        entry_point,
+    )
 }
 
 fn read_disk_headers(path: &Path) -> AppResult<Vec<u8>> {

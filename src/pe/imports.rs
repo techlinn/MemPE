@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use crate::pe::exports::{ExportIndex, ResolvedExport};
 use crate::pe::image;
 use crate::pe::{PeImage, PeKind, Rva};
@@ -12,6 +14,7 @@ const MAX_IMPORTS: usize = 65_536;
 const MAX_IMPORT_GROUPS: usize = 4_096;
 const MAX_IMPORT_NAME: usize = 4_096;
 const MAX_THUNK_DEPTH: usize = 4;
+const MAX_CODE_REFERENCE_BYTES: usize = 256 * 1024 * 1024;
 
 pub(super) struct ImportEntry {
     pub(super) name: Option<String>,
@@ -32,7 +35,7 @@ pub(super) struct ImportPlan {
     pub(super) existing_valid: bool,
 }
 
-pub(super) fn analyze(
+pub(super) fn build_plan(
     image: &PeImage<'_>,
     observed_base: usize,
     exports: &ExportIndex,
@@ -71,7 +74,7 @@ pub(super) fn analyze(
         let end = (trusted_end as usize)
             .min((section_start as usize).saturating_add(length))
             .min(memory.len());
-        scan_section(
+        scan_import_range(
             memory,
             observed_base,
             model.kind(),
@@ -84,10 +87,11 @@ pub(super) fn analyze(
             break;
         }
     }
+    recover_referenced_imports(image, observed_base, exports, &mut plan);
     plan
 }
 
-fn scan_section(
+fn scan_import_range(
     memory: &[u8],
     observed_base: usize,
     kind: PeKind,
@@ -128,7 +132,7 @@ fn scan_section(
                 == Some(0);
         let ends_cleanly = read_pointer(memory, offset, width) == Some(0) || offset == end;
         if entries.len() >= 2 && starts_cleanly && ends_cleanly {
-            append_groups(entries, width, plan);
+            append_groups(entries, width, 2, plan);
         }
         if offset == run_start {
             offset = offset.saturating_add(width);
@@ -136,7 +140,155 @@ fn scan_section(
     }
 }
 
-fn append_groups(entries: Vec<(u32, ResolvedExport)>, width: usize, plan: &mut ImportPlan) {
+fn recover_referenced_imports(
+    image: &PeImage<'_>,
+    observed_base: usize,
+    exports: &ExportIndex,
+    plan: &mut ImportPlan,
+) {
+    if plan.recovered >= MAX_IMPORTS || plan.groups.len() >= MAX_IMPORT_GROUPS {
+        return;
+    }
+    let model = image.model();
+    let memory = image.bytes();
+    let kind = model.kind();
+    let width = if kind == PeKind::Pe32 { 4 } else { 8 };
+    let recovered = collect_recovered_slots(plan, width);
+    let referenced = find_referenced_slots(image, observed_base);
+    let remaining = MAX_IMPORTS.saturating_sub(plan.recovered);
+    let mut entries = Vec::with_capacity(referenced.len().min(remaining));
+
+    for slot in referenced {
+        if recovered.contains(&slot)
+            || !slot_is_in_data_section(image, slot, width)
+            || entries.len() >= remaining
+        {
+            continue;
+        }
+        let Some(value) = read_pointer(memory, slot as usize, width) else {
+            continue;
+        };
+        let Some((symbol, ambiguous)) = resolve_value(memory, observed_base, kind, value, exports)
+        else {
+            continue;
+        };
+        if ambiguous {
+            plan.ambiguous = plan.ambiguous.saturating_add(1);
+            continue;
+        }
+        entries.push((slot, symbol));
+    }
+
+    append_groups(entries, width, 1, plan);
+}
+
+fn find_referenced_slots(image: &PeImage<'_>, observed_base: usize) -> BTreeSet<u32> {
+    let memory = image.bytes();
+    let model = image.model();
+    let mut slots = BTreeSet::new();
+    let mut scanned = 0usize;
+    for section in model.sections() {
+        if !section.is_executable() || scanned >= MAX_CODE_REFERENCE_BYTES {
+            continue;
+        }
+        let start = section.virtual_address().as_usize();
+        let end = start
+            .saturating_add(section.span() as usize)
+            .min(memory.len());
+        let Some(code) = memory.get(start..end) else {
+            continue;
+        };
+        let remaining = MAX_CODE_REFERENCE_BYTES.saturating_sub(scanned);
+        let scan_length = code.len().min(remaining);
+        for index in 0..scan_length.saturating_sub(5) {
+            let instruction = start.saturating_add(index);
+            if let Some(slot) =
+                decode_slot_reference(memory, observed_base, model.kind(), instruction)
+            {
+                slots.insert(slot);
+                if slots.len() >= MAX_IMPORTS {
+                    return slots;
+                }
+            }
+        }
+        scanned = scanned.saturating_add(scan_length);
+    }
+    slots
+}
+
+fn decode_slot_reference(
+    memory: &[u8],
+    observed_base: usize,
+    kind: PeKind,
+    instruction: usize,
+) -> Option<u32> {
+    let code = memory.get(instruction..instruction.checked_add(6)?)?;
+    if code[0] != 0xFF || !matches!(code[1], 0x15 | 0x25) {
+        return None;
+    }
+    let operand = u32::from_le_bytes([code[2], code[3], code[4], code[5]]);
+    let slot = match kind {
+        PeKind::Pe32 => usize::try_from(operand).ok()?.checked_sub(observed_base)?,
+        PeKind::Pe32Plus => {
+            let next = observed_base
+                .checked_add(instruction)?
+                .checked_add(code.len())?;
+            let displacement = operand as i32;
+            let address = if displacement >= 0 {
+                next.checked_add(displacement as usize)?
+            } else {
+                next.checked_sub(displacement.unsigned_abs() as usize)?
+            };
+            address.checked_sub(observed_base)?
+        }
+    };
+    u32::try_from(slot).ok()
+}
+
+fn slot_is_in_data_section(image: &PeImage<'_>, slot: u32, width: usize) -> bool {
+    if !(slot as usize).is_multiple_of(width) {
+        return false;
+    }
+    let Some(end) = slot.checked_add(width as u32) else {
+        return false;
+    };
+    if end as usize > image.bytes().len() {
+        return false;
+    }
+    image.model().sections().iter().any(|section| {
+        let start = section.virtual_address().get();
+        let section_end = start.saturating_add(section.span());
+        section.characteristics() & IMAGE_SCN_MEM_EXECUTE == 0
+            && section.characteristics() & (IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE) != 0
+            && slot >= start
+            && end <= section_end
+    })
+}
+
+fn collect_recovered_slots(plan: &ImportPlan, width: usize) -> BTreeSet<u32> {
+    let mut slots = BTreeSet::new();
+    for group in &plan.groups {
+        for index in 0..group.entries.len() {
+            let Some(offset) = index
+                .checked_mul(width)
+                .and_then(|value| u32::try_from(value).ok())
+            else {
+                continue;
+            };
+            if let Some(slot) = group.first_thunk.checked_add(offset) {
+                slots.insert(slot);
+            }
+        }
+    }
+    slots
+}
+
+fn append_groups(
+    entries: Vec<(u32, ResolvedExport)>,
+    width: usize,
+    minimum_entries: usize,
+    plan: &mut ImportPlan,
+) {
     let mut current: Option<ImportGroup> = None;
     for (slot, symbol) in entries {
         let same_module = current.as_ref().is_some_and(|group| {
@@ -151,7 +303,7 @@ fn append_groups(entries: Vec<(u32, ResolvedExport)>, width: usize, plan: &mut I
         });
         if !same_module {
             if let Some(group) = current.take() {
-                push_group(group, plan);
+                push_group(group, minimum_entries, plan);
             }
             current = Some(ImportGroup {
                 module: symbol.module.clone(),
@@ -167,15 +319,21 @@ fn append_groups(entries: Vec<(u32, ResolvedExport)>, width: usize, plan: &mut I
         }
     }
     if let Some(group) = current {
-        push_group(group, plan);
+        push_group(group, minimum_entries, plan);
     }
 }
 
-fn push_group(group: ImportGroup, plan: &mut ImportPlan) {
-    if group.entries.len() < 2 || plan.groups.len() >= MAX_IMPORT_GROUPS {
+fn push_group(group: ImportGroup, minimum_entries: usize, plan: &mut ImportPlan) {
+    let Some(recovered) = plan.recovered.checked_add(group.entries.len()) else {
+        return;
+    };
+    if group.entries.len() < minimum_entries
+        || recovered > MAX_IMPORTS
+        || plan.groups.len() >= MAX_IMPORT_GROUPS
+    {
         return;
     }
-    plan.recovered = plan.recovered.saturating_add(group.entries.len());
+    plan.recovered = recovered;
     plan.groups.push(group);
 }
 
@@ -346,9 +504,9 @@ fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
 mod tests {
     use pelite::PeFile;
 
-    use super::analyze;
+    use super::{build_plan, decode_slot_reference};
     use crate::pe::parse::parse_memory_image;
-    use crate::pe::{ExportIndex, rebuild};
+    use crate::pe::{ExportIndex, PeKind, rebuild};
 
     #[test]
     fn finds_two_adjacent_resolved_imports() -> Result<(), Box<dyn std::error::Error>> {
@@ -360,13 +518,13 @@ mod tests {
         put_u64(&mut target, 0x2008, export_base as u64 + 0x1010);
         let image = parse_memory_image(&target)?;
 
-        let plan = analyze(&image, 0x0000_7FF6_0000_0000, &index);
+        let plan = build_plan(&image, 0x0000_7FF6_0000_0000, &index);
 
         assert_eq!(plan.recovered, 2);
         assert_eq!(plan.groups.len(), 1);
         assert_eq!(plan.groups[0].module, "fixture.dll");
 
-        let rebuilt = rebuild(&target, 0x0000_7FF6_0000_0000, None, &index)?;
+        let rebuilt = rebuild(&target, &[], 0x0000_7FF6_0000_0000, None, &index, None)?;
         assert_eq!(rebuilt.imports_rebuilt, 2);
         assert_eq!(rebuilt.section_count, 3);
         assert!(PeFile::from_bytes(&rebuilt.bytes).is_ok());
@@ -377,6 +535,60 @@ mod tests {
                 .any(|window| window == b".mempe\0\0")
         );
         Ok(())
+    }
+
+    #[test]
+    fn finds_a_single_import_referenced_by_code() -> Result<(), Box<dyn std::error::Error>> {
+        let export_base = 0x0000_7FFB_0000_0000usize;
+        let target_base = 0x0000_7FF6_0000_0000usize;
+        let export_image = fixture_pe64(true);
+        let index = ExportIndex::build([(export_base, export_image.as_slice(), None)]);
+        let mut target = fixture_pe64(false);
+        put_u64(&mut target, 0x2000, export_base as u64 + 0x1000);
+        let displacement = 0x2000i32 - 0x1006i32;
+        target[0x1000..0x1002].copy_from_slice(&[0xFF, 0x15]);
+        target[0x1002..0x1006].copy_from_slice(&displacement.to_le_bytes());
+        let image = parse_memory_image(&target)?;
+
+        let plan = build_plan(&image, target_base, &index);
+
+        assert_eq!(plan.recovered, 1);
+        assert_eq!(plan.groups.len(), 1);
+        assert_eq!(plan.groups[0].first_thunk, 0x2000);
+        assert_eq!(plan.groups[0].entries.len(), 1);
+
+        let rebuilt = rebuild(&target, &[], target_base, None, &index, None)?;
+        assert_eq!(rebuilt.imports_rebuilt, 1);
+        assert!(PeFile::from_bytes(&rebuilt.bytes).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn ignores_an_unreferenced_single_import() -> Result<(), Box<dyn std::error::Error>> {
+        let export_base = 0x0000_7FFB_0000_0000usize;
+        let export_image = fixture_pe64(true);
+        let index = ExportIndex::build([(export_base, export_image.as_slice(), None)]);
+        let mut target = fixture_pe64(false);
+        put_u64(&mut target, 0x2000, export_base as u64 + 0x1000);
+        let image = parse_memory_image(&target)?;
+
+        let plan = build_plan(&image, 0x0000_7FF6_0000_0000, &index);
+
+        assert_eq!(plan.recovered, 0);
+        assert!(plan.groups.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn decodes_an_x86_absolute_iat_reference() {
+        let base = 0x0040_0000usize;
+        let mut code = [0u8; 6];
+        code[0..2].copy_from_slice(&[0xFF, 0x15]);
+        code[2..6].copy_from_slice(&0x0040_2000u32.to_le_bytes());
+
+        let slot = decode_slot_reference(&code, base, PeKind::Pe32, 0);
+
+        assert_eq!(slot, Some(0x2000));
     }
 
     fn fixture_pe64(with_exports: bool) -> Vec<u8> {
