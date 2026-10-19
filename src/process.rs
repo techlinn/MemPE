@@ -7,7 +7,11 @@ use std::thread;
 use std::time::Duration;
 
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_BAD_LENGTH, ERROR_NO_MORE_FILES, FILETIME, HANDLE,
+    CloseHandle, ERROR_BAD_LENGTH, ERROR_NO_MORE_FILES, FILETIME, HANDLE, LUID,
+};
+use windows::Win32::Security::{
+    AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_DEBUG_NAME,
+    SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
 };
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, MODULEENTRY32W, Module32FirstW, Module32NextW, PROCESSENTRY32W,
@@ -18,11 +22,11 @@ use windows::Win32::System::SystemInformation::{
     IMAGE_FILE_MACHINE_UNKNOWN,
 };
 use windows::Win32::System::Threading::{
-    GetProcessTimes, IsWow64Process2, OpenProcess, PROCESS_ACCESS_RIGHTS,
-    PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
-    QueryFullProcessImageNameW,
+    GetCurrentProcess, GetProcessTimes, IsWow64Process2, OpenProcess, OpenProcessToken,
+    PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_VM_READ, QueryFullProcessImageNameW,
 };
-use windows::core::PWSTR;
+use windows::core::{PCWSTR, PWSTR};
 
 use crate::{AppError, AppResult};
 
@@ -101,6 +105,28 @@ impl Drop for OwnedHandle {
         let result = unsafe { CloseHandle(self.0) };
         debug_assert!(result.is_ok());
     }
+}
+
+pub(crate) fn enable_debug_privilege() {
+    let mut raw_token = HANDLE::default();
+    let opened =
+        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &mut raw_token) };
+    if opened.is_err() {
+        return;
+    }
+    let token = OwnedHandle(raw_token);
+    let mut luid = LUID::default();
+    if unsafe { LookupPrivilegeValueW(PCWSTR::null(), SE_DEBUG_NAME, &mut luid) }.is_err() {
+        return;
+    }
+    let privileges = TOKEN_PRIVILEGES {
+        PrivilegeCount: 1,
+        Privileges: [LUID_AND_ATTRIBUTES {
+            Luid: luid,
+            Attributes: SE_PRIVILEGE_ENABLED,
+        }],
+    };
+    let _ = unsafe { AdjustTokenPrivileges(token.raw(), false, Some(&privileges), 0, None, None) };
 }
 
 struct ProcessEntry {
@@ -297,9 +323,6 @@ fn get_creation_time(handle: &OwnedHandle) -> AppResult<u64> {
 }
 
 fn get_modules(pid: ProcessId) -> AppResult<Vec<ModuleInfo>> {
-    if pid.get() != 0 {
-        return Err(AppError::new("injected Toolhelp failure"));
-    }
     let snapshot = module_snapshot(pid)?;
     let mut entry = MODULEENTRY32W {
         dwSize: size_of::<MODULEENTRY32W>() as u32,

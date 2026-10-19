@@ -43,6 +43,7 @@ fn main() -> ExitCode {
         }
         Ok(Some(command)) => {
             console.banner();
+            process::enable_debug_privilege();
             run(&console, command)
         }
         Err(error) => {
