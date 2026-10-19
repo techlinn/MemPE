@@ -14,6 +14,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -33,8 +35,26 @@ jobs:
           Copy-Item "target/x86_64-pc-windows-msvc/release/mempe.exe" "$dir/"
           Compress-Archive -Path "$dir/*" -DestinationPath "$dir.zip" -Force
 
+      - name: Generate notes
+        shell: bash
+        run: |
+          current="${GITHUB_REF_NAME}"
+          prev=$(git describe --tags --abbrev=0 "${current}^" 2>/dev/null || true)
+          {
+            echo "## Changes"
+            echo
+            if [ -n "$prev" ]; then
+              git log --no-merges --pretty='- %s' "${prev}..${current}"
+              echo
+              echo "**Full Changelog**: https://github.com/${GITHUB_REPOSITORY}/compare/${prev}...${current}"
+            else
+              git log --no-merges --pretty='- %s' "${current}"
+            fi
+          } > NOTES.md
+          cat NOTES.md
+
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
+          body_path: NOTES.md
           files: mempe-windows-x86_64.zip
