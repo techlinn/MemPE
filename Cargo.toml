@@ -1,6 +1,6 @@
 [package]
 name = "mempe"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 license = "MIT"
 description = "Windows PE memory dumper and rebuilder for reverse engineering"
