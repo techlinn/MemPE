@@ -65,6 +65,7 @@ pub(super) struct ImportPlan {
     pub(super) unresolved_outside_image: usize,
     pub(super) unresolved_unknown_stub: usize,
     pub(super) unresolved_chain_exhausted: usize,
+    pub(super) slots_outside_data_sections: usize,
     pub(super) existing: Vec<u8>,
     own: Option<String>,
 }
@@ -353,10 +354,11 @@ fn recover_referenced_imports(
     let mut entries = Vec::with_capacity(referenced.len().min(remaining));
 
     for (slot, reference) in referenced {
-        if recovered.contains(&slot)
-            || !slot_is_in_data_section(image, slot, width)
-            || entries.len() >= remaining
-        {
+        if recovered.contains(&slot) || entries.len() >= remaining {
+            continue;
+        }
+        if !slot_is_in_data_section(image, slot, width) {
+            record_nondata_slot(plan, reference);
             continue;
         }
         let Some(value) = read_pointer(memory, slot as usize, width) else {
@@ -388,11 +390,24 @@ fn recover_referenced_imports(
     append_groups(entries, width, 1, plan);
 }
 
+fn image_offset(observed_base: usize, memory_length: usize, value: usize) -> Option<usize> {
+    let offset = value.checked_sub(observed_base)?;
+    (offset < memory_length).then_some(offset)
+}
+
+fn record_nondata_slot(plan: &mut ImportPlan, reference: Reference) {
+    if reference != Reference::Called {
+        return;
+    }
+    plan.slots_outside_data_sections = plan.slots_outside_data_sections.saturating_add(1);
+}
+
 fn record_unresolved_call(plan: &mut ImportPlan, reference: Reference, reason: Unresolved) {
     if reference != Reference::Called {
         return;
     }
     let counter = match reason {
+        Unresolved::OwnImage => return,
         Unresolved::OutsideImage => &mut plan.unresolved_outside_image,
         Unresolved::UnknownStub => &mut plan.unresolved_unknown_stub,
         Unresolved::ChainExhausted => &mut plan.unresolved_chain_exhausted,
@@ -643,6 +658,7 @@ fn is_import_section(name: &[u8; 8]) -> bool {
 }
 
 enum Unresolved {
+    OwnImage,
     OutsideImage,
     UnknownStub,
     ChainExhausted,
@@ -658,14 +674,13 @@ fn resolve_value(
     let mut value = value;
     for _hop in 0..=MAX_THUNK_DEPTH {
         if let Some(found) = exports.resolve(value) {
+            if image_offset(observed_base, memory.len(), value).is_some() {
+                return Err(Unresolved::OwnImage);
+            }
             return Ok((found.symbol.clone(), found.ambiguous, found.aliased));
         }
-        let rva = value
-            .checked_sub(observed_base)
-            .ok_or(Unresolved::OutsideImage)?;
-        if rva >= memory.len() {
-            return Err(Unresolved::OutsideImage);
-        }
+        let rva =
+            image_offset(observed_base, memory.len(), value).ok_or(Unresolved::OutsideImage)?;
         let next = match kind {
             PeKind::Pe32Plus => decode_x64_thunk(memory, observed_base, rva),
             PeKind::Pe32 => decode_x86_thunk(memory, observed_base, rva),

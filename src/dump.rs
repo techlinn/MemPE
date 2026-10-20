@@ -26,6 +26,7 @@ pub(crate) struct ArtifactInfo {
     pub(crate) unresolved_outside_image: usize,
     pub(crate) unresolved_unknown_stub: usize,
     pub(crate) unresolved_chain_exhausted: usize,
+    pub(crate) slots_outside_data_sections: usize,
     pub(crate) ambiguous_imports: usize,
     pub(crate) aliased_names: usize,
     pub(crate) declared_iat_slots: usize,
@@ -90,6 +91,7 @@ impl ArtifactInfo {
             unresolved_outside_image: 0,
             unresolved_unknown_stub: 0,
             unresolved_chain_exhausted: 0,
+            slots_outside_data_sections: 0,
             ambiguous_imports: 0,
             renamed_sections: 0,
             tls_callbacks: 0,
@@ -136,6 +138,7 @@ pub(crate) struct DumpSummary {
     pub(crate) unresolved_outside_image: usize,
     pub(crate) unresolved_unknown_stub: usize,
     pub(crate) unresolved_chain_exhausted: usize,
+    pub(crate) slots_outside_data_sections: usize,
     pub(crate) ambiguous_imports: usize,
     pub(crate) aliased_names: usize,
     pub(crate) invalid_pdata_sections: usize,
@@ -230,6 +233,7 @@ impl DumpOutcome {
             || self.summary.unresolved_outside_image > 0
             || self.summary.unresolved_unknown_stub > 0
             || self.summary.unresolved_chain_exhausted > 0
+            || self.summary.slots_outside_data_sections > 0
             || self.summary.invalid_unwind_entries > 0
             || self.summary.renamed_sections > 0
             || self.summary.repaired_debug_entries > 0
@@ -278,6 +282,9 @@ impl DumpSummary {
         self.unresolved_chain_exhausted = self
             .unresolved_chain_exhausted
             .saturating_add(info.unresolved_chain_exhausted);
+        self.slots_outside_data_sections = self
+            .slots_outside_data_sections
+            .saturating_add(info.slots_outside_data_sections);
         self.ambiguous_imports = self
             .ambiguous_imports
             .saturating_add(info.ambiguous_imports);
@@ -605,6 +612,7 @@ fn artifact_info(image: &CapturedImage, rebuilt: &RebuiltImage) -> ArtifactInfo 
         unresolved_outside_image: rebuilt.unresolved_outside_image,
         unresolved_unknown_stub: rebuilt.unresolved_unknown_stub,
         unresolved_chain_exhausted: rebuilt.unresolved_chain_exhausted,
+        slots_outside_data_sections: rebuilt.slots_outside_data_sections,
         ambiguous_imports: rebuilt.ambiguous_imports,
         renamed_sections: rebuilt.renamed_sections,
         tls_callbacks: rebuilt.tls_callbacks,
@@ -803,6 +811,7 @@ mod tests {
                 unresolved_outside_image: 0,
                 unresolved_unknown_stub: 0,
                 unresolved_chain_exhausted: 0,
+                slots_outside_data_sections: 0,
                 ambiguous_imports: 0,
                 renamed_sections: 1,
                 tls_callbacks: 2,

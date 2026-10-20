@@ -462,6 +462,12 @@ fn render_import_warnings(console: &Console, outcome: &DumpOutcome) {
             summary.unresolved_chain_exhausted
         ));
     }
+    if summary.slots_outside_data_sections > 0 {
+        console.warning(format_args!(
+            "Called import slots skipped because they lie outside any data section: {}",
+            summary.slots_outside_data_sections
+        ));
+    }
     if summary.invalid_unwind_entries > 0 {
         console.warning(format_args!(
             "Invalid x64 unwind entries removed: {}",
