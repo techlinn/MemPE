@@ -1,0 +1,30 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: clippy
+
+      - name: Build
+        run: cargo build --release --target x86_64-pc-windows-msvc
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
+
+      - name: Test
+        run: cargo test --target x86_64-pc-windows-msvc
+
+      - name: Clippy
+        run: cargo clippy --target x86_64-pc-windows-msvc
