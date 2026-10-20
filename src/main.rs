@@ -373,7 +373,7 @@ fn render_repair_warnings(console: &Console, outcome: &DumpOutcome) {
     console.warning(format_args!("Notable directories cleared: {names}"));
 }
 
-fn repair_warning_counts(summary: &dump::DumpSummary) -> [(usize, &'static str); 15] {
+fn repair_warning_counts(summary: &dump::DumpSummary) -> [(usize, &'static str); 16] {
     [
         (
             summary.never_decrypted_sections,
@@ -386,6 +386,10 @@ fn repair_warning_counts(summary: &dump::DumpSummary) -> [(usize, &'static str);
         (
             summary.invalid_pdata_sections,
             "Sections named .pdata that hold no valid runtime-function table, so their contents are not real",
+        ),
+        (
+            summary.unemitted_imports,
+            "Recovered imports left out because the rebuilt headers could not describe them",
         ),
         (summary.unreadable_pages, "Unreadable pages zero-filled"),
         (

@@ -21,6 +21,7 @@ pub(crate) struct ArtifactInfo {
     pub(crate) cleared_directories: usize,
     pub(crate) invalid_unwind_entries: usize,
     pub(crate) imports_rebuilt: usize,
+    pub(crate) unemitted_imports: usize,
     pub(crate) unresolved_delay: usize,
     pub(crate) ambiguous_imports: usize,
     pub(crate) aliased_names: usize,
@@ -77,6 +78,7 @@ impl ArtifactInfo {
             cleared_directories: 0,
             invalid_unwind_entries: 0,
             imports_rebuilt: 0,
+            unemitted_imports: 0,
             aliased_names: 0,
             declared_iat_slots: 0,
             invalid_pdata_sections: 0,
@@ -123,6 +125,7 @@ pub(crate) struct DumpSummary {
     pub(crate) repaired_headers: usize,
     pub(crate) disk_header_repairs: usize,
     pub(crate) imports_rebuilt: usize,
+    pub(crate) unemitted_imports: usize,
     pub(crate) unresolved_delay: usize,
     pub(crate) ambiguous_imports: usize,
     pub(crate) aliased_names: usize,
@@ -214,6 +217,7 @@ impl DumpOutcome {
             || self.summary.repaired_headers > 0
             || self.summary.disk_header_repairs > 0
             || self.summary.ambiguous_imports > 0
+            || self.summary.unemitted_imports > 0
             || self.summary.invalid_unwind_entries > 0
             || self.summary.renamed_sections > 0
             || self.summary.repaired_debug_entries > 0
@@ -249,6 +253,9 @@ impl DumpSummary {
     fn add_imports(&mut self, info: &ArtifactInfo) {
         self.rebuilt_images = self.rebuilt_images.saturating_add(1);
         self.imports_rebuilt = self.imports_rebuilt.saturating_add(info.imports_rebuilt);
+        self.unemitted_imports = self
+            .unemitted_imports
+            .saturating_add(info.unemitted_imports);
         self.unresolved_delay = self.unresolved_delay.saturating_add(info.unresolved_delay);
         self.ambiguous_imports = self
             .ambiguous_imports
@@ -568,6 +575,7 @@ fn artifact_info(image: &CapturedImage, rebuilt: &RebuiltImage) -> ArtifactInfo 
         cleared_directories: rebuilt.cleared_directories,
         invalid_unwind_entries: rebuilt.invalid_unwind_entries,
         imports_rebuilt: rebuilt.imports_rebuilt,
+        unemitted_imports: rebuilt.unemitted_imports,
         aliased_names: rebuilt.aliased_names,
         declared_iat_slots: rebuilt.declared_iat_slots,
         invalid_pdata_sections: rebuilt.invalid_pdata_sections,
@@ -762,6 +770,7 @@ mod tests {
                 cleared_directories: 1,
                 invalid_unwind_entries: 0,
                 imports_rebuilt: imports,
+                unemitted_imports: 0,
                 aliased_names: 0,
                 declared_iat_slots: 0,
                 invalid_pdata_sections: 0,

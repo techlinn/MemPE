@@ -20,7 +20,7 @@ use directories::{
 };
 use exception::{UnwindRanges, entry_unwind_covered, repair_exception_directory, unwind_layout};
 use headers::{finalize_output, write_core_header_fields};
-use import_section::append_import_section;
+use import_section::{ImportSection, append_import_section};
 use observe::{
     absent_sections, count_tls_callbacks, count_write_execute_sections, entry_section_name,
     invalid_pdata_sections, never_decrypted_sections,
@@ -45,6 +45,7 @@ pub(crate) struct RebuiltImage {
     pub(crate) cleared_directories: usize,
     pub(crate) invalid_unwind_entries: usize,
     pub(crate) imports_rebuilt: usize,
+    pub(crate) unemitted_imports: usize,
     pub(crate) unresolved_delay: usize,
     pub(crate) ambiguous_imports: usize,
     pub(crate) aliased_names: usize,
@@ -92,7 +93,11 @@ pub(crate) fn rebuild(
     let renamed_sections = write_sections(&mut output, memory, &layouts)?;
 
     let mut repairs = apply_repairs(&mut output, model, &layouts, header_size)?;
-    let (import_plan, written) = resolve_imports(
+    let ImportOutcome {
+        plan: import_plan,
+        written,
+        unemitted,
+    } = resolve_imports(
         &mut output,
         model,
         &image,
@@ -113,6 +118,7 @@ pub(crate) fn rebuild(
         notable_cleared_directories: repairs.cleared.notable_names(),
         invalid_unwind_entries: repairs.invalid_unwind_entries,
         imports_rebuilt: if written { import_plan.recovered } else { 0 },
+        unemitted_imports: unemitted,
         unresolved_delay: import_plan.unresolved_delay,
         ambiguous_imports: import_plan.ambiguous,
         aliased_names: import_plan.aliased_names,
@@ -161,6 +167,12 @@ fn apply_repairs(
     })
 }
 
+struct ImportOutcome {
+    plan: ImportPlan,
+    written: bool,
+    unemitted: usize,
+}
+
 fn resolve_imports(
     output: &mut Vec<u8>,
     model: &PeModel,
@@ -168,23 +180,34 @@ fn resolve_imports(
     observed_base: usize,
     exports: &ExportIndex,
     repairs: &mut RepairStats,
-) -> AppResult<(ImportPlan, bool)> {
-    let import_plan = build_plan(image, observed_base, exports);
-    let (written, iat_cleared) = if import_plan.groups.is_empty() {
-        (false, false)
-    } else {
-        append_import_section(output, model, &import_plan)?
+) -> AppResult<ImportOutcome> {
+    let plan = build_plan(image, observed_base, exports);
+    let section = match plan.groups.is_empty() {
+        true => ImportSection::NothingToWrite,
+        false => append_import_section(output, model, &plan)?,
+    };
+    let (written, unemitted, iat_cleared) = match section {
+        ImportSection::Written { iat_cleared } => (true, 0, iat_cleared),
+        ImportSection::NothingToWrite => (false, 0, false),
+        ImportSection::NoImportDirectory | ImportSection::NoRoomInHeaders => {
+            (false, plan.recovered, false)
+        }
     };
     if iat_cleared {
         repairs.cleared.record(IAT_DIRECTORY);
     }
-    if !written && import_plan.existing.is_empty() {
+    if !written && plan.existing.is_empty() {
         let extra = clear_directory(output, model, IMPORT_DIRECTORY)?;
         if extra > 0 {
             repairs.cleared.record(IMPORT_DIRECTORY);
         }
     }
-    Ok((import_plan, written))
+
+    Ok(ImportOutcome {
+        plan,
+        written,
+        unemitted,
+    })
 }
 
 fn declared_iat_slots(image: &PeImage<'_>, model: &PeModel) -> usize {

@@ -8,13 +8,20 @@ use crate::{AppError, AppResult};
 const IMPORT_DESCRIPTOR_SIZE: usize = 20;
 const MEMPE_IMPORT_CHARACTERISTICS: u32 = 0xC000_0040;
 
+pub(super) enum ImportSection {
+    Written { iat_cleared: bool },
+    NothingToWrite,
+    NoImportDirectory,
+    NoRoomInHeaders,
+}
+
 pub(super) fn append_import_section(
     output: &mut Vec<u8>,
     model: &PeModel,
     plan: &ImportPlan,
-) -> AppResult<(bool, bool)> {
+) -> AppResult<ImportSection> {
     if IMPORT_DIRECTORY >= model.directory_count {
-        return Ok((false, false));
+        return Ok(ImportSection::NoImportDirectory);
     }
     let section_header = model
         .sections
@@ -26,7 +33,7 @@ pub(super) fn append_import_section(
     let header_limit = usize::try_from(read_u32(output, model.size_of_headers_offset)?)
         .map_err(|_| AppError::new("PE header size does not fit memory"))?;
     if section_header.saturating_add(SECTION_HEADER_SIZE) > header_limit {
-        return Ok((false, false));
+        return Ok(ImportSection::NoRoomInHeaders);
     }
     let virtual_address = align_up_u64(
         u64::from(read_u32(output, model.size_of_image_offset)?),
@@ -63,7 +70,7 @@ pub(super) fn append_import_section(
         raw_size,
     )?;
     let iat_cleared = commit_import_section(output, model, plan, virtual_address, payload.len())?;
-    Ok((true, iat_cleared))
+    Ok(ImportSection::Written { iat_cleared })
 }
 
 fn write_mempe_section_header(
