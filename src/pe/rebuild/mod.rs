@@ -200,6 +200,9 @@ fn rva_to_file(rva: u32, layouts: &[SectionLayout<'_>], header_size: usize) -> O
         return Some(rva);
     }
     layouts.iter().find_map(|layout| {
+        if layout.raw_size == 0 {
+            return None;
+        }
         let start = layout.model.virtual_address.get() as usize;
         let delta = rva.checked_sub(start)?;
         (delta < layout.source_length).then(|| layout.raw_offset.saturating_add(delta))
