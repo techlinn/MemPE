@@ -171,16 +171,21 @@ fn parse_exports(base: usize, bytes: &[u8], fallback_name: Option<&str>) -> Opti
     let mut direct = Vec::new();
     let mut forwarders = Vec::new();
     for index in 0..header.function_count {
-        let function_rva = read_u32(
-            bytes,
-            header.functions_rva.checked_add(index.checked_mul(4)?)?,
-        )?;
+        let entry = index
+            .checked_mul(4)
+            .and_then(|step| header.functions_rva.checked_add(step));
+        let Some(function_rva) = entry.and_then(|offset| read_u32(bytes, offset)) else {
+            continue;
+        };
         if function_rva == 0 {
             continue;
         }
-        let ordinal = header
-            .ordinal_base
-            .checked_add(u32::try_from(index).ok()?)?;
+        let Some(ordinal) = u32::try_from(index)
+            .ok()
+            .and_then(|step| header.ordinal_base.checked_add(step))
+        else {
+            continue;
+        };
         let aliases = names
             .get(&index)
             .cloned()
