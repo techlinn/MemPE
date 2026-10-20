@@ -27,6 +27,12 @@ pub(crate) struct ArtifactInfo {
     pub(crate) unresolved_unknown_stub: usize,
     pub(crate) unresolved_chain_exhausted: usize,
     pub(crate) slots_outside_data_sections: usize,
+    pub(crate) recovered_attested: usize,
+    pub(crate) recovered_scanned: usize,
+    pub(crate) recovered_delayed: usize,
+    pub(crate) recovered_inferred: usize,
+    pub(crate) mixed_module_runs: usize,
+    pub(crate) slots_with_call_sites: usize,
     pub(crate) ambiguous_imports: usize,
     pub(crate) aliased_names: usize,
     pub(crate) declared_iat_slots: usize,
@@ -92,6 +98,12 @@ impl ArtifactInfo {
             unresolved_unknown_stub: 0,
             unresolved_chain_exhausted: 0,
             slots_outside_data_sections: 0,
+            recovered_attested: 0,
+            recovered_scanned: 0,
+            recovered_delayed: 0,
+            recovered_inferred: 0,
+            mixed_module_runs: 0,
+            slots_with_call_sites: 0,
             ambiguous_imports: 0,
             renamed_sections: 0,
             tls_callbacks: 0,
@@ -139,6 +151,12 @@ pub(crate) struct DumpSummary {
     pub(crate) unresolved_unknown_stub: usize,
     pub(crate) unresolved_chain_exhausted: usize,
     pub(crate) slots_outside_data_sections: usize,
+    pub(crate) recovered_attested: usize,
+    pub(crate) recovered_scanned: usize,
+    pub(crate) recovered_delayed: usize,
+    pub(crate) recovered_inferred: usize,
+    pub(crate) mixed_module_runs: usize,
+    pub(crate) slots_with_call_sites: usize,
     pub(crate) ambiguous_imports: usize,
     pub(crate) aliased_names: usize,
     pub(crate) invalid_pdata_sections: usize,
@@ -285,6 +303,16 @@ impl DumpSummary {
         self.slots_outside_data_sections = self
             .slots_outside_data_sections
             .saturating_add(info.slots_outside_data_sections);
+        self.recovered_attested = self.recovered_attested.saturating_add(info.recovered_attested);
+        self.recovered_scanned = self.recovered_scanned.saturating_add(info.recovered_scanned);
+        self.recovered_delayed = self.recovered_delayed.saturating_add(info.recovered_delayed);
+        self.recovered_inferred = self
+            .recovered_inferred
+            .saturating_add(info.recovered_inferred);
+        self.mixed_module_runs = self.mixed_module_runs.saturating_add(info.mixed_module_runs);
+        self.slots_with_call_sites = self
+            .slots_with_call_sites
+            .saturating_add(info.slots_with_call_sites);
         self.ambiguous_imports = self
             .ambiguous_imports
             .saturating_add(info.ambiguous_imports);
@@ -613,6 +641,12 @@ fn artifact_info(image: &CapturedImage, rebuilt: &RebuiltImage) -> ArtifactInfo 
         unresolved_unknown_stub: rebuilt.unresolved_unknown_stub,
         unresolved_chain_exhausted: rebuilt.unresolved_chain_exhausted,
         slots_outside_data_sections: rebuilt.slots_outside_data_sections,
+        recovered_attested: rebuilt.recovered_attested,
+        recovered_scanned: rebuilt.recovered_scanned,
+        recovered_delayed: rebuilt.recovered_delayed,
+        recovered_inferred: rebuilt.recovered_inferred,
+        mixed_module_runs: rebuilt.mixed_module_runs,
+        slots_with_call_sites: rebuilt.slots_with_call_sites,
         ambiguous_imports: rebuilt.ambiguous_imports,
         renamed_sections: rebuilt.renamed_sections,
         tls_callbacks: rebuilt.tls_callbacks,
@@ -812,6 +846,12 @@ mod tests {
                 unresolved_unknown_stub: 0,
                 unresolved_chain_exhausted: 0,
                 slots_outside_data_sections: 0,
+                recovered_attested: 0,
+                recovered_scanned: 0,
+                recovered_delayed: 0,
+                recovered_inferred: 0,
+                mixed_module_runs: 0,
+                slots_with_call_sites: 0,
                 ambiguous_imports: 0,
                 renamed_sections: 1,
                 tls_callbacks: 2,

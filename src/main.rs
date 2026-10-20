@@ -293,6 +293,7 @@ fn render_analysis(console: &Console, outcome: &DumpOutcome) {
             outcome.summary.imports_rebuilt, outcome.summary.rebuilt_images
         ),
     );
+    render_recovery_confidence(console, &outcome.summary);
     if outcome.summary.unresolved_delay > 0 {
         console.field(
             "Delay",
@@ -434,6 +435,48 @@ fn repair_warning_counts(summary: &dump::DumpSummary) -> [(usize, &'static str);
             "Images given a missing IMAGE_FILE_EXECUTABLE_IMAGE flag",
         ),
     ]
+}
+
+fn render_recovery_confidence(console: &Console, summary: &dump::DumpSummary) {
+    let tiered = summary
+        .recovered_attested
+        .saturating_add(summary.recovered_scanned)
+        .saturating_add(summary.recovered_delayed)
+        .saturating_add(summary.recovered_inferred);
+    if tiered == 0 {
+        return;
+    }
+    console.field(
+        "Recovered from",
+        format_args!(
+            "{} attested, {} scanned, {} delay, {} inferred",
+            summary.recovered_attested,
+            summary.recovered_scanned,
+            summary.recovered_delayed,
+            summary.recovered_inferred
+        ),
+    );
+    let tabled = summary
+        .recovered_attested
+        .saturating_add(summary.recovered_scanned);
+    if tabled > 0 {
+        console.field(
+            "Call sites",
+            format_args!(
+                "{} of {} tabled slots are referenced by code",
+                summary.slots_with_call_sites, tabled
+            ),
+        );
+    }
+    if summary.mixed_module_runs > 0 {
+        console.field(
+            "Mixed runs",
+            format_args!(
+                "{} scanned runs spanned more than one module",
+                summary.mixed_module_runs
+            ),
+        );
+    }
 }
 
 fn render_import_warnings(console: &Console, outcome: &DumpOutcome) {

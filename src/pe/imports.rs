@@ -53,6 +53,15 @@ pub(super) struct ImportGroup {
     pub(super) module: String,
     pub(super) first_thunk: u32,
     pub(super) entries: Vec<ImportEntry>,
+    source: ImportSource,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ImportSource {
+    Attested,
+    Scanned,
+    Delayed,
+    Inferred,
 }
 
 #[derive(Default)]
@@ -66,6 +75,12 @@ pub(super) struct ImportPlan {
     pub(super) unresolved_unknown_stub: usize,
     pub(super) unresolved_chain_exhausted: usize,
     pub(super) slots_outside_data_sections: usize,
+    pub(super) recovered_attested: usize,
+    pub(super) recovered_scanned: usize,
+    pub(super) recovered_delayed: usize,
+    pub(super) recovered_inferred: usize,
+    pub(super) mixed_module_runs: usize,
+    pub(super) slots_with_call_sites: usize,
     pub(super) existing: Vec<u8>,
     own: Option<String>,
 }
@@ -79,12 +94,13 @@ pub(super) fn build_plan(
         own: embedded_module_name(image.bytes()),
         ..ImportPlan::default()
     };
+    let referenced = find_referenced_slots(image, observed_base);
     match existing_descriptors(image).or_else(|| scan_for_orphaned_descriptors(image)) {
         Some(existing) => plan.existing = existing,
-        None => scan_trusted_ranges(image, observed_base, exports, &mut plan),
+        None => scan_trusted_ranges(image, observed_base, exports, &referenced, &mut plan),
     }
-    scan_delay_imports(image, observed_base, exports, &mut plan);
-    recover_referenced_imports(image, observed_base, exports, &mut plan);
+    scan_delay_imports(image, observed_base, exports, &referenced, &mut plan);
+    recover_referenced_imports(image, observed_base, exports, &referenced, &mut plan);
     plan
 }
 
@@ -92,6 +108,7 @@ fn scan_trusted_ranges(
     image: &PeImage<'_>,
     observed_base: usize,
     exports: &ExportIndex,
+    referenced: &BTreeMap<u32, Reference>,
     plan: &mut ImportPlan,
 ) {
     let memory = image.bytes();
@@ -110,25 +127,27 @@ fn scan_trusted_ranges(
             .and_then(|(start, end)| {
                 let overlap_start = start.max(section_start);
                 let overlap_end = end.min(section_end);
-                (overlap_start < overlap_end).then_some((
-                    overlap_start,
-                    overlap_end,
-                    ATTESTED_MINIMUM_ENTRIES,
-                ))
+                (overlap_start < overlap_end).then_some(TrustedRange {
+                    start: overlap_start,
+                    end: overlap_end,
+                    minimum: ATTESTED_MINIMUM_ENTRIES,
+                    source: ImportSource::Attested,
+                })
             })
             .or_else(|| {
-                is_import_section(section.name()).then_some((
-                    section_start,
-                    section_end,
-                    SCANNED_MINIMUM_ENTRIES,
-                ))
+                is_import_section(section.name()).then_some(TrustedRange {
+                    start: section_start,
+                    end: section_end,
+                    minimum: SCANNED_MINIMUM_ENTRIES,
+                    source: ImportSource::Scanned,
+                })
             });
-        let Some((trusted_start, trusted_end, minimum)) = trusted_range else {
+        let Some(trusted) = trusted_range else {
             continue;
         };
-        let start = trusted_start as usize;
+        let start = trusted.start as usize;
         let length = section.span() as usize;
-        let end = (trusted_end as usize)
+        let end = (trusted.end as usize)
             .min((section_start as usize).saturating_add(length))
             .min(memory.len());
         scan_import_range(
@@ -139,8 +158,10 @@ fn scan_trusted_ranges(
             ImportScan {
                 start,
                 end,
-                minimum,
+                minimum: trusted.minimum,
+                source: trusted.source,
             },
+            referenced,
             plan,
         );
         if plan.recovered >= MAX_IMPORTS || plan.groups.len() >= MAX_IMPORT_GROUPS {
@@ -153,6 +174,7 @@ fn scan_delay_imports(
     image: &PeImage<'_>,
     observed_base: usize,
     exports: &ExportIndex,
+    referenced: &BTreeMap<u32, Reference>,
     plan: &mut ImportPlan,
 ) {
     let Some((directory_rva, directory_size)) = directory(image, DELAY_IMPORT_DIRECTORY) else {
@@ -194,6 +216,7 @@ fn scan_delay_imports(
             start,
             end,
             minimum: ATTESTED_MINIMUM_ENTRIES,
+            source: ImportSource::Delayed,
         };
         unbound = unbound.saturating_add(unbound_delay_slots(
             memory,
@@ -202,7 +225,7 @@ fn scan_delay_imports(
             exports,
             &scan,
         ));
-        scan_import_range(memory, observed_base, kind, exports, scan, plan);
+        scan_import_range(memory, observed_base, kind, exports, scan, referenced, plan);
     }
     plan.unresolved_delay = plan.unresolved_delay.saturating_add(unbound);
 }
@@ -276,6 +299,14 @@ struct ImportScan {
     start: usize,
     end: usize,
     minimum: usize,
+    source: ImportSource,
+}
+
+struct TrustedRange {
+    start: u32,
+    end: u32,
+    minimum: usize,
+    source: ImportSource,
 }
 
 fn scan_import_range(
@@ -284,12 +315,14 @@ fn scan_import_range(
     kind: PeKind,
     exports: &ExportIndex,
     scan: ImportScan,
+    referenced: &BTreeMap<u32, Reference>,
     plan: &mut ImportPlan,
 ) {
     let ImportScan {
         start,
         end,
         minimum,
+        source,
     } = scan;
     let width = kind.pointer_width();
     let aligned_start = start.saturating_add((width - start % width) % width);
@@ -326,7 +359,8 @@ fn scan_import_range(
                 == Some(0);
         let ends_cleanly = read_pointer(memory, offset, width) == Some(0) || offset == end;
         if entries.len() >= minimum && starts_cleanly && ends_cleanly {
-            append_groups(entries, width, minimum, plan);
+            record_mixed_module_run(plan, &entries);
+            append_groups(entries, width, minimum, source, referenced, plan);
         }
         if offset == run_start {
             offset = offset.saturating_add(width);
@@ -338,6 +372,7 @@ fn recover_referenced_imports(
     image: &PeImage<'_>,
     observed_base: usize,
     exports: &ExportIndex,
+    referenced: &BTreeMap<u32, Reference>,
     plan: &mut ImportPlan,
 ) {
     if plan.recovered >= MAX_IMPORTS || plan.groups.len() >= MAX_IMPORT_GROUPS {
@@ -349,11 +384,10 @@ fn recover_referenced_imports(
     let width = kind.pointer_width();
     let mut recovered = collect_recovered_slots(plan, width);
     recovered.append(&mut existing_thunk_slots(memory, &plan.existing, width));
-    let referenced = find_referenced_slots(image, observed_base);
     let remaining = MAX_IMPORTS.saturating_sub(plan.recovered);
     let mut entries = Vec::with_capacity(referenced.len().min(remaining));
 
-    for (slot, reference) in referenced {
+    for (&slot, &reference) in referenced {
         if recovered.contains(&slot) || entries.len() >= remaining {
             continue;
         }
@@ -387,7 +421,14 @@ fn recover_referenced_imports(
         entries.push((slot, symbol));
     }
 
-    append_groups(entries, width, 1, plan);
+    append_groups(
+        entries,
+        width,
+        1,
+        ImportSource::Inferred,
+        referenced,
+        plan,
+    );
 }
 
 fn image_offset(observed_base: usize, memory_length: usize, value: usize) -> Option<usize> {
@@ -591,6 +632,8 @@ fn append_groups(
     entries: Vec<(u32, ResolvedExport)>,
     width: usize,
     minimum_entries: usize,
+    source: ImportSource,
+    referenced: &BTreeMap<u32, Reference>,
     plan: &mut ImportPlan,
 ) {
     let mut current: Option<ImportGroup> = None;
@@ -614,12 +657,13 @@ fn append_groups(
         });
         if !same_module {
             if let Some(group) = current.take() {
-                push_group(group, minimum_entries, plan);
+                commit_group(group, minimum_entries, width, referenced, plan);
             }
             current = Some(ImportGroup {
                 module: symbol.module.clone(),
                 first_thunk: slot,
                 entries: Vec::new(),
+                source,
             });
         }
         if let Some(group) = &mut current {
@@ -630,22 +674,80 @@ fn append_groups(
         }
     }
     if let Some(group) = current {
-        push_group(group, minimum_entries, plan);
+        commit_group(group, minimum_entries, width, referenced, plan);
     }
 }
 
-fn push_group(group: ImportGroup, minimum_entries: usize, plan: &mut ImportPlan) {
-    let Some(recovered) = plan.recovered.checked_add(group.entries.len()) else {
+fn commit_group(
+    group: ImportGroup,
+    minimum_entries: usize,
+    width: usize,
+    referenced: &BTreeMap<u32, Reference>,
+    plan: &mut ImportPlan,
+) {
+    let agreeing = count_referenced_slots(&group, width, referenced);
+    let source = group.source;
+    if !push_group(group, minimum_entries, plan) {
         return;
+    }
+    if !carries_call_site_evidence(source) {
+        return;
+    }
+    plan.slots_with_call_sites = plan.slots_with_call_sites.saturating_add(agreeing);
+}
+
+fn carries_call_site_evidence(source: ImportSource) -> bool {
+    matches!(source, ImportSource::Attested | ImportSource::Scanned)
+}
+
+fn count_referenced_slots(
+    group: &ImportGroup,
+    width: usize,
+    referenced: &BTreeMap<u32, Reference>,
+) -> usize {
+    (0..group.entries.len())
+        .filter_map(|index| {
+            let offset = u32::try_from(index.checked_mul(width)?).ok()?;
+            group.first_thunk.checked_add(offset)
+        })
+        .filter(|slot| referenced.contains_key(slot))
+        .count()
+}
+
+fn record_mixed_module_run(plan: &mut ImportPlan, entries: &[(u32, ResolvedExport)]) {
+    let modules = entries
+        .iter()
+        .map(|(_, symbol)| symbol.module.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    if modules.len() > 1 {
+        plan.mixed_module_runs = plan.mixed_module_runs.saturating_add(1);
+    }
+}
+
+fn push_group(group: ImportGroup, minimum_entries: usize, plan: &mut ImportPlan) -> bool {
+    let Some(recovered) = plan.recovered.checked_add(group.entries.len()) else {
+        return false;
     };
     if group.entries.len() < minimum_entries
         || recovered > MAX_IMPORTS
         || plan.groups.len() >= MAX_IMPORT_GROUPS
     {
-        return;
+        return false;
     }
+    record_recovered_tier(plan, group.source, group.entries.len());
     plan.recovered = recovered;
     plan.groups.push(group);
+    true
+}
+
+fn record_recovered_tier(plan: &mut ImportPlan, source: ImportSource, entries: usize) {
+    let counter = match source {
+        ImportSource::Attested => &mut plan.recovered_attested,
+        ImportSource::Scanned => &mut plan.recovered_scanned,
+        ImportSource::Delayed => &mut plan.recovered_delayed,
+        ImportSource::Inferred => &mut plan.recovered_inferred,
+    };
+    *counter = counter.saturating_add(entries);
 }
 
 fn is_import_section(name: &[u8; 8]) -> bool {
