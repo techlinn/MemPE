@@ -62,6 +62,9 @@ pub(super) struct ImportPlan {
     pub(super) ambiguous: usize,
     pub(super) aliased_names: usize,
     pub(super) unresolved_delay: usize,
+    pub(super) unresolved_outside_image: usize,
+    pub(super) unresolved_unknown_stub: usize,
+    pub(super) unresolved_chain_exhausted: usize,
     pub(super) existing: Vec<u8>,
     own: Option<String>,
 }
@@ -217,7 +220,7 @@ fn unbound_delay_slots(
         let Some(value) = read_pointer(memory, offset, width) else {
             break;
         };
-        if resolve_value(memory, observed_base, kind, value, exports).is_none() {
+        if resolve_value(memory, observed_base, kind, value, exports).is_err() {
             unbound = unbound.saturating_add(1);
         }
         offset = offset.saturating_add(width);
@@ -297,7 +300,7 @@ fn scan_import_range(
             let Some(value) = read_pointer(memory, offset, width) else {
                 break;
             };
-            let Some((symbol, ambiguous, aliased)) =
+            let Ok((symbol, ambiguous, aliased)) =
                 resolve_value(memory, observed_base, kind, value, exports)
             else {
                 break;
@@ -359,11 +362,14 @@ fn recover_referenced_imports(
         let Some(value) = read_pointer(memory, slot as usize, width) else {
             continue;
         };
-        let Some((symbol, ambiguous, aliased)) =
-            resolve_value(memory, observed_base, kind, value, exports)
-        else {
-            continue;
-        };
+        let (symbol, ambiguous, aliased) =
+            match resolve_value(memory, observed_base, kind, value, exports) {
+                Ok(found) => found,
+                Err(reason) => {
+                    record_unresolved_call(plan, reference, reason);
+                    continue;
+                }
+            };
         if ambiguous {
             plan.ambiguous = plan.ambiguous.saturating_add(1);
             continue;
@@ -382,6 +388,18 @@ fn recover_referenced_imports(
     append_groups(entries, width, 1, plan);
 }
 
+fn record_unresolved_call(plan: &mut ImportPlan, reference: Reference, reason: Unresolved) {
+    if reference != Reference::Called {
+        return;
+    }
+    let counter = match reason {
+        Unresolved::OutsideImage => &mut plan.unresolved_outside_image,
+        Unresolved::UnknownStub => &mut plan.unresolved_unknown_stub,
+        Unresolved::ChainExhausted => &mut plan.unresolved_chain_exhausted,
+    };
+    *counter = counter.saturating_add(1);
+}
+
 fn neighbor_shares_module(
     memory: &[u8],
     observed_base: usize,
@@ -396,7 +414,7 @@ fn neighbor_shares_module(
         .into_iter()
         .flatten()
         .filter_map(|neighbor| read_pointer(memory, neighbor as usize, width))
-        .filter_map(|value| resolve_value(memory, observed_base, kind, value, exports))
+        .filter_map(|value| resolve_value(memory, observed_base, kind, value, exports).ok())
         .any(|(symbol, _, _)| symbol.module.eq_ignore_ascii_case(module))
 }
 
@@ -624,29 +642,41 @@ fn is_import_section(name: &[u8; 8]) -> bool {
     value.eq_ignore_ascii_case(b".idata") || value.eq_ignore_ascii_case(b".didat")
 }
 
+enum Unresolved {
+    OutsideImage,
+    UnknownStub,
+    ChainExhausted,
+}
+
 fn resolve_value(
     memory: &[u8],
     observed_base: usize,
     kind: PeKind,
     value: usize,
     exports: &ExportIndex,
-) -> Option<(ResolvedExport, bool, bool)> {
+) -> Result<(ResolvedExport, bool, bool), Unresolved> {
     let mut value = value;
     for _hop in 0..=MAX_THUNK_DEPTH {
         if let Some(found) = exports.resolve(value) {
-            return Some((found.symbol.clone(), found.ambiguous, found.aliased));
+            return Ok((found.symbol.clone(), found.ambiguous, found.aliased));
         }
-        let rva = value.checked_sub(observed_base)?;
+        let rva = value
+            .checked_sub(observed_base)
+            .ok_or(Unresolved::OutsideImage)?;
+        if rva >= memory.len() {
+            return Err(Unresolved::OutsideImage);
+        }
         let next = match kind {
             PeKind::Pe32Plus => decode_x64_thunk(memory, observed_base, rva),
             PeKind::Pe32 => decode_x86_thunk(memory, observed_base, rva),
-        }?;
+        }
+        .ok_or(Unresolved::UnknownStub)?;
         if next == value {
-            return None;
+            return Err(Unresolved::ChainExhausted);
         }
         value = next;
     }
-    None
+    Err(Unresolved::ChainExhausted)
 }
 
 fn decode_x64_thunk(memory: &[u8], base: usize, rva: usize) -> Option<usize> {

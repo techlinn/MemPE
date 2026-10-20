@@ -23,6 +23,9 @@ pub(crate) struct ArtifactInfo {
     pub(crate) imports_rebuilt: usize,
     pub(crate) unemitted_imports: usize,
     pub(crate) unresolved_delay: usize,
+    pub(crate) unresolved_outside_image: usize,
+    pub(crate) unresolved_unknown_stub: usize,
+    pub(crate) unresolved_chain_exhausted: usize,
     pub(crate) ambiguous_imports: usize,
     pub(crate) aliased_names: usize,
     pub(crate) declared_iat_slots: usize,
@@ -84,6 +87,9 @@ impl ArtifactInfo {
             invalid_pdata_sections: 0,
             managed: false,
             unresolved_delay: 0,
+            unresolved_outside_image: 0,
+            unresolved_unknown_stub: 0,
+            unresolved_chain_exhausted: 0,
             ambiguous_imports: 0,
             renamed_sections: 0,
             tls_callbacks: 0,
@@ -127,6 +133,9 @@ pub(crate) struct DumpSummary {
     pub(crate) imports_rebuilt: usize,
     pub(crate) unemitted_imports: usize,
     pub(crate) unresolved_delay: usize,
+    pub(crate) unresolved_outside_image: usize,
+    pub(crate) unresolved_unknown_stub: usize,
+    pub(crate) unresolved_chain_exhausted: usize,
     pub(crate) ambiguous_imports: usize,
     pub(crate) aliased_names: usize,
     pub(crate) invalid_pdata_sections: usize,
@@ -218,6 +227,9 @@ impl DumpOutcome {
             || self.summary.disk_header_repairs > 0
             || self.summary.ambiguous_imports > 0
             || self.summary.unemitted_imports > 0
+            || self.summary.unresolved_outside_image > 0
+            || self.summary.unresolved_unknown_stub > 0
+            || self.summary.unresolved_chain_exhausted > 0
             || self.summary.invalid_unwind_entries > 0
             || self.summary.renamed_sections > 0
             || self.summary.repaired_debug_entries > 0
@@ -257,6 +269,15 @@ impl DumpSummary {
             .unemitted_imports
             .saturating_add(info.unemitted_imports);
         self.unresolved_delay = self.unresolved_delay.saturating_add(info.unresolved_delay);
+        self.unresolved_outside_image = self
+            .unresolved_outside_image
+            .saturating_add(info.unresolved_outside_image);
+        self.unresolved_unknown_stub = self
+            .unresolved_unknown_stub
+            .saturating_add(info.unresolved_unknown_stub);
+        self.unresolved_chain_exhausted = self
+            .unresolved_chain_exhausted
+            .saturating_add(info.unresolved_chain_exhausted);
         self.ambiguous_imports = self
             .ambiguous_imports
             .saturating_add(info.ambiguous_imports);
@@ -581,6 +602,9 @@ fn artifact_info(image: &CapturedImage, rebuilt: &RebuiltImage) -> ArtifactInfo 
         invalid_pdata_sections: rebuilt.invalid_pdata_sections,
         managed: rebuilt.managed,
         unresolved_delay: rebuilt.unresolved_delay,
+        unresolved_outside_image: rebuilt.unresolved_outside_image,
+        unresolved_unknown_stub: rebuilt.unresolved_unknown_stub,
+        unresolved_chain_exhausted: rebuilt.unresolved_chain_exhausted,
         ambiguous_imports: rebuilt.ambiguous_imports,
         renamed_sections: rebuilt.renamed_sections,
         tls_callbacks: rebuilt.tls_callbacks,
@@ -776,6 +800,9 @@ mod tests {
                 invalid_pdata_sections: 0,
                 managed: false,
                 unresolved_delay: 0,
+                unresolved_outside_image: 0,
+                unresolved_unknown_stub: 0,
+                unresolved_chain_exhausted: 0,
                 ambiguous_imports: 0,
                 renamed_sections: 1,
                 tls_callbacks: 2,

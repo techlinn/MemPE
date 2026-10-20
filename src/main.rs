@@ -444,6 +444,24 @@ fn render_import_warnings(console: &Console, outcome: &DumpOutcome) {
             summary.ambiguous_imports
         ));
     }
+    if summary.unresolved_unknown_stub > 0 {
+        console.warning(format_args!(
+            "Referenced import slots pointing at code mempe could not follow: {}",
+            summary.unresolved_unknown_stub
+        ));
+    }
+    if summary.unresolved_outside_image > 0 {
+        console.warning(format_args!(
+            "Referenced import slots pointing outside every captured image: {}",
+            summary.unresolved_outside_image
+        ));
+    }
+    if summary.unresolved_chain_exhausted > 0 {
+        console.warning(format_args!(
+            "Referenced import slots whose thunk chain never reached an export: {}",
+            summary.unresolved_chain_exhausted
+        ));
+    }
     if summary.invalid_unwind_entries > 0 {
         console.warning(format_args!(
             "Invalid x64 unwind entries removed: {}",
