@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::HashMap;
 
 use crate::pe::image;
@@ -15,6 +16,7 @@ pub(crate) struct ResolvedExport {
     pub(crate) module: String,
     pub(crate) name: Option<String>,
     pub(crate) ordinal: u32,
+    forwarded: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -34,6 +36,13 @@ pub(crate) struct ExportIndex {
 struct ForwardedExport {
     source: ResolvedExport,
     target: String,
+}
+
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+enum NamingPriority {
+    ApiSetAlias,
+    Implementation,
+    Facade,
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -104,14 +113,17 @@ impl ExportIndex {
 
     pub(crate) fn resolve(&self, address: usize) -> Option<Resolved<'_>> {
         let symbols = self.addresses.get(&address)?;
-        let symbol = undecorated(symbols).or_else(|| symbols.first())?;
+        let symbol = preferred_symbol(symbols)?;
         let ambiguous = symbols
             .iter()
-            .any(|other| !other.module.eq_ignore_ascii_case(&symbol.module));
+            .any(|other| modules_differ(other, symbol) && !names_match(other, symbol));
+        let aliased = !ambiguous
+            && symbols.len() > 1
+            && symbols.iter().any(|other| !names_match(other, symbol));
         Some(Resolved {
             symbol,
             ambiguous,
-            aliased: symbols.len() > 1 && !ambiguous,
+            aliased,
         })
     }
 }
@@ -122,13 +134,38 @@ pub(crate) struct Resolved<'a> {
     pub(crate) aliased: bool,
 }
 
-fn undecorated(symbols: &[ResolvedExport]) -> Option<&ResolvedExport> {
-    symbols.iter().find(|symbol| {
-        symbol
-            .name
-            .as_deref()
-            .is_some_and(|name| !name.starts_with('?'))
-    })
+fn preferred_symbol(symbols: &[ResolvedExport]) -> Option<&ResolvedExport> {
+    symbols
+        .iter()
+        .min_by_key(|symbol| Reverse((is_undecorated(symbol), naming_priority(symbol))))
+}
+
+fn is_undecorated(symbol: &ResolvedExport) -> bool {
+    symbol
+        .name
+        .as_deref()
+        .is_some_and(|name| !name.starts_with('?'))
+}
+
+fn naming_priority(symbol: &ResolvedExport) -> NamingPriority {
+    if is_api_set(&symbol.module) {
+        return NamingPriority::ApiSetAlias;
+    }
+    match symbol.forwarded {
+        true => NamingPriority::Facade,
+        false => NamingPriority::Implementation,
+    }
+}
+
+fn names_match(left: &ResolvedExport, right: &ResolvedExport) -> bool {
+    match (left.name.as_deref(), right.name.as_deref()) {
+        (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+        _ => false,
+    }
+}
+
+fn modules_differ(left: &ResolvedExport, right: &ResolvedExport) -> bool {
+    !left.module.eq_ignore_ascii_case(&right.module)
 }
 
 pub(crate) fn embedded_module_name(bytes: &[u8]) -> Option<String> {
@@ -190,13 +227,16 @@ fn parse_exports(base: usize, bytes: &[u8], fallback_name: Option<&str>) -> Opti
             .get(&index)
             .cloned()
             .unwrap_or_else(|| vec![String::new()]);
+        let forwarded =
+            function_rva >= header.directory_rva && function_rva < header.directory_end;
         for alias in aliases {
             let symbol = ResolvedExport {
                 module: module.clone(),
                 name: (!alias.is_empty()).then_some(alias),
                 ordinal,
+                forwarded,
             };
-            if function_rva >= header.directory_rva && function_rva < header.directory_end {
+            if forwarded {
                 if let Some(target) = read_ascii(bytes, function_rva as usize) {
                     forwarders.push(ForwardedExport {
                         source: symbol,
@@ -328,7 +368,10 @@ fn resolve_key(
 }
 
 fn is_api_set(module: &str) -> bool {
-    module.starts_with("api-") || module.starts_with("ext-")
+    let Some(head) = module.as_bytes().get(..4) else {
+        return false;
+    };
+    head.eq_ignore_ascii_case(b"api-") || head.eq_ignore_ascii_case(b"ext-")
 }
 
 fn add_definition(
@@ -399,6 +442,7 @@ mod tests {
             module: module.to_owned(),
             name: Some(name.to_owned()),
             ordinal: 1,
+            forwarded: false,
         }
     }
 
@@ -445,7 +489,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let index = index_with(
             0x3000,
-            vec![export("shared", "one.dll"), export("shared", "two.dll")],
+            vec![export("shared", "one.dll"), export("other", "two.dll")],
         );
 
         let found = index.resolve(0x3000).ok_or("address is indexed")?;
