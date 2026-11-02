@@ -25,6 +25,7 @@ pub(crate) struct ArtifactInfo {
     pub(crate) imports_rebuilt: usize,
     pub(crate) unemitted_imports: usize,
     pub(crate) unresolved_delay: usize,
+    pub(crate) unresolved_other_module: usize,
     pub(crate) unresolved_outside_image: usize,
     pub(crate) unresolved_unknown_stub: usize,
     pub(crate) unresolved_chain_exhausted: usize,
@@ -96,6 +97,7 @@ impl ArtifactInfo {
             invalid_pdata_sections: 0,
             managed: false,
             unresolved_delay: 0,
+            unresolved_other_module: 0,
             unresolved_outside_image: 0,
             unresolved_unknown_stub: 0,
             unresolved_chain_exhausted: 0,
@@ -149,6 +151,7 @@ pub(crate) struct DumpSummary {
     pub(crate) imports_rebuilt: usize,
     pub(crate) unemitted_imports: usize,
     pub(crate) unresolved_delay: usize,
+    pub(crate) unresolved_other_module: usize,
     pub(crate) unresolved_outside_image: usize,
     pub(crate) unresolved_unknown_stub: usize,
     pub(crate) unresolved_chain_exhausted: usize,
@@ -250,6 +253,7 @@ impl DumpOutcome {
             || self.summary.disk_header_repairs > 0
             || self.summary.ambiguous_imports > 0
             || self.summary.unemitted_imports > 0
+            || self.summary.unresolved_other_module > 0
             || self.summary.unresolved_outside_image > 0
             || self.summary.unresolved_unknown_stub > 0
             || self.summary.unresolved_chain_exhausted > 0
@@ -292,6 +296,9 @@ impl DumpSummary {
             .unemitted_imports
             .saturating_add(info.unemitted_imports);
         self.unresolved_delay = self.unresolved_delay.saturating_add(info.unresolved_delay);
+        self.unresolved_other_module = self
+            .unresolved_other_module
+            .saturating_add(info.unresolved_other_module);
         self.unresolved_outside_image = self
             .unresolved_outside_image
             .saturating_add(info.unresolved_outside_image);
@@ -304,13 +311,21 @@ impl DumpSummary {
         self.slots_outside_data_sections = self
             .slots_outside_data_sections
             .saturating_add(info.slots_outside_data_sections);
-        self.recovered_attested = self.recovered_attested.saturating_add(info.recovered_attested);
-        self.recovered_scanned = self.recovered_scanned.saturating_add(info.recovered_scanned);
-        self.recovered_delayed = self.recovered_delayed.saturating_add(info.recovered_delayed);
+        self.recovered_attested = self
+            .recovered_attested
+            .saturating_add(info.recovered_attested);
+        self.recovered_scanned = self
+            .recovered_scanned
+            .saturating_add(info.recovered_scanned);
+        self.recovered_delayed = self
+            .recovered_delayed
+            .saturating_add(info.recovered_delayed);
         self.recovered_inferred = self
             .recovered_inferred
             .saturating_add(info.recovered_inferred);
-        self.mixed_module_runs = self.mixed_module_runs.saturating_add(info.mixed_module_runs);
+        self.mixed_module_runs = self
+            .mixed_module_runs
+            .saturating_add(info.mixed_module_runs);
         self.slots_with_call_sites = self
             .slots_with_call_sites
             .saturating_add(info.slots_with_call_sites);
@@ -643,6 +658,7 @@ fn artifact_info(image: &CapturedImage, rebuilt: &RebuiltImage) -> ArtifactInfo 
         invalid_pdata_sections: rebuilt.invalid_pdata_sections,
         managed: rebuilt.managed,
         unresolved_delay: rebuilt.unresolved_delay,
+        unresolved_other_module: rebuilt.unresolved_other_module,
         unresolved_outside_image: rebuilt.unresolved_outside_image,
         unresolved_unknown_stub: rebuilt.unresolved_unknown_stub,
         unresolved_chain_exhausted: rebuilt.unresolved_chain_exhausted,
@@ -848,6 +864,7 @@ mod tests {
                 invalid_pdata_sections: 0,
                 managed: false,
                 unresolved_delay: 0,
+                unresolved_other_module: 0,
                 unresolved_outside_image: 0,
                 unresolved_unknown_stub: 0,
                 unresolved_chain_exhausted: 0,

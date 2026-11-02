@@ -16,7 +16,10 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
-          components: clippy
+          components: clippy, rustfmt
+
+      - name: Format
+        run: cargo fmt --check
 
       - name: Build
         run: cargo build --release --target x86_64-pc-windows-msvc
@@ -27,4 +30,4 @@ jobs:
         run: cargo test --target x86_64-pc-windows-msvc
 
       - name: Clippy
-        run: cargo clippy --target x86_64-pc-windows-msvc
+        run: cargo clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings

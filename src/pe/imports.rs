@@ -81,6 +81,7 @@ pub(super) struct ImportPlan {
     pub(super) ambiguous: usize,
     pub(super) aliased_names: usize,
     pub(super) unresolved_delay: usize,
+    pub(super) unresolved_other_module: usize,
     pub(super) unresolved_outside_image: usize,
     pub(super) unresolved_unknown_stub: usize,
     pub(super) unresolved_chain_exhausted: usize,
@@ -495,6 +496,7 @@ fn record_unresolved_call(plan: &mut ImportPlan, reference: Reference, reason: U
     }
     let counter = match reason {
         Unresolved::OwnImage => return,
+        Unresolved::OtherModule => &mut plan.unresolved_other_module,
         Unresolved::OutsideImage => &mut plan.unresolved_outside_image,
         Unresolved::UnknownStub => &mut plan.unresolved_unknown_stub,
         Unresolved::ChainExhausted => &mut plan.unresolved_chain_exhausted,
@@ -827,6 +829,7 @@ fn is_import_section(name: &[u8; 8]) -> bool {
 
 enum Unresolved {
     OwnImage,
+    OtherModule,
     OutsideImage,
     UnknownStub,
     ChainExhausted,
@@ -847,8 +850,12 @@ fn resolve_value(
             }
             return Ok((found.symbol.clone(), found.ambiguous, found.aliased));
         }
-        let rva =
-            image_offset(observed_base, memory.len(), value).ok_or(Unresolved::OutsideImage)?;
+        let Some(rva) = image_offset(observed_base, memory.len(), value) else {
+            return Err(match exports.covers(value) {
+                true => Unresolved::OtherModule,
+                false => Unresolved::OutsideImage,
+            });
+        };
         let next = match kind {
             PeKind::Pe32Plus => decode_x64_thunk(memory, observed_base, rva),
             PeKind::Pe32 => decode_x86_thunk(memory, observed_base, rva),
@@ -1048,8 +1055,9 @@ mod tests {
     use pelite::PeFile;
 
     use super::{
-        IMPORT_DESCRIPTOR_SIZE, Reference, build_plan, decode_slot_reference, delay_table_range,
-        guard_pointer_slots, is_representable, rip_relative_slot, try_descriptor_array,
+        IMPORT_DESCRIPTOR_SIZE, Reference, Unresolved, build_plan, decode_slot_reference,
+        delay_table_range, guard_pointer_slots, is_representable, resolve_value, rip_relative_slot,
+        try_descriptor_array,
     };
     use crate::pe::parse::parse_memory_image;
     use crate::pe::{ExportIndex, PeKind, rebuild};
@@ -1098,6 +1106,22 @@ mod tests {
         assert_eq!(&rebuilt.bytes[bound_imports..bound_imports + 8], &[0; 8]);
         assert!(PeFile::from_bytes(&rebuilt.bytes).is_ok());
         Ok(())
+    }
+
+    #[test]
+    fn tells_a_pointer_into_another_module_from_one_into_no_module() {
+        let export_base = 0x0000_7FFB_0000_0000usize;
+        let export_image = fixture_pe64(true);
+        let index = ExportIndex::build([(export_base, export_image.as_slice(), None)]);
+        let target = fixture_pe64(false);
+        let base = 0x0000_7FF6_0000_0000usize;
+        let not_exported = export_base + 0x1800;
+
+        let into_module = resolve_value(&target, base, PeKind::Pe32Plus, not_exported, &index);
+        let into_nothing = resolve_value(&target, base, PeKind::Pe32Plus, 0x1234_0000, &index);
+
+        assert!(matches!(into_module, Err(Unresolved::OtherModule)));
+        assert!(matches!(into_nothing, Err(Unresolved::OutsideImage)));
     }
 
     #[test]

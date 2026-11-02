@@ -489,19 +489,25 @@ fn render_import_warnings(console: &Console, outcome: &DumpOutcome) {
     }
     if summary.unresolved_unknown_stub > 0 {
         console.warning(format_args!(
-            "Referenced import slots pointing at code mempe could not follow: {}",
+            "Called pointers into their own image's code that mempe could not trace to an export: {}",
             summary.unresolved_unknown_stub
+        ));
+    }
+    if summary.unresolved_other_module > 0 {
+        console.warning(format_args!(
+            "Called pointers into another module at no export: {}",
+            summary.unresolved_other_module
         ));
     }
     if summary.unresolved_outside_image > 0 {
         console.warning(format_args!(
-            "Referenced import slots pointing outside every captured image: {}",
+            "Called pointers outside every captured image: {}",
             summary.unresolved_outside_image
         ));
     }
     if summary.unresolved_chain_exhausted > 0 {
         console.warning(format_args!(
-            "Referenced import slots whose thunk chain never reached an export: {}",
+            "Called pointers whose thunk chain never reached an export: {}",
             summary.unresolved_chain_exhausted
         ));
     }

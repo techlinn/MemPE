@@ -1,5 +1,6 @@
 use std::cmp::Reverse;
 use std::collections::HashMap;
+use std::ops::Range;
 
 use crate::pe::image;
 use crate::pe::parse::parse_memory_image;
@@ -30,6 +31,7 @@ pub(crate) struct ExportStats {
 #[derive(Default)]
 pub(crate) struct ExportIndex {
     addresses: HashMap<usize, Vec<ResolvedExport>>,
+    image_ranges: Vec<Range<usize>>,
     stats: ExportStats,
 }
 
@@ -91,6 +93,9 @@ impl ExportIndex {
 
         for (base, bytes, fallback_name) in images {
             index.stats.modules = index.stats.modules.saturating_add(1);
+            index
+                .image_ranges
+                .push(base..base.saturating_add(bytes.len()));
             let Some(parsed) = parse_exports(base, bytes, fallback_name) else {
                 continue;
             };
@@ -104,11 +109,22 @@ impl ExportIndex {
         index.stats.forwarders = forwarders.len();
         resolve_forwarders(&mut index, &Definitions::build(definitions), &forwarders);
         index.stats.addresses = index.addresses.len();
+        index.image_ranges.sort_unstable_by_key(|range| range.start);
         index
     }
 
     pub(crate) fn stats(&self) -> ExportStats {
         self.stats
+    }
+
+    pub(crate) fn covers(&self, address: usize) -> bool {
+        let following = self
+            .image_ranges
+            .partition_point(|range| range.start <= address);
+        following
+            .checked_sub(1)
+            .and_then(|index| self.image_ranges.get(index))
+            .is_some_and(|range| range.contains(&address))
     }
 
     pub(crate) fn resolve(&self, address: usize) -> Option<Resolved<'_>> {
@@ -238,8 +254,7 @@ fn parse_exports(base: usize, bytes: &[u8], fallback_name: Option<&str>) -> Opti
             .get(&index)
             .cloned()
             .unwrap_or_else(|| vec![String::new()]);
-        let forwarded =
-            function_rva >= header.directory_rva && function_rva < header.directory_end;
+        let forwarded = function_rva >= header.directory_rva && function_rva < header.directory_end;
         for alias in aliases {
             let symbol = ResolvedExport {
                 module: module.clone(),
@@ -461,6 +476,20 @@ mod tests {
         let mut index = ExportIndex::default();
         index.addresses.insert(address, symbols);
         index
+    }
+
+    #[test]
+    fn covers_each_captured_image_and_nothing_between_them() {
+        let image = vec![0u8; 0x1000];
+        let index = ExportIndex::build([
+            (0x20_0000, image.as_slice(), None),
+            (0x10_0000, image.as_slice(), None),
+        ]);
+
+        assert!(index.covers(0x10_0000));
+        assert!(index.covers(0x20_0FFF));
+        assert!(!index.covers(0x10_1000));
+        assert!(!index.covers(0xF_FFFF));
     }
 
     #[test]
