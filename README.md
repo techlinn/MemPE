@@ -14,7 +14,7 @@ Use it for reverse engineering and unpacking. mempe is a dumper, not a malware s
 - Accepts a PID or waits for a new process with a given name
 - Checks distributed executable and writable-image page samples for stability before a watched dump
 - Finds loader-mapped modules and page-aligned PEs in executable non-image memory
-- Carves embedded PEs out of captured images and out of readable non-image memory, including drivers and .NET assemblies loaded from a byte array
+- Carves embedded PEs out of captured images and out of readable non-image memory, including executable memory such as a shellcode loader's buffer, and including drivers and .NET assemblies loaded from a byte array
 - Converts in-memory sections back to a normal file layout
 - Adds observed section access flags and recovers nonzero runtime data beyond damaged section bounds
 - Recovers imports from the existing descriptor table, from delay-load directory 13, from trusted IAT ranges, and from direct x86/x64 call sites
@@ -27,7 +27,7 @@ Use it for reverse engineering and unpacking. mempe is a dumper, not a malware s
 - Reports what it observed about the entry point and about sections it may not have captured in a decrypted state
 - Zero-fills unreadable pages and reports them in the final summary
 - Orders warnings so the ones that mean the dump may be wrong come before the cosmetic ones
-- Reports how much non-image memory the embedded-PE scan had to leave unread, so an empty carve result is distinguishable from an incomplete one
+- Reports how much memory the PE scans had to leave unread, so an empty carve result is distinguishable from an incomplete one
 
 ## Usage
 
@@ -65,7 +65,7 @@ Also write the raw bytes of executable memory that held no complete PE:
 mempe.exe -p 4216 --raw-regions
 ```
 
-This is off by default because it can add a lot of files. Use it when you are looking for headerless payloads or shellcode that the PE carver will not pick up. Each region is written twice: the untouched bytes as `.raw`, and a `.txt` next to it recording the load address, allocation base, committed size, page protection and whether the region was executable, so you can point a disassembler at the right address. No header is invented for those bytes.
+This is off by default because it can add a lot of files. Use it when you are looking for headerless payloads or shellcode that the PE carver will not pick up. Each committed range of such an allocation is written twice: the untouched bytes as `.raw`, and a `.txt` next to it recording the load address, allocation base, committed size, page protection and whether the region was executable, so you can point a disassembler at the right address. No header is invented for those bytes.
 
 Write only the images you care about:
 
@@ -90,7 +90,7 @@ Reading the code in execution order is the fastest way to understand it. There a
 
 Working-set page state is measured first, in `measure_image_pages`, before anything else touches the process. This ordering matters: taking a PSS snapshot marks every page copy-on-write, which destroys the private-page signal mempe uses later to tell decrypted memory from memory that was never written.
 
-`AddressSpace::acquire` then takes a `PSS_CAPTURE_VA_CLONE` snapshot, falling back to a plain live read if that fails. `list_regions` walks the address space, `group_images` collects regions into images by allocation base, and `read_image` copies each image's committed regions into a buffer, zero-filling anything unreadable and recording what protections each region actually had. `find_hidden_images` looks for page-aligned PE headers inside executable non-image allocations, and `read_allocations` picks up readable non-image memory so the carver can search it later.
+`AddressSpace::acquire` then takes a `PSS_CAPTURE_VA_CLONE` snapshot, falling back to a plain live read if that fails. `list_regions` walks the address space, `group_images` collects regions into images by allocation base, and `read_image` copies each image's committed regions into a buffer, zero-filling anything unreadable and recording what protections each region actually had. `find_hidden_images` looks for page-aligned PE headers inside executable non-image allocations, and `read_allocations` picks up the committed, readable ranges of non-image memory so the carver can search them later.
 
 **2. Rebuild** (`src/pe/rebuild/`, one image at a time)
 
@@ -106,7 +106,7 @@ Working-set page state is measured first, in `measure_image_pages`, before anyth
 
 **3. Carve** (`src/pe/carve.rs`)
 
-Every captured image and every readable non-image allocation is scanned for embedded PEs. A candidate has to survive a full disk-image parse before it is written, and its length comes from its own section table and certificate directory, so signed payloads come out byte-exact.
+Every captured image, every executable non-image allocation that held no page-aligned PE, and every other readable non-image allocation is scanned for embedded PEs. A candidate has to survive a full disk-image parse before it is written, and its length comes from its own section table and certificate directory, so signed payloads come out byte-exact.
 
 **4. Write** (`src/output.rs`, `src/dump.rs`)
 
@@ -155,13 +155,14 @@ mempe needs permission to open and read the target process. An elevated target m
 
 - Import recovery depends on the IAT and on the exports available in the captured process. Packed files, custom loaders, API hashing, and unusual thunk layouts may leave imports unresolved.
 - A delay-load slot that has never been called still points at its own stub, so its target cannot be recovered. mempe counts those slots and reports them separately rather than dropping them silently.
-- Hidden images are found by looking for page-aligned PE headers. Headerless payloads and raw shellcode are only written with `--raw-regions`, and then as plain bytes with no reconstructed header, alongside a sidecar recording where they were mapped.
+- Hidden images are found by looking for page-aligned PE headers. A complete PE stored at any other offset is still carved, but headerless payloads and raw shellcode are only written with `--raw-regions`, and then as plain bytes with no reconstructed header, alongside a sidecar recording where they were mapped.
 - Import recovery through a `mov r64,[rip+disp32]` requires a neighbouring pointer slot resolving into the same module, because a lone cached pointer to an API is not a link-time dependency. Pointers reached through `call` or `jmp` are accepted without that check. Runtime dispatch tables, such as the `gdi32.dll` thunks into `gdi32full.dll`, are still recorded as imports: they are real pointers to real exports, and separating them from genuine imports would need a hardcoded list of Windows shim relationships.
 - If module enumeration is denied, mempe still dumps. Image names then come from mapped files rather than the loader, the main image is identified by its mapped path, and the degraded mode is reported.
 - Capture stops at 4096 images or 4 GiB of image data. Hitting either truncates the dump and reports the number of images skipped instead of failing; the main image is always captured.
 - Unreadable memory is replaced with zeroes. The warning count tells you how much data was lost.
 - The entropy warning fires on any section that is resident and was never written after loading, whatever its type. A section that was never faulted in at all is reported by the separate all-zero warning, and a `.pdata` section holding something other than a runtime-function table is reported by a third.
-- The embedded-PE scan stops after 256 MiB of non-image memory. Anything past that is left unread and the amount is reported, so an empty carve result can be told apart from a truncated one.
+- The embedded-PE scan stops after 256 MiB of committed non-image memory, and the hidden-image scan after 1 GiB. Anything past either limit is left unread and the amount is reported, so an empty carve result can be told apart from a truncated one.
+- The "written after load" signal behind the entropy warning is only reliable on the first dump of a process. Taking a snapshot appears to disturb it, so a second dump of the same PID can report more never-written sections than the first.
 - If the main image has been unmapped from the target, mempe dumps every other module and reports the missing main image rather than failing outright. The result is a partial dump and exit code 3.
 - A structurally valid PE is useful for static analysis, but it may still need manual work before it can run.
 - Only x86 and x64 Windows PE images are supported.

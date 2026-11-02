@@ -149,6 +149,9 @@ fn parse_candidate(
         header.section_count,
         declared_image_size,
     )?;
+    if salvaged {
+        require_headers_before_sections(optional_end, section_table_size, &sections)?;
+    }
 
     let offsets = optional_offsets(optional_offset, shape.image_base_relative)?;
     Ok(PeModel {
@@ -330,7 +333,7 @@ fn validate_section(
     raw_size: u32,
     image_size: usize,
 ) -> AppResult<()> {
-    let span = virtual_size.max(raw_size);
+    let span = mapped_size(virtual_size, raw_size);
     if span == 0 {
         return Ok(());
     }
@@ -350,7 +353,7 @@ fn validate_non_overlapping_sections(sections: &[SectionModel]) -> AppResult<()>
     let mut ranges = sections
         .iter()
         .filter_map(|section| {
-            let length = section.virtual_size.max(section.raw_size);
+            let length = mapped_size(section.virtual_size, section.raw_size);
             (length != 0).then_some((section.virtual_address.get(), length))
         })
         .collect::<Vec<_>>();
@@ -361,6 +364,38 @@ fn validate_non_overlapping_sections(sections: &[SectionModel]) -> AppResult<()>
             return Err(AppError::new("section virtual ranges overlap"));
         }
         previous_end = u64::from(start) + u64::from(length);
+    }
+    Ok(())
+}
+
+// The loader maps VirtualSize bytes and drops raw data past it; only a zero
+// VirtualSize falls back to SizeOfRawData.
+fn mapped_size(virtual_size: u32, raw_size: u32) -> u32 {
+    if virtual_size != 0 {
+        virtual_size
+    } else {
+        raw_size
+    }
+}
+
+// The loader maps headers ahead of the first section. A signature found after
+// that point belongs to a PE stored inside the image, not to the image itself.
+fn require_headers_before_sections(
+    table_offset: usize,
+    table_size: usize,
+    sections: &[SectionModel],
+) -> AppResult<()> {
+    let table_end = checked_add(table_offset, table_size, "section table end")?;
+    let first_section = sections
+        .iter()
+        .filter(|section| mapped_size(section.virtual_size, section.raw_size) != 0)
+        .map(|section| section.virtual_address.get() as usize)
+        .min()
+        .unwrap_or(usize::MAX);
+    if table_end > first_section {
+        return Err(AppError::new(
+            "salvaged headers lie inside their own section data",
+        ));
     }
     Ok(())
 }

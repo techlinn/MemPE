@@ -14,6 +14,9 @@ const MAX_IMPORT_NAME: usize = 4_096;
 const MAX_THUNK_DEPTH: usize = 4;
 const MAX_CODE_REFERENCE_BYTES: usize = 256 * 1024 * 1024;
 const DELAY_IMPORT_DIRECTORY: usize = 13;
+const LOAD_CONFIG_DIRECTORY: usize = 10;
+const GUARD_CHECK_POINTER_PE32: usize = 0x48;
+const GUARD_CHECK_POINTER_PE32_PLUS: usize = 0x70;
 const DELAY_DESCRIPTOR_SIZE: usize = 32;
 const DELAY_ATTRIBUTES_RVA_BASED: u32 = 0x1;
 const DELAY_NAME_OFFSET: usize = 4;
@@ -47,6 +50,13 @@ enum Reference {
 pub(super) struct ImportEntry {
     pub(super) name: Option<String>,
     pub(super) ordinal: u32,
+    aliased: bool,
+}
+
+struct SlotCandidate {
+    slot: u32,
+    symbol: ResolvedExport,
+    aliased: bool,
 }
 
 pub(super) struct ImportGroup {
@@ -81,8 +91,11 @@ pub(super) struct ImportPlan {
     pub(super) recovered_inferred: usize,
     pub(super) mixed_module_runs: usize,
     pub(super) slots_with_call_sites: usize,
+    pub(super) unrepresentable: usize,
     pub(super) existing: Vec<u8>,
     own: Option<String>,
+    ambiguous_slots: BTreeSet<u32>,
+    unbound_delay_slots: BTreeSet<u32>,
 }
 
 pub(super) fn build_plan(
@@ -101,6 +114,8 @@ pub(super) fn build_plan(
     }
     scan_delay_imports(image, observed_base, exports, &referenced, &mut plan);
     recover_referenced_imports(image, observed_base, exports, &referenced, &mut plan);
+    plan.ambiguous = plan.ambiguous_slots.len();
+    plan.unresolved_delay = plan.unbound_delay_slots.len();
     plan
 }
 
@@ -189,7 +204,6 @@ fn scan_delay_imports(
     let already_recovered = collect_recovered_slots(plan, width);
     let max_descriptors = (directory_size as usize / DELAY_DESCRIPTOR_SIZE).min(MAX_IMPORT_GROUPS);
     let mut budget = MAX_IMPORTS;
-    let mut unbound = 0usize;
     for index in 0..max_descriptors {
         if plan.recovered >= MAX_IMPORTS || plan.groups.len() >= MAX_IMPORT_GROUPS {
             break;
@@ -218,16 +232,10 @@ fn scan_delay_imports(
             minimum: ATTESTED_MINIMUM_ENTRIES,
             source: ImportSource::Delayed,
         };
-        unbound = unbound.saturating_add(unbound_delay_slots(
-            memory,
-            observed_base,
-            kind,
-            exports,
-            &scan,
-        ));
+        let unbound = unbound_delay_slots(memory, observed_base, kind, exports, &scan);
+        plan.unbound_delay_slots.extend(unbound);
         scan_import_range(memory, observed_base, kind, exports, scan, referenced, plan);
     }
-    plan.unresolved_delay = plan.unresolved_delay.saturating_add(unbound);
 }
 
 fn unbound_delay_slots(
@@ -236,16 +244,18 @@ fn unbound_delay_slots(
     kind: PeKind,
     exports: &ExportIndex,
     scan: &ImportScan,
-) -> usize {
+) -> BTreeSet<u32> {
     let width = kind.pointer_width();
-    let mut unbound = 0usize;
+    let mut unbound = BTreeSet::new();
     let mut offset = scan.start;
     while offset.saturating_add(width) <= scan.end {
         let Some(value) = read_pointer(memory, offset, width) else {
             break;
         };
-        if resolve_value(memory, observed_base, kind, value, exports).is_err() {
-            unbound = unbound.saturating_add(1);
+        if resolve_value(memory, observed_base, kind, value, exports).is_err()
+            && let Ok(slot) = u32::try_from(offset)
+        {
+            unbound.insert(slot);
         }
         offset = offset.saturating_add(width);
     }
@@ -329,9 +339,12 @@ fn scan_import_range(
     let mut offset = aligned_start;
     while offset.saturating_add(width) <= end && plan.recovered < MAX_IMPORTS {
         let run_start = offset;
-        let mut entries = Vec::<(u32, ResolvedExport)>::new();
+        let mut entries = Vec::<SlotCandidate>::new();
         while offset.saturating_add(width) <= end && entries.len() < MAX_IMPORTS {
             let Some(value) = read_pointer(memory, offset, width) else {
+                break;
+            };
+            let Ok(slot) = u32::try_from(offset) else {
                 break;
             };
             let Ok((symbol, ambiguous, aliased)) =
@@ -340,16 +353,14 @@ fn scan_import_range(
                 break;
             };
             if ambiguous {
-                plan.ambiguous = plan.ambiguous.saturating_add(1);
+                plan.ambiguous_slots.insert(slot);
                 break;
             }
-            if aliased {
-                plan.aliased_names = plan.aliased_names.saturating_add(1);
-            }
-            let Ok(slot_rva) = u32::try_from(offset) else {
-                break;
-            };
-            entries.push((slot_rva, symbol));
+            entries.push(SlotCandidate {
+                slot,
+                symbol,
+                aliased,
+            });
             offset = offset.saturating_add(width);
         }
         let starts_cleanly = run_start == aligned_start
@@ -384,15 +395,24 @@ fn recover_referenced_imports(
     let width = kind.pointer_width();
     let mut recovered = collect_recovered_slots(plan, width);
     recovered.append(&mut existing_thunk_slots(memory, &plan.existing, width));
+    recovered.append(&mut guard_pointer_slots(image, observed_base));
     let remaining = MAX_IMPORTS.saturating_sub(plan.recovered);
     let mut entries = Vec::with_capacity(referenced.len().min(remaining));
 
     for (&slot, &reference) in referenced {
-        if recovered.contains(&slot) || entries.len() >= remaining {
+        if recovered.contains(&slot)
+            || plan.unbound_delay_slots.contains(&slot)
+            || entries.len() >= remaining
+        {
             continue;
         }
         if !slot_is_in_data_section(image, slot, width) {
-            record_nondata_slot(plan, reference);
+            if reference == Reference::Called
+                && slot_holds_import(memory, observed_base, kind, exports, slot)
+            {
+                plan.slots_outside_data_sections =
+                    plan.slots_outside_data_sections.saturating_add(1);
+            }
             continue;
         }
         let Some(value) = read_pointer(memory, slot as usize, width) else {
@@ -407,7 +427,7 @@ fn recover_referenced_imports(
                 }
             };
         if ambiguous {
-            plan.ambiguous = plan.ambiguous.saturating_add(1);
+            plan.ambiguous_slots.insert(slot);
             continue;
         }
         if reference == Reference::Loaded
@@ -415,10 +435,11 @@ fn recover_referenced_imports(
         {
             continue;
         }
-        if aliased {
-            plan.aliased_names = plan.aliased_names.saturating_add(1);
-        }
-        entries.push((slot, symbol));
+        entries.push(SlotCandidate {
+            slot,
+            symbol,
+            aliased,
+        });
     }
 
     append_groups(
@@ -436,11 +457,43 @@ fn image_offset(observed_base: usize, memory_length: usize, value: usize) -> Opt
     (offset < memory_length).then_some(offset)
 }
 
-fn record_nondata_slot(plan: &mut ImportPlan, reference: Reference) {
-    if reference != Reference::Called {
-        return;
+// The CFG check and dispatch pointers are called through like imports but hold
+// the image's own no-op stubs when the process runs without CFG.
+fn guard_pointer_slots(image: &PeImage<'_>, observed_base: usize) -> BTreeSet<u32> {
+    let memory = image.bytes();
+    let kind = image.model().kind();
+    let width = kind.pointer_width();
+    let Some((directory_rva, _)) = directory(image, LOAD_CONFIG_DIRECTORY) else {
+        return BTreeSet::new();
+    };
+    let directory_rva = directory_rva as usize;
+    let first = match kind {
+        PeKind::Pe32 => GUARD_CHECK_POINTER_PE32,
+        PeKind::Pe32Plus => GUARD_CHECK_POINTER_PE32_PLUS,
+    };
+    let declared = read_u32(memory, directory_rva).unwrap_or(0) as usize;
+    [first, first.saturating_add(width)]
+        .into_iter()
+        .filter(|offset| offset.saturating_add(width) <= declared)
+        .filter_map(|offset| read_pointer(memory, directory_rva.checked_add(offset)?, width))
+        .filter_map(|address| u32::try_from(address.checked_sub(observed_base)?).ok())
+        .collect()
+}
+
+fn slot_holds_import(
+    memory: &[u8],
+    observed_base: usize,
+    kind: PeKind,
+    exports: &ExportIndex,
+    slot: u32,
+) -> bool {
+    let width = kind.pointer_width();
+    if !(slot as usize).is_multiple_of(width) {
+        return false;
     }
-    plan.slots_outside_data_sections = plan.slots_outside_data_sections.saturating_add(1);
+    read_pointer(memory, slot as usize, width)
+        .and_then(|value| resolve_value(memory, observed_base, kind, value, exports).ok())
+        .is_some_and(|(_, ambiguous, _)| !ambiguous)
 }
 
 fn record_unresolved_call(plan: &mut ImportPlan, reference: Reference, reason: Unresolved) {
@@ -586,7 +639,7 @@ fn slot_is_in_data_section(image: &PeImage<'_>, slot: u32, width: usize) -> bool
 
 fn existing_thunk_slots(memory: &[u8], descriptors: &[u8], width: usize) -> BTreeSet<u32> {
     let mut slots = BTreeSet::new();
-    for descriptor in descriptors.chunks_exact(IMPORT_DESCRIPTOR_SIZE) {
+    for descriptor in descriptors.as_chunks::<IMPORT_DESCRIPTOR_SIZE>().0 {
         let Some(first_thunk) = read_u32(descriptor, 16) else {
             continue;
         };
@@ -629,7 +682,7 @@ fn collect_recovered_slots(plan: &ImportPlan, width: usize) -> BTreeSet<u32> {
 }
 
 fn append_groups(
-    entries: Vec<(u32, ResolvedExport)>,
+    entries: Vec<SlotCandidate>,
     width: usize,
     minimum_entries: usize,
     source: ImportSource,
@@ -637,12 +690,21 @@ fn append_groups(
     plan: &mut ImportPlan,
 ) {
     let mut current: Option<ImportGroup> = None;
-    for (slot, symbol) in entries {
+    for SlotCandidate {
+        slot,
+        symbol,
+        aliased,
+    } in entries
+    {
         if plan
             .own
             .as_deref()
             .is_some_and(|own| own.eq_ignore_ascii_case(&symbol.module))
         {
+            continue;
+        }
+        if !is_representable(&symbol) {
+            plan.unrepresentable = plan.unrepresentable.saturating_add(1);
             continue;
         }
         let same_module = current.as_ref().is_some_and(|group| {
@@ -670,12 +732,22 @@ fn append_groups(
             group.entries.push(ImportEntry {
                 name: symbol.name,
                 ordinal: symbol.ordinal,
+                aliased,
             });
         }
     }
     if let Some(group) = current {
         commit_group(group, minimum_entries, width, referenced, plan);
     }
+}
+
+fn is_representable(symbol: &ResolvedExport) -> bool {
+    let ascii = |text: &str| !text.is_empty() && text.is_ascii() && !text.contains('\0');
+    ascii(&symbol.module)
+        && match symbol.name.as_deref() {
+            Some(name) => ascii(name),
+            None => u16::try_from(symbol.ordinal).is_ok(),
+        }
 }
 
 fn commit_group(
@@ -686,10 +758,12 @@ fn commit_group(
     plan: &mut ImportPlan,
 ) {
     let agreeing = count_referenced_slots(&group, width, referenced);
+    let aliased = group.entries.iter().filter(|entry| entry.aliased).count();
     let source = group.source;
     if !push_group(group, minimum_entries, plan) {
         return;
     }
+    plan.aliased_names = plan.aliased_names.saturating_add(aliased);
     if !carries_call_site_evidence(source) {
         return;
     }
@@ -714,10 +788,10 @@ fn count_referenced_slots(
         .count()
 }
 
-fn record_mixed_module_run(plan: &mut ImportPlan, entries: &[(u32, ResolvedExport)]) {
+fn record_mixed_module_run(plan: &mut ImportPlan, entries: &[SlotCandidate]) {
     let modules = entries
         .iter()
-        .map(|(_, symbol)| symbol.module.to_ascii_lowercase())
+        .map(|entry| entry.symbol.module.to_ascii_lowercase())
         .collect::<BTreeSet<_>>();
     if modules.len() > 1 {
         plan.mixed_module_runs = plan.mixed_module_runs.saturating_add(1);
@@ -983,10 +1057,86 @@ mod tests {
 
     use super::{
         IMPORT_DESCRIPTOR_SIZE, Reference, build_plan, decode_slot_reference, delay_table_range,
-        rip_relative_slot, try_descriptor_array,
+        guard_pointer_slots, is_representable, rip_relative_slot, try_descriptor_array,
     };
+    use crate::pe::exports::ResolvedExport;
     use crate::pe::parse::parse_memory_image;
     use crate::pe::{ExportIndex, PeKind, rebuild};
+
+    fn symbol(module: &str, name: Option<&str>, ordinal: u32) -> ResolvedExport {
+        ResolvedExport {
+            module: module.to_owned(),
+            name: name.map(str::to_owned),
+            ordinal,
+            forwarded: false,
+        }
+    }
+
+    #[test]
+    fn makes_header_room_for_recovered_imports_when_the_table_fills_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let export_base = 0x0000_7FFB_0000_0000usize;
+        let export_image = fixture_pe64(true);
+        let index = ExportIndex::build([(export_base, export_image.as_slice(), None)]);
+        let mut target = fixture_pe64(false);
+        let table = target[0x188..0x1D8].to_vec();
+        target[0x188..0x1D8].fill(0);
+        target[0x1A8..0x1F8].copy_from_slice(&table);
+        put_u16(&mut target, 0x94, 0x110);
+        put_u64(&mut target, 0x2000, export_base as u64 + 0x1000);
+        put_u32(&mut target, 0x98 + 112 + 12 * 8, 0x2000);
+        put_u32(&mut target, 0x98 + 112 + 12 * 8 + 4, 8);
+
+        let rebuilt = rebuild(&target, &[], 0x0000_7FF6_0000_0000, None, &index, None, &[])?;
+
+        assert_eq!(rebuilt.imports_rebuilt, 1);
+        assert_eq!(rebuilt.unemitted_imports, 0);
+        assert_eq!(rebuilt.section_count, 3);
+        assert!(PeFile::from_bytes(&rebuilt.bytes).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn names_the_cfg_check_and_dispatch_slots_from_the_load_config()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let base = 0x0000_7FF6_0000_0000u64;
+        let mut memory = fixture_pe64(false);
+        put_u32(&mut memory, 0x98 + 112 + 10 * 8, 0x2400);
+        put_u32(&mut memory, 0x98 + 112 + 10 * 8 + 4, 0x140);
+        put_u32(&mut memory, 0x2400, 0x140);
+        put_u64(&mut memory, 0x2400 + 0x70, base + 0x2290);
+        put_u64(&mut memory, 0x2400 + 0x78, base + 0x22A0);
+        let image = parse_memory_image(&memory)?;
+
+        let slots = guard_pointer_slots(&image, base as usize);
+
+        assert_eq!(slots.into_iter().collect::<Vec<_>>(), vec![0x2290, 0x22A0]);
+        Ok(())
+    }
+
+    #[test]
+    fn ignores_cfg_pointers_a_short_load_config_does_not_declare()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let base = 0x0000_7FF6_0000_0000u64;
+        let mut memory = fixture_pe64(false);
+        put_u32(&mut memory, 0x98 + 112 + 10 * 8, 0x2400);
+        put_u32(&mut memory, 0x98 + 112 + 10 * 8 + 4, 0x70);
+        put_u32(&mut memory, 0x2400, 0x70);
+        put_u64(&mut memory, 0x2400 + 0x70, base + 0x2290);
+        let image = parse_memory_image(&memory)?;
+
+        assert!(guard_pointer_slots(&image, base as usize).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn only_imports_an_ascii_table_can_describe_are_representable() {
+        assert!(is_representable(&symbol("KERNEL32.dll", Some("Sleep"), 1)));
+        assert!(is_representable(&symbol("WS2_32.dll", None, 0xFFFF)));
+        assert!(!is_representable(&symbol("WS2_32.dll", None, 0x1_0000)));
+        assert!(!is_representable(&symbol("тест.dll", Some("Sleep"), 1)));
+        assert!(!is_representable(&symbol("a.dll", Some("Schlüssel"), 1)));
+    }
 
     #[test]
     fn recovers_a_lone_import_when_the_iat_directory_attests_it()

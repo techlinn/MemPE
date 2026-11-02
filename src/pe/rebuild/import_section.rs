@@ -7,9 +7,10 @@ use crate::{AppError, AppResult};
 
 const IMPORT_DESCRIPTOR_SIZE: usize = 20;
 const MEMPE_IMPORT_CHARACTERISTICS: u32 = 0xC000_0040;
+const BOUND_IMPORT_DIRECTORY: usize = 11;
 
 pub(super) enum ImportSection {
-    Written { iat_cleared: bool },
+    Written { cleared: Vec<usize> },
     NothingToWrite,
     NoImportDirectory,
     NoRoomInHeaders,
@@ -42,6 +43,7 @@ pub(super) fn append_import_section(
     let virtual_address = u32::try_from(virtual_address)
         .map_err(|_| AppError::new("import section RVA exceeds u32"))?;
     let payload = build_import_payload(plan, model.kind, virtual_address)?;
+    let bound_cleared = clear_overlapping_bound_imports(output, model, section_header)?;
     let raw_offset = align_up(output.len(), model.file_alignment as usize)?;
     let raw_size = align_up(payload.len(), model.file_alignment as usize)?;
     let final_size = raw_offset
@@ -69,8 +71,31 @@ pub(super) fn append_import_section(
         raw_offset,
         raw_size,
     )?;
-    let iat_cleared = commit_import_section(output, model, plan, virtual_address, payload.len())?;
-    Ok(ImportSection::Written { iat_cleared })
+    let mut cleared = Vec::new();
+    if bound_cleared {
+        cleared.push(BOUND_IMPORT_DIRECTORY);
+    }
+    if commit_import_section(output, model, plan, virtual_address, payload.len())? {
+        cleared.push(IAT_DIRECTORY);
+    }
+    Ok(ImportSection::Written { cleared })
+}
+
+fn clear_overlapping_bound_imports(
+    output: &mut [u8],
+    model: &PeModel,
+    section_header: usize,
+) -> AppResult<bool> {
+    let Some(offset) = model.directory_offset(BOUND_IMPORT_DIRECTORY)? else {
+        return Ok(false);
+    };
+    let start = read_u32(output, offset)? as usize;
+    let end = start.saturating_add(read_u32(output, offset.saturating_add(4))? as usize);
+    let header_end = section_header.saturating_add(SECTION_HEADER_SIZE);
+    if start == end || start >= header_end || end <= section_header {
+        return Ok(false);
+    }
+    Ok(clear_directory(output, model, BOUND_IMPORT_DIRECTORY)? > 0)
 }
 
 fn write_mempe_section_header(

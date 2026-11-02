@@ -2,7 +2,7 @@ use crate::pe::image::read_u32;
 use crate::pe::parse::parse_disk_image;
 use crate::pe::{PeImage, PeKind, SECURITY_DIRECTORY};
 
-const DOS_MAGIC: [u8; 2] = [b'M', b'Z'];
+const DOS_MAGIC: [u8; 2] = *b"MZ";
 const RAW_SIZE_OFFSET: usize = 16;
 const RAW_POINTER_OFFSET: usize = 20;
 const SUBSYSTEM_NATIVE: u16 = 1;
@@ -18,7 +18,12 @@ pub(crate) struct EmbeddedPe {
     pub(crate) extension: &'static str,
 }
 
-pub(crate) fn carve_embedded(memory: &[u8]) -> Vec<EmbeddedPe> {
+pub(crate) struct CarveResult {
+    pub(crate) found: Vec<EmbeddedPe>,
+    pub(crate) unscanned: usize,
+}
+
+pub(crate) fn carve_embedded(memory: &[u8]) -> CarveResult {
     let mut found = Vec::new();
     let mut attempts = 0usize;
     let mut offset = 1usize;
@@ -39,7 +44,11 @@ pub(crate) fn carve_embedded(memory: &[u8]) -> Vec<EmbeddedPe> {
             None => offset = offset.saturating_add(1),
         }
     }
-    found
+    let unscanned = memory
+        .len()
+        .saturating_sub(64)
+        .saturating_sub(offset.saturating_sub(1));
+    CarveResult { found, unscanned }
 }
 
 fn try_carve(memory: &[u8], offset: usize) -> Option<EmbeddedPe> {
@@ -134,7 +143,7 @@ mod tests {
     fn carves_only_the_inner_pe_not_the_host() {
         let host = host_with_embedded();
 
-        let found = carve_embedded(&host);
+        let found = carve_embedded(&host).found;
 
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].offset, 0x2000);
@@ -147,7 +156,7 @@ mod tests {
         bytes[0x100] = 0x4d;
         bytes[0x101] = 0x5a;
 
-        assert!(carve_embedded(&bytes).is_empty());
+        assert!(carve_embedded(&bytes).found.is_empty());
     }
 
     #[test]
@@ -156,7 +165,7 @@ mod tests {
         write_min_pe(&mut host, 0x2000);
         host[0x2000 + 0x84..0x2000 + 0x86].copy_from_slice(&0x1234u16.to_le_bytes());
 
-        assert!(carve_embedded(&host).is_empty());
+        assert!(carve_embedded(&host).found.is_empty());
     }
 
     #[test]
@@ -166,7 +175,26 @@ mod tests {
         let section_size = 0x2000 + 0x98 + 0xf0 + 8;
         host[section_size..section_size + 4].copy_from_slice(&0x9000u32.to_le_bytes());
 
-        assert!(carve_embedded(&host).is_empty());
+        assert!(carve_embedded(&host).found.is_empty());
+    }
+
+    #[test]
+    fn reports_nothing_unscanned_after_a_complete_pass() {
+        assert_eq!(carve_embedded(&host_with_embedded()).unscanned, 0);
+    }
+
+    #[test]
+    fn reports_the_bytes_left_when_the_attempt_limit_stops_it() {
+        let bytes = b"MZ".repeat(super::MAX_CARVE_ATTEMPTS + 0x1000);
+
+        let result = carve_embedded(&bytes);
+
+        assert!(result.found.is_empty());
+        assert_eq!(
+            result.unscanned,
+            bytes.len() - 64 - 2 * super::MAX_CARVE_ATTEMPTS
+        );
+        assert!(result.unscanned < bytes.len());
     }
 
     #[test]
@@ -180,6 +208,6 @@ mod tests {
             *byte = (state >> 33) as u8;
         }
 
-        assert!(carve_embedded(&bytes).is_empty());
+        assert!(carve_embedded(&bytes).found.is_empty());
     }
 }

@@ -15,13 +15,17 @@ const MAX_RENAME_ATTEMPTS: usize = 64;
 pub(super) fn build_output_buffer<'a>(
     model: &'a PeModel,
     memory: &[u8],
+    reserve_import_header: bool,
 ) -> AppResult<(Vec<u8>, Vec<SectionLayout<'a>>, usize)> {
     let section_table_end = model
         .sections
         .last()
         .map(|section| section.header_offset.saturating_add(SECTION_HEADER_SIZE))
         .ok_or_else(|| AppError::new("PE has no section headers"))?;
-    let header_size = align_up(section_table_end, model.file_alignment as usize)?;
+    let header_size = match reserve_import_header {
+        true => header_size_with_spare_slot(model, section_table_end)?,
+        false => align_up(section_table_end, model.file_alignment as usize)?,
+    };
     let layouts = layout_sections(model, memory, header_size)?;
     let output_size = layouts
         .iter()
@@ -42,6 +46,27 @@ pub(super) fn build_output_buffer<'a>(
     let copied_headers = header_size.min(memory.len());
     output[..copied_headers].copy_from_slice(&memory[..copied_headers]);
     Ok((output, layouts, header_size))
+}
+
+fn header_size_with_spare_slot(model: &PeModel, section_table_end: usize) -> AppResult<usize> {
+    let alignment = model.file_alignment as usize;
+    let minimum = align_up(section_table_end, alignment)?;
+    let spare = align_up(
+        section_table_end.saturating_add(SECTION_HEADER_SIZE),
+        alignment,
+    )?;
+    let first_section = model
+        .sections
+        .iter()
+        .filter(|section| section.span() != 0)
+        .map(|section| section.virtual_address.get() as usize)
+        .min()
+        .unwrap_or(usize::MAX);
+    Ok(if spare <= first_section {
+        spare
+    } else {
+        minimum
+    })
 }
 
 pub(super) fn write_sections(

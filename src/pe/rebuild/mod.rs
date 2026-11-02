@@ -97,7 +97,9 @@ pub(crate) fn rebuild(
         .map_err(|error| AppError::new(format!("rebuilt PE headers are invalid: {error}")))?;
     let memory = image.bytes();
     let model = image.model();
-    let (mut output, layouts, header_size) = build_output_buffer(model, memory)?;
+    let plan = build_plan(&image, observed_base, exports);
+    let (mut output, layouts, header_size) =
+        build_output_buffer(model, memory, !plan.groups.is_empty())?;
 
     write_core_header_fields(&mut output, model, observed_base, header_size)?;
     let renamed_sections = write_sections(&mut output, memory, &layouts)?;
@@ -107,14 +109,7 @@ pub(crate) fn rebuild(
         plan: import_plan,
         written,
         unemitted,
-    } = resolve_imports(
-        &mut output,
-        model,
-        &image,
-        observed_base,
-        exports,
-        &mut repairs,
-    )?;
+    } = resolve_imports(&mut output, model, plan, &mut repairs)?;
     let (final_entry_point, executable_flag_added) =
         finalize_output(&mut output, model, entry_point)?;
 
@@ -196,25 +191,23 @@ struct ImportOutcome {
 fn resolve_imports(
     output: &mut Vec<u8>,
     model: &PeModel,
-    image: &PeImage<'_>,
-    observed_base: usize,
-    exports: &ExportIndex,
+    plan: ImportPlan,
     repairs: &mut RepairStats,
 ) -> AppResult<ImportOutcome> {
-    let plan = build_plan(image, observed_base, exports);
     let section = match plan.groups.is_empty() {
         true => ImportSection::NothingToWrite,
         false => append_import_section(output, model, &plan)?,
     };
-    let (written, unemitted, iat_cleared) = match section {
-        ImportSection::Written { iat_cleared } => (true, 0, iat_cleared),
-        ImportSection::NothingToWrite => (false, 0, false),
+    let (written, unemitted, cleared) = match section {
+        ImportSection::Written { cleared } => (true, 0, cleared),
+        ImportSection::NothingToWrite => (false, 0, Vec::new()),
         ImportSection::NoImportDirectory | ImportSection::NoRoomInHeaders => {
-            (false, plan.recovered, false)
+            (false, plan.recovered, Vec::new())
         }
     };
-    if iat_cleared {
-        repairs.cleared.record(IAT_DIRECTORY);
+    let unemitted = unemitted.saturating_add(plan.unrepresentable);
+    for index in cleared {
+        repairs.cleared.record(index);
     }
     if !written && plan.existing.is_empty() {
         let extra = clear_directory(output, model, IMPORT_DIRECTORY)?;
@@ -329,6 +322,74 @@ mod tests {
             result.err().map(|error| error.to_string()),
             Some("disk SizeOfImage exceeds the captured image".to_owned())
         );
+    }
+
+    #[test]
+    fn does_not_salvage_the_headers_of_a_pe_stored_inside_a_section() {
+        let disk = fixture_pe64();
+        let mut memory = disk.clone();
+        memory[..0x200].fill(0);
+        memory[0x1100..0x1300].copy_from_slice(&disk[..0x200]);
+
+        let result = rebuild(
+            &memory,
+            &[],
+            0x0000_7FF6_0000_0000,
+            None,
+            &ExportIndex::default(),
+            None,
+            &[],
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn keeps_the_header_size_when_no_recovered_imports_need_room()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut memory = fixture_pe64();
+        let old_table = 0x98 + 0xF0;
+        let new_table = 0x98 + 0x120;
+        let section = memory[old_table..old_table + 40].to_vec();
+        memory[old_table..old_table + 40].fill(0);
+        memory[new_table..new_table + 40].copy_from_slice(&section);
+        put_u16(&mut memory, 0x94, 0x120);
+
+        let rebuilt = rebuild(
+            &memory,
+            &[],
+            0x0000_7FF6_0000_0000,
+            None,
+            &ExportIndex::default(),
+            None,
+            &[],
+        )?;
+
+        assert_eq!(get_u32(&rebuilt.bytes, 0x98 + 60), 0x200);
+        assert_eq!(&rebuilt.bytes[0x200..0x204], &[0x90, 0x90, 0xC3, 0]);
+        assert!(PeFile::from_bytes(&rebuilt.bytes).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn accepts_raw_data_the_loader_would_drop_past_virtual_size()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut memory = fixture_pe64();
+        put_u32(&mut memory, 0x98 + 0xF0 + 16, 0x4000);
+
+        let rebuilt = rebuild(
+            &memory,
+            &[],
+            0x0000_7FF6_0000_0000,
+            None,
+            &ExportIndex::default(),
+            None,
+            &[],
+        )?;
+
+        assert!(PeFile::from_bytes(&rebuilt.bytes).is_ok());
+        assert_eq!(&rebuilt.bytes[0x200..0x204], &[0x90, 0x90, 0xC3, 0]);
+        Ok(())
     }
 
     #[test]

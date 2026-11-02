@@ -339,10 +339,10 @@ fn render_warnings(console: &Console, outcome: &DumpOutcome) {
             outcome.images_skipped
         ));
     }
-    if outcome.unscanned_non_image_bytes > 0 {
+    if outcome.unscanned_bytes > 0 {
         console.warning(format_args!(
-            "Non-image memory left unscanned for embedded PEs: {}",
-            format_size(outcome.unscanned_non_image_bytes)
+            "Memory left unscanned for embedded PEs: {}",
+            format_size(outcome.unscanned_bytes)
         ));
     }
     let unmatched_non_image = outcome
@@ -447,7 +447,7 @@ fn render_recovery_confidence(console: &Console, summary: &dump::DumpSummary) {
         return;
     }
     console.field(
-        "Recovered from",
+        "Recovered",
         format_args!(
             "{} attested, {} scanned, {} delay, {} inferred",
             summary.recovered_attested,

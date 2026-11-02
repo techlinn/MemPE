@@ -16,7 +16,7 @@ pub(crate) struct ResolvedExport {
     pub(crate) module: String,
     pub(crate) name: Option<String>,
     pub(crate) ordinal: u32,
-    forwarded: bool,
+    pub(crate) forwarded: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -114,9 +114,7 @@ impl ExportIndex {
     pub(crate) fn resolve(&self, address: usize) -> Option<Resolved<'_>> {
         let symbols = self.addresses.get(&address)?;
         let symbol = preferred_symbol(symbols)?;
-        let ambiguous = symbols
-            .iter()
-            .any(|other| modules_differ(other, symbol) && !names_match(other, symbol));
+        let ambiguous = definitions_conflict(symbols);
         let aliased = !ambiguous
             && symbols.len() > 1
             && symbols.iter().any(|other| !names_match(other, symbol));
@@ -155,6 +153,21 @@ fn naming_priority(symbol: &ResolvedExport) -> NamingPriority {
         true => NamingPriority::Facade,
         false => NamingPriority::Implementation,
     }
+}
+
+// A forwarder is only indexed at the address its chain resolves to, so it always
+// aliases the definition there. Only two direct definitions can disagree.
+fn definitions_conflict(symbols: &[ResolvedExport]) -> bool {
+    let definitions = symbols
+        .iter()
+        .filter(|symbol| !symbol.forwarded)
+        .collect::<Vec<_>>();
+    definitions.iter().enumerate().any(|(index, left)| {
+        definitions
+            .iter()
+            .skip(index.saturating_add(1))
+            .any(|right| modules_differ(left, right) && !names_match(left, right))
+    })
 }
 
 fn names_match(left: &ResolvedExport, right: &ResolvedExport) -> bool {
@@ -496,6 +509,72 @@ mod tests {
 
         assert!(found.ambiguous);
         assert!(!found.aliased);
+        Ok(())
+    }
+
+    fn forwarder(name: Option<&str>, module: &str) -> ResolvedExport {
+        ResolvedExport {
+            module: module.to_owned(),
+            name: name.map(str::to_owned),
+            ordinal: 1,
+            forwarded: true,
+        }
+    }
+
+    #[test]
+    fn a_forwarder_and_the_definition_it_reaches_are_not_ambiguous()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let index = index_with(
+            0x4000,
+            vec![
+                export("EtwEventWrite", "ntdll.dll"),
+                forwarder(Some("EventWrite"), "KERNELBASE.dll"),
+            ],
+        );
+
+        let found = index.resolve(0x4000).ok_or("address is indexed")?;
+
+        assert!(!found.ambiguous);
+        assert!(found.aliased);
+        assert_eq!(found.symbol.module, "KERNELBASE.dll");
+        assert_eq!(found.symbol.name.as_deref(), Some("EventWrite"));
+        Ok(())
+    }
+
+    #[test]
+    fn an_ordinal_only_forwarder_does_not_hide_the_named_definition()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let index = index_with(
+            0x5000,
+            vec![
+                export("LoadCursorW", "USER32.dll"),
+                forwarder(None, "SHLWAPI.dll"),
+            ],
+        );
+
+        let found = index.resolve(0x5000).ok_or("address is indexed")?;
+
+        assert!(!found.ambiguous);
+        assert_eq!(found.symbol.module, "USER32.dll");
+        assert_eq!(found.symbol.name.as_deref(), Some("LoadCursorW"));
+        Ok(())
+    }
+
+    #[test]
+    fn two_definitions_stay_ambiguous_beside_a_forwarder() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let index = index_with(
+            0x6000,
+            vec![
+                export("shared", "one.dll"),
+                export("other", "two.dll"),
+                forwarder(Some("shared"), "three.dll"),
+            ],
+        );
+
+        let found = index.resolve(0x6000).ok_or("address is indexed")?;
+
+        assert!(found.ambiguous);
         Ok(())
     }
 

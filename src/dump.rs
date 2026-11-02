@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::memory::{Capture, CapturedImage, RawRegion};
 use crate::output::{OutputFile, OutputPlan, WrittenFile};
-use crate::pe::{self, EntryPointRva, ExportIndex, ExportStats, PeKind, RebuiltImage};
+use crate::pe::{self, CarveResult, EntryPointRva, ExportIndex, ExportStats, PeKind, RebuiltImage};
 use crate::process::TargetProcess;
 use crate::{AppError, AppResult};
 
@@ -191,7 +191,7 @@ pub(crate) struct BuildReport {
 
 struct CaptureCounts {
     executable_non_image_allocations: usize,
-    unscanned_non_image_bytes: usize,
+    unscanned_bytes: usize,
     images_skipped: usize,
     hidden_non_image_images: usize,
     main_image_missing: bool,
@@ -203,7 +203,7 @@ pub(crate) struct DumpOutcome {
     pub(crate) summary: DumpSummary,
     pub(crate) export_stats: ExportStats,
     pub(crate) executable_non_image_allocations: usize,
-    pub(crate) unscanned_non_image_bytes: usize,
+    pub(crate) unscanned_bytes: usize,
     pub(crate) images_skipped: usize,
     pub(crate) hidden_non_image_images: usize,
     pub(crate) main_rebuilt: bool,
@@ -222,7 +222,7 @@ impl BuildReport {
             summary,
             export_stats: self.export_stats,
             executable_non_image_allocations: self.counts.executable_non_image_allocations,
-            unscanned_non_image_bytes: self.counts.unscanned_non_image_bytes,
+            unscanned_bytes: self.counts.unscanned_bytes,
             images_skipped: self.counts.images_skipped,
             hidden_non_image_images: self.counts.hidden_non_image_images,
             main_rebuilt: self.main_rebuilt,
@@ -263,12 +263,11 @@ impl DumpOutcome {
             || self.summary.never_decrypted_sections > 0
             || self.summary.absent_sections > 0
             || self.summary.raw_region_unreadable_pages > 0
-            || self.summary.raw_regions > 0
             || self.export_stats.unresolved_forwarders > 0
             || !self.failures.is_empty()
             || self.main_image_missing
             || self.executable_non_image_allocations > self.hidden_non_image_images
-            || self.unscanned_non_image_bytes > 0
+            || self.unscanned_bytes > 0
             || self.images_skipped > 0
             || self.summary.aliased_names > 0
             || self.summary.invalid_pdata_sections > 0
@@ -398,7 +397,7 @@ pub(crate) fn build(
 ) -> BuildReport {
     let counts = CaptureCounts {
         executable_non_image_allocations: capture.executable_non_image_allocations,
-        unscanned_non_image_bytes: capture.unscanned_non_image_bytes,
+        unscanned_bytes: capture.unscanned_non_image_bytes,
         images_skipped: capture.images_skipped,
         hidden_non_image_images: capture.images.iter().filter(|image| image.hidden).count(),
         main_image_missing: capture.main_image_missing,
@@ -446,7 +445,9 @@ pub(crate) fn build(
 
 fn push_region_embedded(regions: &[RawRegion], report: &mut BuildReport) {
     for region in regions {
-        for (index, embedded) in pe::carve_embedded(&region.bytes).into_iter().enumerate() {
+        let CarveResult { found, unscanned } = pe::carve_embedded(&region.bytes);
+        report.counts.unscanned_bytes = report.counts.unscanned_bytes.saturating_add(unscanned);
+        for (index, embedded) in found.into_iter().enumerate() {
             let Some(bytes) = copy_range(&region.bytes, embedded.offset, embedded.length) else {
                 continue;
             };
@@ -503,7 +504,7 @@ fn region_notes(region: &RawRegion, written: usize) -> String {
          for them. Point a disassembler at the load address above. Protections are\n\
          a union, so individual pages inside this range may be less permissive.\n",
         region.base,
-        region.base,
+        region.allocation_base,
         region.committed,
         region.committed,
         region.protections,
@@ -514,7 +515,9 @@ fn region_notes(region: &RawRegion, written: usize) -> String {
 
 fn push_embedded(target: &TargetProcess, image: &CapturedImage, report: &mut BuildReport) {
     let label = embedded_label(target, image);
-    for (index, embedded) in pe::carve_embedded(&image.bytes).into_iter().enumerate() {
+    let CarveResult { found, unscanned } = pe::carve_embedded(&image.bytes);
+    report.counts.unscanned_bytes = report.counts.unscanned_bytes.saturating_add(unscanned);
+    for (index, embedded) in found.into_iter().enumerate() {
         let Some(bytes) = copy_range(&image.bytes, embedded.offset, embedded.length) else {
             continue;
         };
@@ -805,7 +808,7 @@ mod tests {
             summary: DumpSummary::default(),
             export_stats: ExportStats::default(),
             executable_non_image_allocations: 0,
-            unscanned_non_image_bytes: 0,
+            unscanned_bytes: 0,
             images_skipped: 0,
             hidden_non_image_images: 0,
             main_rebuilt,

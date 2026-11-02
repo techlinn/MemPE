@@ -106,6 +106,7 @@ pub(crate) struct Capture {
 
 pub(crate) struct RawRegion {
     pub(crate) base: usize,
+    pub(crate) allocation_base: usize,
     pub(crate) bytes: Vec<u8>,
     pub(crate) unreadable_pages: usize,
     pub(crate) committed: usize,
@@ -393,7 +394,11 @@ fn read_all_images(
     let mut skipped = 0usize;
     for (base, group) in groups {
         let size = group.end.saturating_sub(base);
-        if size == 0 || size > MAX_IMAGE_SIZE {
+        if size == 0 {
+            continue;
+        }
+        if size > MAX_IMAGE_SIZE {
+            skipped = skipped.saturating_add(1);
             continue;
         }
         if !claim_image_budget(&mut total_size, size, main_base == Some(base)) {
@@ -426,7 +431,10 @@ fn capture_from_space(
     let bases = image_bases(&regions, target);
     let main_base = resolve_main_base(space, target, &bases);
     let (groups, mut images_skipped) = group_images(&regions, &bases, main_base)?;
-    let hidden = find_hidden_images(space, &regions, &non_image_allocations)?;
+    let HiddenScan {
+        found: hidden,
+        unscanned: unscanned_hidden,
+    } = find_hidden_images(space, &regions, &non_image_allocations)?;
     let (images, over_budget) =
         read_all_images(space, target, &regions, groups, &hidden, main_base)?;
     images_skipped = images_skipped.saturating_add(over_budget);
@@ -436,10 +444,16 @@ fn capture_from_space(
         ));
     }
     let main_image_missing = main_image_is_missing(&images);
-    let carve_allocations = readable_non_image_allocations(space, &regions, &non_image_allocations);
+    let unclaimed = unclaimed_executable_allocations(&regions, &non_image_allocations, &hidden);
+    let mut carve_allocations = unclaimed.iter().copied().collect::<Vec<_>>();
+    carve_allocations.extend(readable_non_image_allocations(
+        space,
+        &regions,
+        &non_image_allocations,
+    ));
     let carve = read_allocations(space, &regions, &carve_allocations, MAX_NON_IMAGE_RW_BYTES);
     let raw = if want_raw_regions {
-        let unclaimed = unclaimed_executable_allocations(&regions, &non_image_allocations, &hidden);
+        let unclaimed = unclaimed.into_iter().collect::<Vec<_>>();
         read_allocations(space, &regions, &unclaimed, MAX_RAW_REGION_BYTES)
     } else {
         ScannedAllocations {
@@ -452,7 +466,10 @@ fn capture_from_space(
         non_image_count,
         carve_regions: carve.regions,
         raw_regions: raw.regions,
-        unscanned_non_image_bytes: carve.skipped.saturating_add(raw.skipped),
+        unscanned_non_image_bytes: carve
+            .skipped
+            .saturating_add(raw.skipped)
+            .saturating_add(unscanned_hidden),
         main_image_missing,
         images_skipped,
     })
@@ -508,53 +525,81 @@ struct ScannedAllocations {
     skipped: usize,
 }
 
-#[derive(Default)]
-struct AllocationExtent {
+struct CommittedRun {
+    allocation_base: usize,
+    base: usize,
     end: usize,
-    committed: usize,
     protections: u32,
     executable: bool,
+}
+
+fn committed_runs(
+    regions: &[MemoryRegion],
+    allocations: &[usize],
+) -> BTreeMap<usize, Vec<CommittedRun>> {
+    let wanted = allocations.iter().copied().collect::<BTreeSet<_>>();
+    let mut runs = BTreeMap::<usize, Vec<CommittedRun>>::new();
+    for region in regions {
+        if region.state != MEM_COMMIT.0
+            || !is_readable(region.protect)
+            || !wanted.contains(&region.allocation_base)
+        {
+            continue;
+        }
+        let end = region.base.saturating_add(region.size);
+        let list = runs.entry(region.allocation_base).or_default();
+        match list.last_mut() {
+            Some(run) if run.end == region.base => {
+                run.end = end;
+                run.protections |= region.protect;
+                run.executable |= is_executable(region.protect);
+            }
+            _ => list.push(CommittedRun {
+                allocation_base: region.allocation_base,
+                base: region.base,
+                end,
+                protections: region.protect,
+                executable: is_executable(region.protect),
+            }),
+        }
+    }
+    runs
 }
 
 fn read_allocations(
     space: &AddressSpace,
     regions: &[MemoryRegion],
-    allocations: &BTreeSet<usize>,
+    allocations: &[usize],
     budget: usize,
 ) -> ScannedAllocations {
-    let mut extents = BTreeMap::<usize, AllocationExtent>::new();
-    for region in regions {
-        if region.state != MEM_COMMIT.0 || !allocations.contains(&region.allocation_base) {
-            continue;
-        }
-        let extent = extents.entry(region.allocation_base).or_default();
-        extent.end = extent.end.max(region.base.saturating_add(region.size));
-        extent.committed = extent.committed.saturating_add(region.size);
-        extent.protections |= region.protect;
-        extent.executable |= is_executable(region.protect);
-    }
+    let mut runs = committed_runs(regions, allocations);
     let mut remaining = budget;
     let mut skipped = 0usize;
     let mut collected = Vec::new();
-    for (base, extent) in extents.into_iter().take(MAX_IMAGES) {
-        let size = extent.end.saturating_sub(base).min(remaining);
-        let mut bytes = Vec::new();
-        if size == 0 || bytes.try_reserve_exact(size).is_err() {
-            skipped = skipped.saturating_add(extent.committed);
-            continue;
+    for allocation in allocations {
+        for run in runs.remove(allocation).unwrap_or_default() {
+            let committed = run.end.saturating_sub(run.base);
+            let size = committed.min(remaining);
+            let mut bytes = Vec::new();
+            if size == 0 || collected.len() >= MAX_IMAGES || bytes.try_reserve_exact(size).is_err()
+            {
+                skipped = skipped.saturating_add(committed);
+                continue;
+            }
+            bytes.resize(size, 0);
+            let unreadable_pages = read_region(space, run.base, &mut bytes);
+            remaining = remaining.saturating_sub(size);
+            skipped = skipped.saturating_add(committed.saturating_sub(size));
+            collected.push(RawRegion {
+                base: run.base,
+                allocation_base: run.allocation_base,
+                bytes,
+                unreadable_pages,
+                committed,
+                protections: run.protections,
+                executable: run.executable,
+            });
         }
-        bytes.resize(size, 0);
-        let unreadable_pages = read_region(space, base, &mut bytes);
-        remaining = remaining.saturating_sub(size);
-        skipped = skipped.saturating_add(extent.committed.saturating_sub(size));
-        collected.push(RawRegion {
-            base,
-            bytes,
-            unreadable_pages,
-            committed: extent.committed,
-            protections: extent.protections,
-            executable: extent.executable,
-        });
     }
     ScannedAllocations {
         regions: collected,
@@ -929,15 +974,21 @@ fn measure_pages(process: HANDLE, base: usize, size: usize) -> PageCoverage {
     coverage
 }
 
+struct HiddenScan {
+    found: Vec<(usize, usize)>,
+    unscanned: usize,
+}
+
 fn find_hidden_images(
     space: &AddressSpace,
     regions: &[MemoryRegion],
     executable_allocations: &BTreeSet<usize>,
-) -> AppResult<Vec<(usize, usize)>> {
+) -> AppResult<HiddenScan> {
     let allocation_ends = allocation_extents(regions, executable_allocations)?;
     let mut found = Vec::new();
     let mut captured_allocations = BTreeSet::new();
     let mut scanned_pages = 0usize;
+    let mut unscanned = 0usize;
     for region in regions {
         if captured_allocations.contains(&region.allocation_base)
             || !executable_allocations.contains(&region.allocation_base)
@@ -950,12 +1001,11 @@ fn find_hidden_images(
             continue;
         };
         for offset in (0..region.size).step_by(PAGE_SIZE) {
-            scanned_pages = scanned_pages.saturating_add(1);
-            if scanned_pages > MAX_NON_IMAGE_SCAN_PAGES {
-                return Err(AppError::new(
-                    "non-image PE scan exceeds the 262144-page safety limit",
-                ));
+            if scanned_pages >= MAX_NON_IMAGE_SCAN_PAGES || found.len() >= MAX_IMAGES {
+                unscanned = unscanned.saturating_add(region.size.saturating_sub(offset));
+                break;
             }
+            scanned_pages = scanned_pages.saturating_add(1);
             let Some(base) = region.base.checked_add(offset) else {
                 return Err(AppError::new("non-image PE scan address overflowed"));
             };
@@ -964,15 +1014,10 @@ fn find_hidden_images(
             };
             found.push((base, available));
             captured_allocations.insert(region.allocation_base);
-            if found.len() > MAX_IMAGES {
-                return Err(AppError::new(
-                    "hidden image count exceeds the 4096-image safety limit",
-                ));
-            }
             break;
         }
     }
-    Ok(found)
+    Ok(HiddenScan { found, unscanned })
 }
 
 fn allocation_extents(
