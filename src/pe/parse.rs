@@ -1,4 +1,4 @@
-use crate::pe::image::{checked_add, read_u16, read_u32, require_range};
+use crate::pe::image::{checked_add, first_section_rva, read_u16, read_u32, require_range};
 use crate::pe::{PeImage, PeKind, PeModel, Rva, SectionModel};
 use crate::{AppError, AppResult};
 
@@ -290,21 +290,22 @@ fn parse_sections(
             bytes,
             checked_add(header_offset, 36, "section characteristics")?,
         )?;
-        validate_section(virtual_address, virtual_size, raw_size, declared_image_size)?;
         let mut name = [0u8; 8];
         name.copy_from_slice(
             bytes
                 .get(header_offset..header_offset.saturating_add(8))
                 .ok_or_else(|| AppError::new("section name is outside the captured image"))?,
         );
-        sections.push(SectionModel {
+        let section = SectionModel {
             header_offset,
             name,
             virtual_size,
             virtual_address: Rva(virtual_address),
             raw_size,
             characteristics,
-        });
+        };
+        validate_section(&section, declared_image_size)?;
+        sections.push(section);
     }
     validate_non_overlapping_sections(&sections)?;
     Ok(sections)
@@ -327,19 +328,15 @@ fn validate_alignments(file_alignment: u32, section_alignment: u32) -> AppResult
     Ok(())
 }
 
-fn validate_section(
-    virtual_address: u32,
-    virtual_size: u32,
-    raw_size: u32,
-    image_size: usize,
-) -> AppResult<()> {
-    let span = mapped_size(virtual_size, raw_size);
+fn validate_section(section: &SectionModel, image_size: usize) -> AppResult<()> {
+    let span = section.mapped_size();
     if span == 0 {
         return Ok(());
     }
-    let end = usize::try_from(virtual_address)
-        .ok()
-        .and_then(|start| start.checked_add(span as usize))
+    let end = section
+        .virtual_address
+        .as_usize()
+        .checked_add(span as usize)
         .ok_or_else(|| AppError::new("section virtual range overflowed"))?;
     if end > image_size {
         return Err(AppError::new(format!(
@@ -353,7 +350,7 @@ fn validate_non_overlapping_sections(sections: &[SectionModel]) -> AppResult<()>
     let mut ranges = sections
         .iter()
         .filter_map(|section| {
-            let length = mapped_size(section.virtual_size, section.raw_size);
+            let length = section.mapped_size();
             (length != 0).then_some((section.virtual_address.get(), length))
         })
         .collect::<Vec<_>>();
@@ -368,31 +365,15 @@ fn validate_non_overlapping_sections(sections: &[SectionModel]) -> AppResult<()>
     Ok(())
 }
 
-// The loader maps VirtualSize bytes and drops raw data past it; only a zero
-// VirtualSize falls back to SizeOfRawData.
-fn mapped_size(virtual_size: u32, raw_size: u32) -> u32 {
-    if virtual_size != 0 {
-        virtual_size
-    } else {
-        raw_size
-    }
-}
-
-// The loader maps headers ahead of the first section. A signature found after
-// that point belongs to a PE stored inside the image, not to the image itself.
 fn require_headers_before_sections(
     table_offset: usize,
     table_size: usize,
     sections: &[SectionModel],
 ) -> AppResult<()> {
     let table_end = checked_add(table_offset, table_size, "section table end")?;
-    let first_section = sections
-        .iter()
-        .filter(|section| mapped_size(section.virtual_size, section.raw_size) != 0)
-        .map(|section| section.virtual_address.get() as usize)
-        .min()
-        .unwrap_or(usize::MAX);
+    let first_section = first_section_rva(sections).unwrap_or(usize::MAX);
     if table_end > first_section {
+        // headers past the first section belong to a pe stored inside the image
         return Err(AppError::new(
             "salvaged headers lie inside their own section data",
         ));

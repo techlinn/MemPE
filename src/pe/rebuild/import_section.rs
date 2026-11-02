@@ -90,9 +90,12 @@ fn clear_overlapping_bound_imports(
         return Ok(false);
     };
     let start = read_u32(output, offset)? as usize;
-    let end = start.saturating_add(read_u32(output, offset.saturating_add(4))? as usize);
+    let size = read_u32(output, offset.saturating_add(4))? as usize;
+    let end = start.saturating_add(size);
     let header_end = section_header.saturating_add(SECTION_HEADER_SIZE);
-    if start == end || start >= header_end || end <= section_header {
+
+    let overlaps = size != 0 && start < header_end && end > section_header;
+    if !overlaps {
         return Ok(false);
     }
     Ok(clear_directory(output, model, BOUND_IMPORT_DIRECTORY)? > 0)

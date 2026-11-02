@@ -3,6 +3,7 @@ use crate::pe::parse::parse_disk_image;
 use crate::pe::{PeImage, PeKind, SECURITY_DIRECTORY};
 
 const DOS_MAGIC: [u8; 2] = *b"MZ";
+const DOS_HEADER_SIZE: usize = 64;
 const RAW_SIZE_OFFSET: usize = 16;
 const RAW_POINTER_OFFSET: usize = 20;
 const SUBSYSTEM_NATIVE: u16 = 1;
@@ -23,11 +24,26 @@ pub(crate) struct CarveResult {
     pub(crate) unscanned: usize,
 }
 
-pub(crate) fn carve_embedded(memory: &[u8]) -> CarveResult {
+#[derive(Clone, Copy)]
+pub(crate) enum CarveSource {
+    Image,
+    Buffer,
+}
+
+pub(crate) fn carve_embedded(memory: &[u8], source: CarveSource) -> CarveResult {
+    let Some(last_candidate) = memory.len().checked_sub(DOS_HEADER_SIZE) else {
+        return CarveResult {
+            found: Vec::new(),
+            unscanned: 0,
+        };
+    };
     let mut found = Vec::new();
     let mut attempts = 0usize;
-    let mut offset = 1usize;
-    while offset.saturating_add(64) <= memory.len()
+    let mut offset = match source {
+        CarveSource::Image => 1, // offset 0 is the images own header
+        CarveSource::Buffer => 0,
+    };
+    while offset <= last_candidate
         && found.len() < MAX_EMBEDDED_PER_IMAGE
         && attempts < MAX_CARVE_ATTEMPTS
     {
@@ -44,10 +60,8 @@ pub(crate) fn carve_embedded(memory: &[u8]) -> CarveResult {
             None => offset = offset.saturating_add(1),
         }
     }
-    let unscanned = memory
-        .len()
-        .saturating_sub(64)
-        .saturating_sub(offset.saturating_sub(1));
+
+    let unscanned = last_candidate.saturating_add(1).saturating_sub(offset);
     CarveResult { found, unscanned }
 }
 
@@ -104,7 +118,7 @@ fn classify(image: &PeImage<'_>) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::carve_embedded;
+    use super::{CarveSource, carve_embedded};
 
     fn host_with_embedded() -> Vec<u8> {
         let mut host = vec![0u8; 0x4000];
@@ -143,7 +157,7 @@ mod tests {
     fn carves_only_the_inner_pe_not_the_host() {
         let host = host_with_embedded();
 
-        let found = carve_embedded(&host).found;
+        let found = carve_embedded(&host, CarveSource::Image).found;
 
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].offset, 0x2000);
@@ -156,7 +170,7 @@ mod tests {
         bytes[0x100] = 0x4d;
         bytes[0x101] = 0x5a;
 
-        assert!(carve_embedded(&bytes).found.is_empty());
+        assert!(carve_embedded(&bytes, CarveSource::Image).found.is_empty());
     }
 
     #[test]
@@ -165,7 +179,7 @@ mod tests {
         write_min_pe(&mut host, 0x2000);
         host[0x2000 + 0x84..0x2000 + 0x86].copy_from_slice(&0x1234u16.to_le_bytes());
 
-        assert!(carve_embedded(&host).found.is_empty());
+        assert!(carve_embedded(&host, CarveSource::Image).found.is_empty());
     }
 
     #[test]
@@ -175,24 +189,51 @@ mod tests {
         let section_size = 0x2000 + 0x98 + 0xf0 + 8;
         host[section_size..section_size + 4].copy_from_slice(&0x9000u32.to_le_bytes());
 
-        assert!(carve_embedded(&host).found.is_empty());
+        assert!(carve_embedded(&host, CarveSource::Image).found.is_empty());
     }
 
     #[test]
     fn reports_nothing_unscanned_after_a_complete_pass() {
-        assert_eq!(carve_embedded(&host_with_embedded()).unscanned, 0);
+        assert_eq!(
+            carve_embedded(&host_with_embedded(), CarveSource::Image).unscanned,
+            0
+        );
+    }
+
+    #[test]
+    fn finds_a_pe_at_the_very_start_of_a_buffer() {
+        let mut buffer = vec![0u8; 0x4000];
+        write_min_pe(&mut buffer, 0);
+
+        let from_buffer = carve_embedded(&buffer, CarveSource::Buffer).found;
+        let from_image = carve_embedded(&buffer, CarveSource::Image).found;
+
+        assert_eq!(from_buffer.len(), 1);
+        assert_eq!(from_buffer[0].offset, 0);
+        assert!(from_image.is_empty());
+    }
+
+    #[test]
+    fn scans_nothing_in_a_buffer_shorter_than_a_dos_header() {
+        let mut buffer = vec![0u8; 0x20];
+        buffer[..2].copy_from_slice(b"MZ");
+
+        let result = carve_embedded(&buffer, CarveSource::Buffer);
+
+        assert!(result.found.is_empty());
+        assert_eq!(result.unscanned, 0);
     }
 
     #[test]
     fn reports_the_bytes_left_when_the_attempt_limit_stops_it() {
         let bytes = b"MZ".repeat(super::MAX_CARVE_ATTEMPTS + 0x1000);
 
-        let result = carve_embedded(&bytes);
+        let result = carve_embedded(&bytes, CarveSource::Image);
 
         assert!(result.found.is_empty());
         assert_eq!(
             result.unscanned,
-            bytes.len() - 64 - 2 * super::MAX_CARVE_ATTEMPTS
+            bytes.len() - super::DOS_HEADER_SIZE - 2 * super::MAX_CARVE_ATTEMPTS
         );
         assert!(result.unscanned < bytes.len());
     }
@@ -208,6 +249,6 @@ mod tests {
             *byte = (state >> 33) as u8;
         }
 
-        assert!(carve_embedded(&bytes).found.is_empty());
+        assert!(carve_embedded(&bytes, CarveSource::Image).found.is_empty());
     }
 }

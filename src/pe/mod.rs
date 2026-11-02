@@ -7,7 +7,7 @@ mod rebuild;
 
 use std::fmt::{Display, Formatter};
 
-pub(crate) use carve::{CarveResult, carve_embedded};
+pub(crate) use carve::{CarveResult, CarveSource, carve_embedded};
 pub(crate) use exports::{ExportIndex, ExportStats, embedded_module_name};
 pub(crate) use parse::memory_image_size;
 pub(crate) use rebuild::{RebuiltImage, rebuild};

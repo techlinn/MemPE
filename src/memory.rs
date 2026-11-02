@@ -445,7 +445,7 @@ fn capture_from_space(
     }
     let main_image_missing = main_image_is_missing(&images);
     let unclaimed = unclaimed_executable_allocations(&regions, &non_image_allocations, &hidden);
-    let mut carve_allocations = unclaimed.iter().copied().collect::<Vec<_>>();
+    let mut carve_allocations = unclaimed.iter().copied().collect::<Vec<_>>(); // loader buffers get the budget first
     carve_allocations.extend(readable_non_image_allocations(
         space,
         &regions,
@@ -547,14 +547,14 @@ fn committed_runs(
             continue;
         }
         let end = region.base.saturating_add(region.size);
-        let list = runs.entry(region.allocation_base).or_default();
-        match list.last_mut() {
+        let allocation_runs = runs.entry(region.allocation_base).or_default();
+        match allocation_runs.last_mut() {
             Some(run) if run.end == region.base => {
                 run.end = end;
                 run.protections |= region.protect;
                 run.executable |= is_executable(region.protect);
             }
-            _ => list.push(CommittedRun {
+            _ => allocation_runs.push(CommittedRun {
                 allocation_base: region.allocation_base,
                 base: region.base,
                 end,
@@ -580,9 +580,9 @@ fn read_allocations(
         for run in runs.remove(allocation).unwrap_or_default() {
             let committed = run.end.saturating_sub(run.base);
             let size = committed.min(remaining);
+            let limit_reached = size == 0 || collected.len() >= MAX_IMAGES;
             let mut bytes = Vec::new();
-            if size == 0 || collected.len() >= MAX_IMAGES || bytes.try_reserve_exact(size).is_err()
-            {
+            if limit_reached || bytes.try_reserve_exact(size).is_err() {
                 skipped = skipped.saturating_add(committed);
                 continue;
             }
@@ -1186,13 +1186,13 @@ mod tests {
     use std::collections::BTreeSet;
 
     use windows::Win32::System::Memory::{
-        MEM_COMMIT, MEM_IMAGE, MEM_MAPPED, MEM_PRIVATE, PAGE_EXECUTE_READ, PAGE_GUARD,
-        PAGE_READONLY, PAGE_READWRITE,
+        MEM_COMMIT, MEM_IMAGE, MEM_MAPPED, MEM_PRIVATE, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_GUARD,
+        PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
     };
 
     use super::{
         CapturedImage, MAX_IMAGES, MAX_STABILITY_READS, MAX_TOTAL_IMAGE_BYTES, MemoryRegion,
-        PAGE_SIZE, allocation_extents, basename_mismatch, claim_image_budget,
+        PAGE_SIZE, allocation_extents, basename_mismatch, claim_image_budget, committed_runs,
         executable_non_image_allocations, group_images, is_executable, main_image_is_missing,
         regions_in_range, stability_pages, to_dos_path,
     };
@@ -1396,6 +1396,48 @@ mod tests {
         assert!(!basename_mismatch(None, Some("ntdll.dll")));
         assert!(!basename_mismatch(Some("ntdll.dll"), None));
         assert!(!basename_mismatch(None, None));
+    }
+
+    fn private_region(
+        base: usize,
+        allocation_base: usize,
+        state: u32,
+        protect: u32,
+    ) -> MemoryRegion {
+        MemoryRegion {
+            base,
+            allocation_base,
+            size: PAGE_SIZE,
+            state,
+            protect,
+            kind: MEM_PRIVATE.0,
+        }
+    }
+
+    #[test]
+    fn merges_adjacent_readable_pages_and_splits_at_gaps() {
+        let committed = MEM_COMMIT.0;
+        let regions = [
+            private_region(0x1000, 0x1000, committed, PAGE_READWRITE.0),
+            private_region(0x2000, 0x1000, committed, PAGE_EXECUTE_READ.0),
+            private_region(0x3000, 0x1000, MEM_RESERVE.0, PAGE_NOACCESS.0),
+            private_region(0x4000, 0x1000, committed, PAGE_READWRITE.0),
+            private_region(0x5000, 0x1000, committed, PAGE_NOACCESS.0),
+            private_region(0x9000, 0x9000, committed, PAGE_READWRITE.0),
+        ];
+
+        let runs = committed_runs(&regions, &[0x1000]);
+
+        let spans = runs
+            .get(&0x1000)
+            .map(|runs| {
+                runs.iter()
+                    .map(|run| (run.base, run.end, run.executable))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        assert_eq!(spans, vec![(0x1000, 0x3000, true), (0x4000, 0x5000, false)]);
+        assert!(!runs.contains_key(&0x9000));
     }
 
     #[test]

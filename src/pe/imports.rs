@@ -395,7 +395,7 @@ fn recover_referenced_imports(
     let width = kind.pointer_width();
     let mut recovered = collect_recovered_slots(plan, width);
     recovered.append(&mut existing_thunk_slots(memory, &plan.existing, width));
-    recovered.append(&mut guard_pointer_slots(image, observed_base));
+    recovered.append(&mut guard_pointer_slots(image, observed_base)); // hold own no-op stubs without cfg
     let remaining = MAX_IMPORTS.saturating_sub(plan.recovered);
     let mut entries = Vec::with_capacity(referenced.len().min(remaining));
 
@@ -442,14 +442,7 @@ fn recover_referenced_imports(
         });
     }
 
-    append_groups(
-        entries,
-        width,
-        1,
-        ImportSource::Inferred,
-        referenced,
-        plan,
-    );
+    append_groups(entries, width, 1, ImportSource::Inferred, referenced, plan);
 }
 
 fn image_offset(observed_base: usize, memory_length: usize, value: usize) -> Option<usize> {
@@ -457,22 +450,22 @@ fn image_offset(observed_base: usize, memory_length: usize, value: usize) -> Opt
     (offset < memory_length).then_some(offset)
 }
 
-// The CFG check and dispatch pointers are called through like imports but hold
-// the image's own no-op stubs when the process runs without CFG.
 fn guard_pointer_slots(image: &PeImage<'_>, observed_base: usize) -> BTreeSet<u32> {
-    let memory = image.bytes();
-    let kind = image.model().kind();
-    let width = kind.pointer_width();
     let Some((directory_rva, _)) = directory(image, LOAD_CONFIG_DIRECTORY) else {
         return BTreeSet::new();
     };
+    let memory = image.bytes();
+    let kind = image.model().kind();
+    let width = kind.pointer_width();
     let directory_rva = directory_rva as usize;
-    let first = match kind {
+    let declared = read_u32(memory, directory_rva).unwrap_or(0) as usize; // the load configs own size field
+
+    let check_pointer = match kind {
         PeKind::Pe32 => GUARD_CHECK_POINTER_PE32,
         PeKind::Pe32Plus => GUARD_CHECK_POINTER_PE32_PLUS,
     };
-    let declared = read_u32(memory, directory_rva).unwrap_or(0) as usize;
-    [first, first.saturating_add(width)]
+    let dispatch_pointer = check_pointer.saturating_add(width);
+    [check_pointer, dispatch_pointer]
         .into_iter()
         .filter(|offset| offset.saturating_add(width) <= declared)
         .filter_map(|offset| read_pointer(memory, directory_rva.checked_add(offset)?, width))
@@ -703,7 +696,7 @@ fn append_groups(
         {
             continue;
         }
-        if !is_representable(&symbol) {
+        if !is_representable(&symbol.module, symbol.name.as_deref(), symbol.ordinal) {
             plan.unrepresentable = plan.unrepresentable.saturating_add(1);
             continue;
         }
@@ -741,12 +734,11 @@ fn append_groups(
     }
 }
 
-fn is_representable(symbol: &ResolvedExport) -> bool {
-    let ascii = |text: &str| !text.is_empty() && text.is_ascii() && !text.contains('\0');
-    ascii(&symbol.module)
-        && match symbol.name.as_deref() {
-            Some(name) => ascii(name),
-            None => u16::try_from(symbol.ordinal).is_ok(),
+fn is_representable(module: &str, name: Option<&str>, ordinal: u32) -> bool {
+    module.is_ascii()
+        && match name {
+            Some(name) => name.is_ascii(),
+            None => u16::try_from(ordinal).is_ok(), // ordinal thunks hold 16 bits
         }
 }
 
@@ -1059,18 +1051,8 @@ mod tests {
         IMPORT_DESCRIPTOR_SIZE, Reference, build_plan, decode_slot_reference, delay_table_range,
         guard_pointer_slots, is_representable, rip_relative_slot, try_descriptor_array,
     };
-    use crate::pe::exports::ResolvedExport;
     use crate::pe::parse::parse_memory_image;
     use crate::pe::{ExportIndex, PeKind, rebuild};
-
-    fn symbol(module: &str, name: Option<&str>, ordinal: u32) -> ResolvedExport {
-        ResolvedExport {
-            module: module.to_owned(),
-            name: name.map(str::to_owned),
-            ordinal,
-            forwarded: false,
-        }
-    }
 
     #[test]
     fn makes_header_room_for_recovered_imports_when_the_table_fills_it()
@@ -1092,6 +1074,28 @@ mod tests {
         assert_eq!(rebuilt.imports_rebuilt, 1);
         assert_eq!(rebuilt.unemitted_imports, 0);
         assert_eq!(rebuilt.section_count, 3);
+        assert!(PeFile::from_bytes(&rebuilt.bytes).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn clears_a_bound_import_table_where_the_new_section_header_goes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let export_base = 0x0000_7FFB_0000_0000usize;
+        let export_image = fixture_pe64(true);
+        let index = ExportIndex::build([(export_base, export_image.as_slice(), None)]);
+        let mut target = fixture_pe64(false);
+        let bound_imports = 0x98 + 112 + 11 * 8;
+        put_u32(&mut target, bound_imports, 0x1D8);
+        put_u32(&mut target, bound_imports + 4, 0x20);
+        put_u64(&mut target, 0x2000, export_base as u64 + 0x1000);
+        put_u32(&mut target, 0x98 + 112 + 12 * 8, 0x2000);
+        put_u32(&mut target, 0x98 + 112 + 12 * 8 + 4, 8);
+
+        let rebuilt = rebuild(&target, &[], 0x0000_7FF6_0000_0000, None, &index, None, &[])?;
+
+        assert_eq!(rebuilt.imports_rebuilt, 1);
+        assert_eq!(&rebuilt.bytes[bound_imports..bound_imports + 8], &[0; 8]);
         assert!(PeFile::from_bytes(&rebuilt.bytes).is_ok());
         Ok(())
     }
@@ -1131,11 +1135,11 @@ mod tests {
 
     #[test]
     fn only_imports_an_ascii_table_can_describe_are_representable() {
-        assert!(is_representable(&symbol("KERNEL32.dll", Some("Sleep"), 1)));
-        assert!(is_representable(&symbol("WS2_32.dll", None, 0xFFFF)));
-        assert!(!is_representable(&symbol("WS2_32.dll", None, 0x1_0000)));
-        assert!(!is_representable(&symbol("тест.dll", Some("Sleep"), 1)));
-        assert!(!is_representable(&symbol("a.dll", Some("Schlüssel"), 1)));
+        assert!(is_representable("KERNEL32.dll", Some("Sleep"), 1));
+        assert!(is_representable("WS2_32.dll", None, 0xFFFF));
+        assert!(!is_representable("WS2_32.dll", None, 0x1_0000));
+        assert!(!is_representable("тест.dll", Some("Sleep"), 1));
+        assert!(!is_representable("a.dll", Some("Schlüssel"), 1));
     }
 
     #[test]

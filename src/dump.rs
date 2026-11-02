@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 
 use crate::memory::{Capture, CapturedImage, RawRegion};
 use crate::output::{OutputFile, OutputPlan, WrittenFile};
-use crate::pe::{self, CarveResult, EntryPointRva, ExportIndex, ExportStats, PeKind, RebuiltImage};
+use crate::pe::{
+    self, CarveResult, CarveSource, EntryPointRva, ExportIndex, ExportStats, PeKind, RebuiltImage,
+};
 use crate::process::TargetProcess;
 use crate::{AppError, AppResult};
 
@@ -445,7 +447,8 @@ pub(crate) fn build(
 
 fn push_region_embedded(regions: &[RawRegion], report: &mut BuildReport) {
     for region in regions {
-        let CarveResult { found, unscanned } = pe::carve_embedded(&region.bytes);
+        let CarveResult { found, unscanned } =
+            pe::carve_embedded(&region.bytes, CarveSource::Buffer);
         report.counts.unscanned_bytes = report.counts.unscanned_bytes.saturating_add(unscanned);
         for (index, embedded) in found.into_iter().enumerate() {
             let Some(bytes) = copy_range(&region.bytes, embedded.offset, embedded.length) else {
@@ -515,7 +518,7 @@ fn region_notes(region: &RawRegion, written: usize) -> String {
 
 fn push_embedded(target: &TargetProcess, image: &CapturedImage, report: &mut BuildReport) {
     let label = embedded_label(target, image);
-    let CarveResult { found, unscanned } = pe::carve_embedded(&image.bytes);
+    let CarveResult { found, unscanned } = pe::carve_embedded(&image.bytes, CarveSource::Image);
     report.counts.unscanned_bytes = report.counts.unscanned_bytes.saturating_add(unscanned);
     for (index, embedded) in found.into_iter().enumerate() {
         let Some(bytes) = copy_range(&image.bytes, embedded.offset, embedded.length) else {

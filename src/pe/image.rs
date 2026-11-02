@@ -42,6 +42,13 @@ impl SectionModel {
         self.virtual_size.max(self.raw_size)
     }
 
+    pub(super) fn mapped_size(&self) -> u32 {
+        match self.virtual_size {
+            0 => self.raw_size,
+            size => size, // the loader drops raw data past VirtualSize
+        }
+    }
+
     pub(super) fn contains_rva(&self, rva: Rva) -> bool {
         let start = self.virtual_address.get();
         let end = start.saturating_add(self.span());
@@ -113,6 +120,14 @@ impl PeModel {
             .iter()
             .any(|section| section.is_executable() && section.contains_rva(rva))
     }
+}
+
+pub(super) fn first_section_rva(sections: &[SectionModel]) -> Option<usize> {
+    sections
+        .iter()
+        .filter(|section| section.mapped_size() != 0)
+        .map(|section| section.virtual_address.as_usize())
+        .min()
 }
 
 pub(super) fn read_u16(bytes: &[u8], offset: usize) -> AppResult<u16> {

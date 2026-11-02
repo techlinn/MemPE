@@ -1,7 +1,7 @@
 use super::{
     IMAGE_SCN_CNT_CODE, MAX_OUTPUT_SIZE, PAGE_SIZE, SECTION_HEADER_SIZE, SectionLayout, align_up,
 };
-use crate::pe::image::write_u32;
+use crate::pe::image::{first_section_rva, write_u32};
 use crate::pe::{
     IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE, PeModel, RegionEvidence,
 };
@@ -22,10 +22,7 @@ pub(super) fn build_output_buffer<'a>(
         .last()
         .map(|section| section.header_offset.saturating_add(SECTION_HEADER_SIZE))
         .ok_or_else(|| AppError::new("PE has no section headers"))?;
-    let header_size = match reserve_import_header {
-        true => header_size_with_spare_slot(model, section_table_end)?,
-        false => align_up(section_table_end, model.file_alignment as usize)?,
-    };
+    let header_size = header_size(model, section_table_end, reserve_import_header)?;
     let layouts = layout_sections(model, memory, header_size)?;
     let output_size = layouts
         .iter()
@@ -48,22 +45,22 @@ pub(super) fn build_output_buffer<'a>(
     Ok((output, layouts, header_size))
 }
 
-fn header_size_with_spare_slot(model: &PeModel, section_table_end: usize) -> AppResult<usize> {
+fn header_size(
+    model: &PeModel,
+    section_table_end: usize,
+    reserve_import_header: bool,
+) -> AppResult<usize> {
     let alignment = model.file_alignment as usize;
     let minimum = align_up(section_table_end, alignment)?;
-    let spare = align_up(
-        section_table_end.saturating_add(SECTION_HEADER_SIZE),
-        alignment,
-    )?;
-    let first_section = model
-        .sections
-        .iter()
-        .filter(|section| section.span() != 0)
-        .map(|section| section.virtual_address.get() as usize)
-        .min()
-        .unwrap_or(usize::MAX);
-    Ok(if spare <= first_section {
-        spare
+    if !reserve_import_header {
+        return Ok(minimum);
+    }
+
+    let next_header_end = section_table_end.saturating_add(SECTION_HEADER_SIZE); // the .mempe header
+    let with_room = align_up(next_header_end, alignment)?;
+    let first_section = first_section_rva(&model.sections).unwrap_or(usize::MAX);
+    Ok(if with_room <= first_section {
+        with_room
     } else {
         minimum
     })

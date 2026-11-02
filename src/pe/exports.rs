@@ -16,7 +16,7 @@ pub(crate) struct ResolvedExport {
     pub(crate) module: String,
     pub(crate) name: Option<String>,
     pub(crate) ordinal: u32,
-    pub(crate) forwarded: bool,
+    forwarded: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -155,12 +155,10 @@ fn naming_priority(symbol: &ResolvedExport) -> NamingPriority {
     }
 }
 
-// A forwarder is only indexed at the address its chain resolves to, so it always
-// aliases the definition there. Only two direct definitions can disagree.
 fn definitions_conflict(symbols: &[ResolvedExport]) -> bool {
     let definitions = symbols
         .iter()
-        .filter(|symbol| !symbol.forwarded)
+        .filter(|symbol| !symbol.forwarded) // a forwarder only lands on the address it resolves to
         .collect::<Vec<_>>();
     definitions.iter().enumerate().any(|(index, left)| {
         definitions
