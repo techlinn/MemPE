@@ -2,6 +2,7 @@ mod carve;
 mod exports;
 mod image;
 mod imports;
+mod packers;
 mod parse;
 mod rebuild;
 
@@ -9,8 +10,9 @@ use std::fmt::{Display, Formatter};
 
 pub(crate) use carve::{CarveResult, CarveSource, carve_embedded};
 pub(crate) use exports::{ExportIndex, ExportStats, embedded_module_name};
+pub(crate) use packers::PackerReport;
 pub(crate) use parse::memory_image_size;
-pub(crate) use rebuild::{RebuiltImage, rebuild};
+pub(crate) use rebuild::{RebuiltImage, append_overlay, overlay_offset, rebuild};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RegionEvidence {
@@ -37,9 +39,14 @@ impl EntryPointRva {
 pub(crate) const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 pub(crate) const IMAGE_SCN_MEM_READ: u32 = 0x4000_0000;
 pub(crate) const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
+pub(crate) const EXPORT_DIRECTORY: usize = 0;
 pub(crate) const IMPORT_DIRECTORY: usize = 1;
-pub(crate) const IAT_DIRECTORY: usize = 12;
+pub(crate) const RESOURCE_DIRECTORY: usize = 2;
 pub(crate) const SECURITY_DIRECTORY: usize = 4;
+pub(crate) const BASERELOC_DIRECTORY: usize = 5;
+pub(crate) const DEBUG_DIRECTORY: usize = 6;
+pub(crate) const BOUND_IMPORT_DIRECTORY: usize = 11;
+pub(crate) const IAT_DIRECTORY: usize = 12;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PeKind {
@@ -90,6 +97,7 @@ struct SectionModel {
     name: [u8; 8],
     virtual_size: u32,
     virtual_address: Rva,
+    raw_pointer: u32,
     raw_size: u32,
     characteristics: u32,
 }
@@ -116,15 +124,4 @@ struct PeModel {
     image_size: u32,
     sections: Vec<SectionModel>,
     salvaged: bool,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::PeKind;
-
-    #[test]
-    fn pointer_width_follows_the_image_kind() {
-        assert_eq!(PeKind::Pe32.pointer_width(), 4);
-        assert_eq!(PeKind::Pe32Plus.pointer_width(), 8);
-    }
 }

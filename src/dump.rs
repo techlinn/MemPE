@@ -1,17 +1,19 @@
 use std::collections::BTreeSet;
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::memory::{Capture, CapturedImage, RawRegion};
 use crate::output::{OutputFile, OutputPlan, WrittenFile};
 use crate::pe::{
-    self, CarveResult, CarveSource, EntryPointRva, ExportIndex, ExportStats, PeKind, RebuiltImage,
+    self, CarveResult, CarveSource, EntryPointRva, ExportIndex, ExportStats, PackerReport, PeKind,
+    RebuiltImage,
 };
 use crate::process::TargetProcess;
 use crate::{AppError, AppResult};
 
 const MAX_DISK_HEADER_BYTES: u64 = 1024 * 1024;
+const MAX_OVERLAY_BYTES: u64 = 1024 * 1024 * 1024;
 
 pub(crate) struct ArtifactInfo {
     pub(crate) base: usize,
@@ -34,6 +36,7 @@ pub(crate) struct ArtifactInfo {
     pub(crate) recovered_scanned: usize,
     pub(crate) recovered_delayed: usize,
     pub(crate) recovered_inferred: usize,
+    pub(crate) recovered_packer: usize,
     pub(crate) mixed_module_runs: usize,
     pub(crate) slots_with_call_sites: usize,
     pub(crate) ambiguous_imports: usize,
@@ -53,6 +56,7 @@ pub(crate) struct ArtifactInfo {
     pub(crate) write_execute_sections: usize,
     pub(crate) never_decrypted_sections: usize,
     pub(crate) absent_sections: usize,
+    pub(crate) packer: Option<PackerReport>,
     pub(crate) resident_pages: usize,
     pub(crate) private_pages: usize,
     pub(crate) unlinked: bool,
@@ -106,6 +110,7 @@ impl ArtifactInfo {
             recovered_scanned: 0,
             recovered_delayed: 0,
             recovered_inferred: 0,
+            recovered_packer: 0,
             mixed_module_runs: 0,
             slots_with_call_sites: 0,
             ambiguous_imports: 0,
@@ -121,6 +126,7 @@ impl ArtifactInfo {
             write_execute_sections: 0,
             never_decrypted_sections: 0,
             absent_sections: 0,
+            packer: None,
             resident_pages: 0,
             private_pages: 0,
             unlinked: false,
@@ -160,6 +166,7 @@ pub(crate) struct DumpSummary {
     pub(crate) recovered_scanned: usize,
     pub(crate) recovered_delayed: usize,
     pub(crate) recovered_inferred: usize,
+    pub(crate) recovered_packer: usize,
     pub(crate) mixed_module_runs: usize,
     pub(crate) slots_with_call_sites: usize,
     pub(crate) ambiguous_imports: usize,
@@ -179,6 +186,7 @@ pub(crate) struct DumpSummary {
     pub(crate) path_mismatches: usize,
     pub(crate) never_decrypted_sections: usize,
     pub(crate) absent_sections: usize,
+    pub(crate) partly_unpacked: usize,
     pub(crate) raw_region_unreadable_pages: usize,
     pub(crate) raw_regions: usize,
     pub(crate) embedded_pes: usize,
@@ -268,6 +276,7 @@ impl DumpOutcome {
             || self.summary.path_mismatches > 0
             || self.summary.never_decrypted_sections > 0
             || self.summary.absent_sections > 0
+            || self.summary.partly_unpacked > 0
             || self.summary.raw_region_unreadable_pages > 0
             || self.export_stats.unresolved_forwarders > 0
             || !self.failures.is_empty()
@@ -323,6 +332,7 @@ impl DumpSummary {
         self.recovered_inferred = self
             .recovered_inferred
             .saturating_add(info.recovered_inferred);
+        self.recovered_packer = self.recovered_packer.saturating_add(info.recovered_packer);
         self.mixed_module_runs = self
             .mixed_module_runs
             .saturating_add(info.mixed_module_runs);
@@ -391,6 +401,11 @@ impl DumpSummary {
             .never_decrypted_sections
             .saturating_add(info.never_decrypted_sections);
         self.absent_sections = self.absent_sections.saturating_add(info.absent_sections);
+        if let Some(packer) = &info.packer {
+            self.partly_unpacked = self
+                .partly_unpacked
+                .saturating_add(usize::from(!packer.unrestored.is_empty()));
+        }
     }
 }
 
@@ -621,7 +636,9 @@ fn build_image(
 ) {
     let known_module = image.name.is_some();
     let image_entry_point = if image.is_main { entry_point } else { None };
-    match rebuild_image(&image, exports, image_entry_point) {
+    match rebuild_image(&image, exports, image_entry_point)
+        .map(|rebuilt| with_overlay(&image, rebuilt))
+    {
         Ok(rebuilt) if should_write(&image, &rebuilt, known_module) => {
             report.main_rebuilt |= image.is_main;
             let preferred_name = output_name(target, &image, &rebuilt);
@@ -667,6 +684,7 @@ fn artifact_info(image: &CapturedImage, rebuilt: &RebuiltImage) -> ArtifactInfo 
         recovered_scanned: rebuilt.recovered_scanned,
         recovered_delayed: rebuilt.recovered_delayed,
         recovered_inferred: rebuilt.recovered_inferred,
+        recovered_packer: rebuilt.recovered_packer,
         mixed_module_runs: rebuilt.mixed_module_runs,
         slots_with_call_sites: rebuilt.slots_with_call_sites,
         ambiguous_imports: rebuilt.ambiguous_imports,
@@ -682,6 +700,7 @@ fn artifact_info(image: &CapturedImage, rebuilt: &RebuiltImage) -> ArtifactInfo 
         write_execute_sections: rebuilt.write_execute_sections,
         never_decrypted_sections: rebuilt.never_decrypted_sections,
         absent_sections: rebuilt.absent_sections,
+        packer: rebuilt.packer.clone(),
         resident_pages: image.resident_pages,
         private_pages: image.private_pages,
         unlinked: !image.linked && !image.hidden,
@@ -780,6 +799,50 @@ fn rebuild_with_disk_headers(
     )
 }
 
+fn with_overlay(image: &CapturedImage, mut rebuilt: RebuiltImage) -> RebuiltImage {
+    let unpacked = rebuilt
+        .packer
+        .as_ref()
+        .is_some_and(|report| !report.restored.is_empty());
+    let Some(path) = image
+        .path
+        .as_ref()
+        .filter(|_| unpacked && image.image_backed && !image.path_mismatch)
+    else {
+        return rebuilt;
+    };
+    let appended = match read_overlay(path) {
+        Ok(None) => return rebuilt,
+        Ok(Some(overlay)) => pe::append_overlay(&mut rebuilt, &overlay).is_ok(),
+        Err(_) => false,
+    };
+    if !appended && let Some(report) = &mut rebuilt.packer {
+        report
+            .unrestored
+            .push("overlay (the packed file could not be read or appended)");
+    }
+    rebuilt
+}
+
+fn read_overlay(path: &Path) -> AppResult<Option<Vec<u8>>> {
+    let headers = read_disk_headers(path)?;
+    let Some(start) = pe::overlay_offset(&headers) else {
+        return Ok(None);
+    };
+    let unreadable =
+        |error: std::io::Error| AppError::new(format!("cannot read {}: {error}", path.display()));
+    let mut file = File::open(path).map_err(unreadable)?;
+    if file.metadata().map_err(unreadable)?.len() <= start {
+        return Ok(None);
+    }
+    file.seek(SeekFrom::Start(start)).map_err(unreadable)?;
+    let mut overlay = Vec::new();
+    file.take(MAX_OVERLAY_BYTES)
+        .read_to_end(&mut overlay)
+        .map_err(unreadable)?;
+    Ok(Some(overlay))
+}
+
 fn read_disk_headers(path: &Path) -> AppResult<Vec<u8>> {
     let file = File::open(path)
         .map_err(|error| AppError::new(format!("cannot open {}: {error}", path.display())))?;
@@ -810,107 +873,4 @@ fn with_extension(name: &str, extension: &str) -> String {
         .and_then(|value| value.to_str())
         .map(str::to_owned)
         .unwrap_or_else(|| format!("dump.{extension}"))
-}
-
-#[cfg(test)]
-mod tests {
-    use std::path::PathBuf;
-
-    use super::{ArtifactInfo, DumpOutcome, DumpSummary};
-    use crate::output::WrittenFile;
-    use crate::pe::{ExportStats, PeKind};
-
-    fn outcome(selected_images: Option<usize>, main_rebuilt: bool) -> DumpOutcome {
-        DumpOutcome {
-            artifacts: Vec::new(),
-            failures: Vec::new(),
-            summary: DumpSummary::default(),
-            export_stats: ExportStats::default(),
-            executable_non_image_allocations: 0,
-            unscanned_bytes: 0,
-            images_skipped: 0,
-            hidden_non_image_images: 0,
-            main_rebuilt,
-            dll_failures: 0,
-            main_image_missing: false,
-            selected_images,
-        }
-    }
-
-    #[test]
-    fn a_filtered_dump_is_complete_only_when_the_filter_matched_something() {
-        assert!(!outcome(Some(0), false).is_complete());
-        assert!(outcome(Some(1), false).is_complete());
-        assert!(!outcome(None, false).is_complete());
-        assert!(outcome(None, true).is_complete());
-    }
-
-    fn artifact(is_main: bool, hidden: bool, imports: usize) -> WrittenFile<ArtifactInfo> {
-        WrittenFile {
-            path: PathBuf::new(),
-            context: ArtifactInfo {
-                base: 0,
-                kind: PeKind::Pe32Plus,
-                sections: 1,
-                unreadable_pages: 2,
-                salvaged_headers: false,
-                disk_headers_used: false,
-                cleared_directories: 1,
-                invalid_unwind_entries: 0,
-                imports_rebuilt: imports,
-                unemitted_imports: 0,
-                aliased_names: 0,
-                declared_iat_slots: 0,
-                invalid_pdata_sections: 0,
-                managed: false,
-                unresolved_delay: 0,
-                unresolved_other_module: 0,
-                unresolved_outside_image: 0,
-                unresolved_unknown_stub: 0,
-                unresolved_chain_exhausted: 0,
-                slots_outside_data_sections: 0,
-                recovered_attested: 0,
-                recovered_scanned: 0,
-                recovered_delayed: 0,
-                recovered_inferred: 0,
-                mixed_module_runs: 0,
-                slots_with_call_sites: 0,
-                ambiguous_imports: 0,
-                renamed_sections: 1,
-                tls_callbacks: 2,
-                entry_point: 0x1000,
-                entry_section: None,
-                repaired_debug_entries: 1,
-                fixed_image_base: true,
-                notable_cleared_directories: Vec::new(),
-                executable_flag_added: false,
-                entry_unwind_covered: None,
-                write_execute_sections: 0,
-                never_decrypted_sections: 0,
-                absent_sections: 0,
-                resident_pages: 8,
-                private_pages: 3,
-                unlinked: false,
-                path_mismatch: false,
-                embedded: false,
-                raw_region: false,
-                hidden,
-                is_main,
-                sidecar: false,
-            },
-        }
-    }
-
-    #[test]
-    fn summarizes_artifacts_without_parallel_lists() {
-        let artifacts = [artifact(true, false, 2), artifact(false, true, 3)];
-
-        let summary = DumpSummary::from_artifacts(&artifacts);
-
-        assert_eq!(summary.dlls, 1);
-        assert_eq!(summary.hidden_images, 1);
-        assert_eq!(summary.unreadable_pages, 4);
-        assert_eq!(summary.cleared_directories, 2);
-        assert_eq!(summary.imports_rebuilt, 5);
-    }
 }

@@ -3,17 +3,31 @@ use std::borrow::Cow;
 use super::sections::recover_section_headers;
 use super::{SECTION_HEADER_SIZE, align_up};
 use crate::pe::image::{read_u16, read_u32, write_u32};
+use crate::pe::packers::{HeaderSource, PackerFindings, Unpacked, unpack};
 use crate::pe::parse::{parse_disk_image, parse_memory_image};
 use crate::pe::{PeKind, PeModel, RegionEvidence, Rva};
 use crate::{AppError, AppResult};
 
 const MAX_DISK_HEADERS: usize = 1024 * 1024;
 
+#[derive(Clone, Copy)]
+pub(super) enum Unpack {
+    Restore,
+    DetectOnly,
+}
+
+pub(super) struct Source<'a> {
+    pub(super) bytes: Cow<'a, [u8]>,
+    pub(super) disk_headers_used: bool,
+    pub(super) packer: Option<PackerFindings>,
+}
+
 pub(super) fn resolve_source_bytes<'a>(
     memory: &'a [u8],
     regions: &[RegionEvidence],
     disk_headers: Option<&[u8]>,
-) -> AppResult<(Cow<'a, [u8]>, bool)> {
+    unpack_mode: Unpack,
+) -> AppResult<Source<'a>> {
     let (initial, disk_headers_used) = match parse_memory_image(memory) {
         Ok(_) => (Cow::Borrowed(memory), false),
         Err(memory_error) => {
@@ -29,15 +43,48 @@ pub(super) fn resolve_source_bytes<'a>(
             (Cow::Owned(repaired), true)
         }
     };
-    let recovered = {
-        let image = parse_memory_image(&initial)?;
-        recover_section_headers(image.bytes(), image.model(), regions)?
+    let headers = match disk_headers_used {
+        true => HeaderSource::Disk,
+        false => HeaderSource::Memory,
     };
-    let resolved = match recovered {
+    let image = parse_memory_image(&initial)?;
+    let packer = match (unpack(&image, headers), unpack_mode) {
+        (
+            Some(Unpacked {
+                image: Some(rebuilt),
+                findings,
+            }),
+            Unpack::Restore,
+        ) => {
+            return Ok(Source {
+                bytes: Cow::Owned(rebuilt),
+                disk_headers_used,
+                packer: Some(findings),
+            });
+        }
+        (detected, Unpack::Restore) => detected.map(|unpacked| unpacked.findings),
+        (detected, Unpack::DetectOnly) => detected.map(detection_only),
+    };
+
+    let bytes = match recover_section_headers(image.bytes(), image.model(), regions)? {
         Some(bytes) => Cow::Owned(bytes),
         None => initial,
     };
-    Ok((resolved, disk_headers_used))
+    Ok(Source {
+        bytes,
+        disk_headers_used,
+        packer,
+    })
+}
+
+fn detection_only(unpacked: Unpacked) -> PackerFindings {
+    let mut findings = unpacked.findings;
+    if unpacked.image.is_some() {
+        findings.report.restored.clear();
+        findings.report.lost.clear();
+        findings.report.unrestored = vec!["image (the unpacked image could not be rebuilt)"];
+    }
+    findings
 }
 
 fn merge_header_evidence(memory: &[u8], disk: &[u8]) -> AppResult<Vec<u8>> {

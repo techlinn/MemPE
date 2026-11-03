@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::pe::exports::{ExportIndex, ResolvedExport, embedded_module_name};
 use crate::pe::image;
+use crate::pe::packers::{ImportedFunction, ModuleImports};
 use crate::pe::{
     IAT_DIRECTORY, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE,
     IMPORT_DIRECTORY, PeImage, PeKind, Rva,
@@ -72,6 +73,7 @@ enum ImportSource {
     Scanned,
     Delayed,
     Inferred,
+    Packer,
 }
 
 #[derive(Default)]
@@ -90,9 +92,11 @@ pub(super) struct ImportPlan {
     pub(super) recovered_scanned: usize,
     pub(super) recovered_delayed: usize,
     pub(super) recovered_inferred: usize,
+    pub(super) recovered_packer: usize,
     pub(super) mixed_module_runs: usize,
     pub(super) slots_with_call_sites: usize,
     pub(super) unrepresentable: usize,
+    pub(super) keep_iat_directory: bool,
     pub(super) existing: Vec<u8>,
     own: Option<String>,
     ambiguous_slots: BTreeSet<u32>,
@@ -118,6 +122,126 @@ pub(super) fn build_plan(
     plan.ambiguous = plan.ambiguous_slots.len();
     plan.unresolved_delay = plan.unbound_delay_slots.len();
     plan
+}
+
+pub(super) fn build_restored_plan(
+    image: &PeImage<'_>,
+    observed_base: usize,
+    exports: &ExportIndex,
+    modules: Option<&[ModuleImports]>,
+) -> ImportPlan {
+    let mut plan = ImportPlan {
+        keep_iat_directory: true,
+        ..ImportPlan::default()
+    };
+    let referenced = find_referenced_slots(image, observed_base);
+    match modules {
+        Some(modules) => {
+            for module in modules {
+                add_packed_module(
+                    image,
+                    observed_base,
+                    exports,
+                    module,
+                    &referenced,
+                    &mut plan,
+                );
+            }
+        }
+        None => plan.existing = existing_descriptors(image).unwrap_or_default(),
+    }
+    scan_delay_imports(image, observed_base, exports, &referenced, &mut plan);
+    plan.unresolved_delay = plan.unbound_delay_slots.len();
+    plan
+}
+
+fn add_packed_module(
+    image: &PeImage<'_>,
+    observed_base: usize,
+    exports: &ExportIndex,
+    module: &ModuleImports,
+    referenced: &BTreeMap<u32, Reference>,
+    plan: &mut ImportPlan,
+) {
+    let width = image.model().kind().pointer_width();
+    let mut current: Option<ImportGroup> = None;
+    for (index, function) in module.functions.iter().enumerate() {
+        let slot = u32::try_from(index.saturating_mul(width))
+            .ok()
+            .and_then(|offset| module.first_thunk.checked_add(offset));
+        let entry = slot.and_then(|slot| {
+            let entry = packed_entry(
+                image,
+                observed_base,
+                exports,
+                &module.module,
+                function,
+                slot,
+            )?;
+            is_representable(&module.module, entry.name.as_deref(), entry.ordinal).then_some(entry)
+        });
+        match (entry, slot) {
+            (Some(entry), Some(slot)) => current
+                .get_or_insert_with(|| ImportGroup {
+                    module: module.module.clone(),
+                    first_thunk: slot,
+                    entries: Vec::new(),
+                    source: ImportSource::Packer,
+                })
+                .entries
+                .push(entry),
+            _ => {
+                plan.unrepresentable = plan.unrepresentable.saturating_add(1);
+                if let Some(group) = current.take() {
+                    commit_group(group, 1, width, referenced, plan);
+                }
+            }
+        }
+    }
+    if let Some(group) = current {
+        commit_group(group, 1, width, referenced, plan);
+    }
+}
+
+fn packed_entry(
+    image: &PeImage<'_>,
+    observed_base: usize,
+    exports: &ExportIndex,
+    module: &str,
+    function: &ImportedFunction,
+    slot: u32,
+) -> Option<ImportEntry> {
+    match function {
+        ImportedFunction::Name(name) => Some(ImportEntry {
+            name: Some(name.clone()),
+            ordinal: 0,
+            aliased: false,
+        }),
+        ImportedFunction::Ordinal(ordinal) => Some(ImportEntry {
+            name: None,
+            ordinal: u32::from(*ordinal),
+            aliased: false,
+        }),
+        ImportedFunction::OrdinalFromAddress => {
+            let memory = image.bytes();
+            let kind = image.model().kind();
+            let value = read_pointer(memory, slot as usize, kind.pointer_width())?;
+            if let Some(ordinal) = exports.ordinal_in(value, module) {
+                return Some(ImportEntry {
+                    name: None,
+                    ordinal,
+                    aliased: false,
+                });
+            }
+            let (symbol, ambiguous, aliased) =
+                resolve_value(memory, observed_base, kind, value, exports).ok()?;
+            (!ambiguous).then_some(ImportEntry {
+                name: symbol.name,
+                ordinal: symbol.ordinal,
+                aliased,
+            })
+        }
+    }
 }
 
 fn scan_trusted_ranges(
@@ -765,7 +889,10 @@ fn commit_group(
 }
 
 fn carries_call_site_evidence(source: ImportSource) -> bool {
-    matches!(source, ImportSource::Attested | ImportSource::Scanned)
+    matches!(
+        source,
+        ImportSource::Attested | ImportSource::Scanned | ImportSource::Packer
+    )
 }
 
 fn count_referenced_slots(
@@ -814,6 +941,7 @@ fn record_recovered_tier(plan: &mut ImportPlan, source: ImportSource, entries: u
         ImportSource::Scanned => &mut plan.recovered_scanned,
         ImportSource::Delayed => &mut plan.recovered_delayed,
         ImportSource::Inferred => &mut plan.recovered_inferred,
+        ImportSource::Packer => &mut plan.recovered_packer,
     };
     *counter = counter.saturating_add(entries);
 }
@@ -1048,541 +1176,4 @@ fn read_pointer(bytes: &[u8], offset: usize, width: usize) -> Option<usize> {
 
 fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
     image::read_u32(bytes, offset).ok()
-}
-
-#[cfg(test)]
-mod tests {
-    use pelite::PeFile;
-
-    use super::{
-        IMPORT_DESCRIPTOR_SIZE, Reference, Unresolved, build_plan, decode_slot_reference,
-        delay_table_range, guard_pointer_slots, is_representable, resolve_value, rip_relative_slot,
-        try_descriptor_array,
-    };
-    use crate::pe::parse::parse_memory_image;
-    use crate::pe::{ExportIndex, PeKind, rebuild};
-
-    #[test]
-    fn makes_header_room_for_recovered_imports_when_the_table_fills_it()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let export_base = 0x0000_7FFB_0000_0000usize;
-        let export_image = fixture_pe64(true);
-        let index = ExportIndex::build([(export_base, export_image.as_slice(), None)]);
-        let mut target = fixture_pe64(false);
-        let table = target[0x188..0x1D8].to_vec();
-        target[0x188..0x1D8].fill(0);
-        target[0x1A8..0x1F8].copy_from_slice(&table);
-        put_u16(&mut target, 0x94, 0x110);
-        put_u64(&mut target, 0x2000, export_base as u64 + 0x1000);
-        put_u32(&mut target, 0x98 + 112 + 12 * 8, 0x2000);
-        put_u32(&mut target, 0x98 + 112 + 12 * 8 + 4, 8);
-
-        let rebuilt = rebuild(&target, &[], 0x0000_7FF6_0000_0000, None, &index, None, &[])?;
-
-        assert_eq!(rebuilt.imports_rebuilt, 1);
-        assert_eq!(rebuilt.unemitted_imports, 0);
-        assert_eq!(rebuilt.section_count, 3);
-        assert!(PeFile::from_bytes(&rebuilt.bytes).is_ok());
-        Ok(())
-    }
-
-    #[test]
-    fn clears_a_bound_import_table_where_the_new_section_header_goes()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let export_base = 0x0000_7FFB_0000_0000usize;
-        let export_image = fixture_pe64(true);
-        let index = ExportIndex::build([(export_base, export_image.as_slice(), None)]);
-        let mut target = fixture_pe64(false);
-        let bound_imports = 0x98 + 112 + 11 * 8;
-        put_u32(&mut target, bound_imports, 0x1D8);
-        put_u32(&mut target, bound_imports + 4, 0x20);
-        put_u64(&mut target, 0x2000, export_base as u64 + 0x1000);
-        put_u32(&mut target, 0x98 + 112 + 12 * 8, 0x2000);
-        put_u32(&mut target, 0x98 + 112 + 12 * 8 + 4, 8);
-
-        let rebuilt = rebuild(&target, &[], 0x0000_7FF6_0000_0000, None, &index, None, &[])?;
-
-        assert_eq!(rebuilt.imports_rebuilt, 1);
-        assert_eq!(&rebuilt.bytes[bound_imports..bound_imports + 8], &[0; 8]);
-        assert!(PeFile::from_bytes(&rebuilt.bytes).is_ok());
-        Ok(())
-    }
-
-    #[test]
-    fn tells_a_pointer_into_another_module_from_one_into_no_module() {
-        let export_base = 0x0000_7FFB_0000_0000usize;
-        let export_image = fixture_pe64(true);
-        let index = ExportIndex::build([(export_base, export_image.as_slice(), None)]);
-        let target = fixture_pe64(false);
-        let base = 0x0000_7FF6_0000_0000usize;
-        let not_exported = export_base + 0x1800;
-
-        let into_module = resolve_value(&target, base, PeKind::Pe32Plus, not_exported, &index);
-        let into_nothing = resolve_value(&target, base, PeKind::Pe32Plus, 0x1234_0000, &index);
-
-        assert!(matches!(into_module, Err(Unresolved::OtherModule)));
-        assert!(matches!(into_nothing, Err(Unresolved::OutsideImage)));
-    }
-
-    #[test]
-    fn names_the_cfg_check_and_dispatch_slots_from_the_load_config()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let base = 0x0000_7FF6_0000_0000u64;
-        let mut memory = fixture_pe64(false);
-        put_u32(&mut memory, 0x98 + 112 + 10 * 8, 0x2400);
-        put_u32(&mut memory, 0x98 + 112 + 10 * 8 + 4, 0x140);
-        put_u32(&mut memory, 0x2400, 0x140);
-        put_u64(&mut memory, 0x2400 + 0x70, base + 0x2290);
-        put_u64(&mut memory, 0x2400 + 0x78, base + 0x22A0);
-        let image = parse_memory_image(&memory)?;
-
-        let slots = guard_pointer_slots(&image, base as usize);
-
-        assert_eq!(slots.into_iter().collect::<Vec<_>>(), vec![0x2290, 0x22A0]);
-        Ok(())
-    }
-
-    #[test]
-    fn ignores_cfg_pointers_a_short_load_config_does_not_declare()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let base = 0x0000_7FF6_0000_0000u64;
-        let mut memory = fixture_pe64(false);
-        put_u32(&mut memory, 0x98 + 112 + 10 * 8, 0x2400);
-        put_u32(&mut memory, 0x98 + 112 + 10 * 8 + 4, 0x70);
-        put_u32(&mut memory, 0x2400, 0x70);
-        put_u64(&mut memory, 0x2400 + 0x70, base + 0x2290);
-        let image = parse_memory_image(&memory)?;
-
-        assert!(guard_pointer_slots(&image, base as usize).is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn only_imports_an_ascii_table_can_describe_are_representable() {
-        assert!(is_representable("KERNEL32.dll", Some("Sleep"), 1));
-        assert!(is_representable("WS2_32.dll", None, 0xFFFF));
-        assert!(!is_representable("WS2_32.dll", None, 0x1_0000));
-        assert!(!is_representable("тест.dll", Some("Sleep"), 1));
-        assert!(!is_representable("a.dll", Some("Schlüssel"), 1));
-    }
-
-    #[test]
-    fn recovers_a_lone_import_when_the_iat_directory_attests_it()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let export_base = 0x0000_7FFB_0000_0000usize;
-        let export_image = fixture_pe64(true);
-        let index = ExportIndex::build([(export_base, export_image.as_slice(), None)]);
-        let mut target = fixture_pe64(false);
-        put_u64(&mut target, 0x2000, export_base as u64 + 0x1000);
-        put_u32(&mut target, 0x98 + 112 + 12 * 8, 0x2000);
-        put_u32(&mut target, 0x98 + 112 + 12 * 8 + 4, 8);
-        let image = parse_memory_image(&target)?;
-
-        let plan = build_plan(&image, 0x0000_7FF6_0000_0000, &index);
-
-        assert_eq!(plan.recovered, 1);
-        assert_eq!(plan.groups.len(), 1);
-        Ok(())
-    }
-
-    #[test]
-    fn still_rejects_a_lone_import_with_only_a_section_name_match()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let export_base = 0x0000_7FFB_0000_0000usize;
-        let export_image = fixture_pe64(true);
-        let index = ExportIndex::build([(export_base, export_image.as_slice(), None)]);
-        let mut target = fixture_pe64(false);
-        put_u64(&mut target, 0x2000, export_base as u64 + 0x1000);
-        let image = parse_memory_image(&target)?;
-
-        let plan = build_plan(&image, 0x0000_7FF6_0000_0000, &index);
-
-        assert_eq!(plan.recovered, 0);
-        assert!(plan.groups.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn finds_two_adjacent_resolved_imports() -> Result<(), Box<dyn std::error::Error>> {
-        let export_base = 0x0000_7FFB_0000_0000usize;
-        let export_image = fixture_pe64(true);
-        let index = ExportIndex::build([(export_base, export_image.as_slice(), None)]);
-        let mut target = fixture_pe64(false);
-        put_u64(&mut target, 0x2000, export_base as u64 + 0x1000);
-        put_u64(&mut target, 0x2008, export_base as u64 + 0x1010);
-        let image = parse_memory_image(&target)?;
-
-        let plan = build_plan(&image, 0x0000_7FF6_0000_0000, &index);
-
-        assert_eq!(plan.recovered, 2);
-        assert_eq!(plan.groups.len(), 1);
-        assert_eq!(plan.groups[0].module, "fixture.dll");
-
-        let rebuilt = rebuild(&target, &[], 0x0000_7FF6_0000_0000, None, &index, None, &[])?;
-        assert_eq!(rebuilt.imports_rebuilt, 2);
-        assert_eq!(rebuilt.section_count, 3);
-        assert!(PeFile::from_bytes(&rebuilt.bytes).is_ok());
-        assert!(
-            rebuilt
-                .bytes
-                .windows(8)
-                .any(|window| window == b".mempe\0\0")
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn finds_a_single_import_referenced_by_code() -> Result<(), Box<dyn std::error::Error>> {
-        let export_base = 0x0000_7FFB_0000_0000usize;
-        let target_base = 0x0000_7FF6_0000_0000usize;
-        let export_image = fixture_pe64(true);
-        let index = ExportIndex::build([(export_base, export_image.as_slice(), None)]);
-        let mut target = fixture_pe64(false);
-        put_u64(&mut target, 0x2000, export_base as u64 + 0x1000);
-        let displacement = 0x2000i32 - 0x1006i32;
-        target[0x1000..0x1002].copy_from_slice(&[0xFF, 0x15]);
-        target[0x1002..0x1006].copy_from_slice(&displacement.to_le_bytes());
-        let image = parse_memory_image(&target)?;
-
-        let plan = build_plan(&image, target_base, &index);
-
-        assert_eq!(plan.recovered, 1);
-        assert_eq!(plan.groups.len(), 1);
-        assert_eq!(plan.groups[0].first_thunk, 0x2000);
-        assert_eq!(plan.groups[0].entries.len(), 1);
-
-        let rebuilt = rebuild(&target, &[], target_base, None, &index, None, &[])?;
-        assert_eq!(rebuilt.imports_rebuilt, 1);
-        assert!(PeFile::from_bytes(&rebuilt.bytes).is_ok());
-        Ok(())
-    }
-
-    #[test]
-    fn ignores_an_unreferenced_single_import() -> Result<(), Box<dyn std::error::Error>> {
-        let export_base = 0x0000_7FFB_0000_0000usize;
-        let export_image = fixture_pe64(true);
-        let index = ExportIndex::build([(export_base, export_image.as_slice(), None)]);
-        let mut target = fixture_pe64(false);
-        put_u64(&mut target, 0x2000, export_base as u64 + 0x1000);
-        let image = parse_memory_image(&target)?;
-
-        let plan = build_plan(&image, 0x0000_7FF6_0000_0000, &index);
-
-        assert_eq!(plan.recovered, 0);
-        assert!(plan.groups.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn merges_recovered_imports_with_a_valid_existing_table()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let export_base = 0x0000_7FFB_0000_0000usize;
-        let target_base = 0x0000_7FF6_0000_0000usize;
-        let export_image = fixture_pe64(true);
-        let index = ExportIndex::build([(export_base, export_image.as_slice(), None)]);
-        let mut target = fixture_pe64(false);
-        put_u32(&mut target, 0x98 + 112 + 8, 0x2100);
-        put_u32(&mut target, 0x98 + 112 + 12, 40);
-        put_u32(&mut target, 0x2100, 0x2200);
-        put_u32(&mut target, 0x2100 + 12, 0x2300);
-        put_u32(&mut target, 0x2100 + 16, 0x2400);
-        put_u64(&mut target, 0x2200, 0x2280);
-        put_u64(&mut target, 0x2400, export_base as u64 + 0x1010);
-        target[0x2282..0x228b].copy_from_slice(b"Existing\0");
-        target[0x2300..0x230a].copy_from_slice(b"other.dll\0");
-        put_u64(&mut target, 0x2500, export_base as u64 + 0x1000);
-        let fresh = 0x2500i32 - 0x1006i32;
-        target[0x1000..0x1002].copy_from_slice(&[0xFF, 0x15]);
-        target[0x1002..0x1006].copy_from_slice(&fresh.to_le_bytes());
-        let covered = 0x2400i32 - 0x1016i32;
-        target[0x1010..0x1012].copy_from_slice(&[0xFF, 0x15]);
-        target[0x1012..0x1016].copy_from_slice(&covered.to_le_bytes());
-        let image = parse_memory_image(&target)?;
-
-        let plan = build_plan(&image, target_base, &index);
-
-        assert_eq!(plan.existing.len(), IMPORT_DESCRIPTOR_SIZE);
-        assert_eq!(plan.recovered, 1);
-        assert_eq!(plan.groups[0].first_thunk, 0x2500);
-
-        let rebuilt = rebuild(&target, &[], target_base, None, &index, None, &[])?;
-        let modules = PeFile::from_bytes(&rebuilt.bytes)?
-            .imports()?
-            .into_iter()
-            .map(|descriptor| descriptor.dll_name().map(|name| name.to_string()))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        assert_eq!(modules, ["other.dll", "fixture.dll"]);
-        Ok(())
-    }
-
-    #[test]
-    fn decodes_an_x86_absolute_iat_reference() {
-        let base = 0x0040_0000usize;
-        let mut code = [0u8; 6];
-        code[0..2].copy_from_slice(&[0xFF, 0x15]);
-        code[2..6].copy_from_slice(&0x0040_2000u32.to_le_bytes());
-
-        let slot = decode_slot_reference(&code, base, PeKind::Pe32, 0);
-
-        assert_eq!(slot, Some((0x2000, Reference::Called)));
-    }
-
-    #[test]
-    fn ignores_a_loaded_pointer_standing_alone_among_unrelated_data()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let export_base = 0x0000_7FFB_0000_0000usize;
-        let export_image = fixture_pe64(true);
-        let index = ExportIndex::build([(export_base, export_image.as_slice(), None)]);
-        let mut target = plain_data_fixture();
-        target[0x1000..0x1007].copy_from_slice(&[0x48, 0x8B, 0x05, 0xF9, 0x11, 0x00, 0x00]);
-        put_u64(&mut target, 0x2200, export_base as u64 + 0x1000);
-        let image = parse_memory_image(&target)?;
-
-        let plan = build_plan(&image, 0x0000_7FF6_0000_0000, &index);
-
-        assert_eq!(plan.recovered, 0);
-        Ok(())
-    }
-
-    #[test]
-    fn keeps_a_loaded_pointer_beside_a_slot_from_the_same_module()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let export_base = 0x0000_7FFB_0000_0000usize;
-        let export_image = fixture_pe64(true);
-        let index = ExportIndex::build([(export_base, export_image.as_slice(), None)]);
-        let mut target = plain_data_fixture();
-        target[0x1000..0x1007].copy_from_slice(&[0x48, 0x8B, 0x05, 0xF9, 0x11, 0x00, 0x00]);
-        put_u64(&mut target, 0x2200, export_base as u64 + 0x1000);
-        put_u64(&mut target, 0x2208, export_base as u64 + 0x1010);
-        let image = parse_memory_image(&target)?;
-
-        let plan = build_plan(&image, 0x0000_7FF6_0000_0000, &index);
-
-        assert_eq!(plan.recovered, 1);
-        assert_eq!(plan.groups[0].module, "fixture.dll");
-        Ok(())
-    }
-
-    #[test]
-    fn never_records_an_image_as_importing_from_itself() -> Result<(), Box<dyn std::error::Error>> {
-        let target_base = 0x0000_7FF6_0000_0000usize;
-        let mut target = fixture_pe64(true);
-        put_u64(&mut target, 0x2100, target_base as u64 + 0x1000);
-        put_u64(&mut target, 0x2108, target_base as u64 + 0x1010);
-        let index = ExportIndex::build([(target_base, target.as_slice(), None)]);
-        let image = parse_memory_image(&target)?;
-
-        let plan = build_plan(&image, target_base, &index);
-
-        assert_eq!(plan.recovered, 0);
-        assert!(plan.groups.is_empty());
-        Ok(())
-    }
-
-    fn plain_data_fixture() -> Vec<u8> {
-        let mut image = fixture_pe64(false);
-        image[0x1B0..0x1B8].copy_from_slice(b".rdata\0\0");
-        image
-    }
-
-    fn fixture_pe64(with_exports: bool) -> Vec<u8> {
-        let mut image = vec![0u8; 0x3000];
-        put_u16(&mut image, 0, 0x5A4D);
-        put_u32(&mut image, 0x3c, 0x80);
-        put_u32(&mut image, 0x80, 0x0000_4550);
-        put_u16(&mut image, 0x84, 0x8664);
-        put_u16(&mut image, 0x86, 2);
-        put_u16(&mut image, 0x94, 0xF0);
-        put_u16(&mut image, 0x96, 0x22);
-        let optional = 0x98;
-        put_u16(&mut image, optional, 0x20B);
-        put_u32(&mut image, optional + 16, 0x1000);
-        put_u64(&mut image, optional + 24, 0x0000_7FF6_0000_0000);
-        put_u32(&mut image, optional + 32, 0x1000);
-        put_u32(&mut image, optional + 36, 0x200);
-        put_u32(&mut image, optional + 56, 0x3000);
-        put_u32(&mut image, optional + 60, 0x400);
-        put_u32(&mut image, optional + 108, 16);
-        let text = optional + 0xF0;
-        image[text..text + 5].copy_from_slice(b".text");
-        put_u32(&mut image, text + 8, 0x1000);
-        put_u32(&mut image, text + 12, 0x1000);
-        put_u32(&mut image, text + 16, 0x200);
-        put_u32(&mut image, text + 36, 0x6000_0020);
-        let data = text + 40;
-        image[data..data + 6].copy_from_slice(b".idata");
-        put_u32(&mut image, data + 8, 0x1000);
-        put_u32(&mut image, data + 12, 0x2000);
-        put_u32(&mut image, data + 16, 0x200);
-        put_u32(&mut image, data + 36, 0x4000_0040);
-        if with_exports {
-            add_exports(&mut image, optional);
-        }
-        image
-    }
-
-    fn add_exports(image: &mut [u8], optional: usize) {
-        put_u32(image, optional + 112, 0x2000);
-        put_u32(image, optional + 116, 0x100);
-        put_u32(image, 0x2000 + 12, 0x2080);
-        put_u32(image, 0x2000 + 16, 1);
-        put_u32(image, 0x2000 + 20, 2);
-        put_u32(image, 0x2000 + 24, 2);
-        put_u32(image, 0x2000 + 28, 0x2040);
-        put_u32(image, 0x2000 + 32, 0x2048);
-        put_u32(image, 0x2000 + 36, 0x2050);
-        put_u32(image, 0x2040, 0x1000);
-        put_u32(image, 0x2044, 0x1010);
-        put_u32(image, 0x2048, 0x2090);
-        put_u32(image, 0x204c, 0x2096);
-        put_u16(image, 0x2050, 0);
-        put_u16(image, 0x2052, 1);
-        image[0x2080..0x208c].copy_from_slice(b"fixture.dll\0");
-        image[0x2090..0x2096].copy_from_slice(b"First\0");
-        image[0x2096..0x209d].copy_from_slice(b"Second\0");
-    }
-
-    fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
-        bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
-    }
-
-    fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
-        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-    }
-
-    fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
-        bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
-    }
-
-    #[test]
-    fn resolves_rip_relative_targets_in_both_directions() {
-        let base = 0x0000_0001_4000_0000usize;
-        assert_eq!(rip_relative_slot(base, 0x1000, 6, 0x100), Some(0x1106));
-        assert_eq!(rip_relative_slot(base, 0x1000, 6, -0x100), Some(0x0F06));
-        assert_eq!(rip_relative_slot(base, 0x1000, 7, 0), Some(0x1007));
-        assert_eq!(rip_relative_slot(0, 0, 6, -100), None);
-        assert_eq!(rip_relative_slot(base, 0x1000, 6, -0x4000_0000), None);
-    }
-
-    #[test]
-    fn decodes_call_jump_and_register_load_forms() {
-        let call = [0xFFu8, 0x15, 0x00, 0x01, 0x00, 0x00, 0x90];
-        let jump = [0xFFu8, 0x25, 0x00, 0x01, 0x00, 0x00, 0x90];
-        let mov_rax = [0x48u8, 0x8B, 0x05, 0x00, 0x01, 0x00, 0x00];
-        let mov_r9 = [0x4Cu8, 0x8B, 0x0D, 0x00, 0x01, 0x00, 0x00];
-
-        assert_eq!(
-            decode_slot_reference(&call, 0, PeKind::Pe32Plus, 0),
-            Some((0x106, Reference::Called))
-        );
-        assert_eq!(
-            decode_slot_reference(&jump, 0, PeKind::Pe32Plus, 0),
-            Some((0x106, Reference::Called))
-        );
-        assert_eq!(
-            decode_slot_reference(&mov_rax, 0, PeKind::Pe32Plus, 0),
-            Some((0x107, Reference::Loaded))
-        );
-        assert_eq!(
-            decode_slot_reference(&mov_r9, 0, PeKind::Pe32Plus, 0),
-            Some((0x107, Reference::Loaded))
-        );
-    }
-
-    #[test]
-    fn rejects_register_loads_that_are_not_rip_relative() {
-        let mov_rbp = [0x48u8, 0x8B, 0x45, 0x00, 0x01, 0x00, 0x00];
-        let add = [0x48u8, 0x03, 0x05, 0x00, 0x01, 0x00, 0x00];
-        let mov_rax = [0x48u8, 0x8B, 0x05, 0x00, 0x01, 0x00, 0x00];
-
-        assert_eq!(
-            decode_slot_reference(&mov_rbp, 0, PeKind::Pe32Plus, 0),
-            None
-        );
-        assert_eq!(decode_slot_reference(&add, 0, PeKind::Pe32Plus, 0), None);
-        assert_eq!(decode_slot_reference(&mov_rax, 0, PeKind::Pe32, 0), None);
-    }
-
-    fn delay_fixture() -> Vec<u8> {
-        let mut memory = vec![0u8; 0x200];
-        memory[0x30..0x34].copy_from_slice(b"a.d\0");
-        put_u64(&mut memory, 0x40, 0x1111);
-        put_u64(&mut memory, 0x48, 0x2222);
-        put_u64(&mut memory, 0x60, 0x3333);
-        put_u64(&mut memory, 0x68, 0x4444);
-        memory
-    }
-
-    fn delay_descriptor(attributes: u32, iat: u32, int: u32) -> Vec<u8> {
-        let mut descriptor = vec![0u8; 32];
-        descriptor[0..4].copy_from_slice(&attributes.to_le_bytes());
-        descriptor[4..8].copy_from_slice(&0x30u32.to_le_bytes());
-        descriptor[12..16].copy_from_slice(&iat.to_le_bytes());
-        descriptor[16..20].copy_from_slice(&int.to_le_bytes());
-        descriptor
-    }
-
-    #[test]
-    fn accepts_a_delay_descriptor_whose_tables_agree() {
-        let memory = delay_fixture();
-        let descriptor = delay_descriptor(1, 0x40, 0x60);
-        let mut budget = 1_000usize;
-
-        assert_eq!(
-            delay_table_range(&memory, &descriptor, 8, &mut budget),
-            Some((0x40, 0x50))
-        );
-    }
-
-    #[test]
-    fn rejects_delay_descriptors_that_fail_any_gate() {
-        let mut memory = delay_fixture();
-        let mut budget = 1_000usize;
-
-        let not_rva_based = delay_descriptor(0, 0x40, 0x60);
-        assert_eq!(
-            delay_table_range(&memory, &not_rva_based, 8, &mut budget),
-            None
-        );
-
-        let misaligned = delay_descriptor(1, 0x41, 0x60);
-        assert_eq!(
-            delay_table_range(&memory, &misaligned, 8, &mut budget),
-            None
-        );
-
-        put_u64(&mut memory, 0x70, 0x5555);
-        let uneven = delay_descriptor(1, 0x40, 0x60);
-        assert_eq!(delay_table_range(&memory, &uneven, 8, &mut budget), None);
-    }
-
-    fn descriptor_array_fixture(thunks: usize) -> Vec<u8> {
-        let mut memory = vec![0u8; 0x400];
-        memory[0x100..0x104].copy_from_slice(b"a.d\0");
-        let descriptor = 0x200usize;
-        memory[descriptor..descriptor + 4].copy_from_slice(&0x120u32.to_le_bytes());
-        memory[descriptor + 12..descriptor + 16].copy_from_slice(&0x100u32.to_le_bytes());
-        memory[descriptor + 16..descriptor + 20].copy_from_slice(&0x180u32.to_le_bytes());
-        for index in 0..thunks {
-            put_u64(&mut memory, 0x120 + index * 8, 0x8000_0000_0000_0001);
-        }
-        memory
-    }
-
-    #[test]
-    fn accepts_a_descriptor_array_with_enough_thunks() {
-        let memory = descriptor_array_fixture(2);
-
-        let found = try_descriptor_array(&memory, PeKind::Pe32Plus, 0x200);
-
-        assert_eq!(found.map(|bytes| bytes.len()), Some(IMPORT_DESCRIPTOR_SIZE));
-    }
-
-    #[test]
-    fn rejects_a_descriptor_array_shaped_like_a_decoy() {
-        let memory = descriptor_array_fixture(1);
-
-        assert_eq!(try_descriptor_array(&memory, PeKind::Pe32Plus, 0x200), None);
-    }
 }

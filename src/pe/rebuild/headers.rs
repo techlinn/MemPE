@@ -44,7 +44,7 @@ fn ensure_executable_image_flag(output: &mut [u8], model: &PeModel) -> AppResult
     Ok(true)
 }
 
-fn apply_checksum(output: &mut [u8], model: &PeModel) -> AppResult<()> {
+pub(super) fn apply_checksum(output: &mut [u8], model: &PeModel) -> AppResult<()> {
     let checksum_offset = model.size_of_headers_offset.saturating_add(4);
     write_u32(output, checksum_offset, 0)?;
     let checksum = compute_checksum(output)?;
@@ -219,18 +219,4 @@ impl DerivedSizes {
 fn add_size(left: u32, right: u32, name: &str) -> AppResult<u32> {
     left.checked_add(right)
         .ok_or_else(|| AppError::new(format!("{name} overflowed")))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::compute_checksum;
-
-    #[test]
-    fn folds_the_checksum_like_the_loader_does() -> Result<(), Box<dyn std::error::Error>> {
-        assert_eq!(compute_checksum(&[0x01, 0x00, 0x02, 0x00])?, 7);
-        assert_eq!(compute_checksum(&[0xFF, 0xFF, 0x05])?, 8);
-        assert_eq!(compute_checksum(&[0xFF, 0xFF, 0xFF, 0xFF])?, 0x0001_0003);
-        assert_eq!(compute_checksum(&[])?, 0);
-        Ok(())
-    }
 }

@@ -2,12 +2,11 @@ use super::directories::{clear_directory, write_directory};
 use super::{MAX_OUTPUT_SIZE, SECTION_HEADER_SIZE, align_up, align_up_u64};
 use crate::pe::image::{read_u16, read_u32, write_u16, write_u32, write_u64};
 use crate::pe::imports::{ImportGroup, ImportPlan};
-use crate::pe::{IAT_DIRECTORY, IMPORT_DIRECTORY, PeKind, PeModel};
+use crate::pe::{BOUND_IMPORT_DIRECTORY, IAT_DIRECTORY, IMPORT_DIRECTORY, PeKind, PeModel};
 use crate::{AppError, AppResult};
 
 const IMPORT_DESCRIPTOR_SIZE: usize = 20;
 const MEMPE_IMPORT_CHARACTERISTICS: u32 = 0xC000_0040;
-const BOUND_IMPORT_DIRECTORY: usize = 11;
 
 pub(super) enum ImportSection {
     Written { cleared: Vec<usize> },
@@ -167,7 +166,7 @@ fn commit_import_section(
         virtual_address,
         descriptor_size,
     )?;
-    if plan.existing.is_empty() {
+    if plan.existing.is_empty() && !plan.keep_iat_directory {
         return Ok(clear_directory(output, model, IAT_DIRECTORY)? > 0);
     }
     Ok(false)

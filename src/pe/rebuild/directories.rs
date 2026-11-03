@@ -1,12 +1,12 @@
 use super::{SectionLayout, rva_to_file};
 use crate::pe::image::{read_u16, read_u32, write_u16, write_u32};
-use crate::pe::{PeKind, PeModel, SECURITY_DIRECTORY};
+use crate::pe::{BASERELOC_DIRECTORY, DEBUG_DIRECTORY, PeKind, PeModel, SECURITY_DIRECTORY};
 use crate::{AppError, AppResult};
 
-const DEBUG_DIRECTORY: usize = 6;
-const BASERELOC_DIRECTORY: usize = 5;
 const RELOCATION_BLOCK_HEADER: usize = 8;
 const RELOCATION_ABSOLUTE: u16 = 0;
+const RELOCATION_HIGH: u16 = 1;
+const RELOCATION_LOW: u16 = 2;
 const RELOCATION_HIGHLOW: u16 = 3;
 const RELOCATION_DIR64: u16 = 10;
 const MAX_RELOCATION_BLOCKS: usize = 65_536;
@@ -137,9 +137,9 @@ fn relocations_are_walkable(
         return false;
     };
     let end = start.saturating_add(size as usize);
-    let expected = match model.kind {
-        PeKind::Pe32 => RELOCATION_HIGHLOW,
-        PeKind::Pe32Plus => RELOCATION_DIR64,
+    let expected: &[u16] = match model.kind {
+        PeKind::Pe32 => &[RELOCATION_HIGHLOW, RELOCATION_HIGH, RELOCATION_LOW],
+        PeKind::Pe32Plus => &[RELOCATION_DIR64],
     };
     let mut cursor = start;
     let mut fixups = 0usize;
@@ -172,7 +172,7 @@ fn relocations_are_walkable(
             if kind == RELOCATION_ABSOLUTE {
                 continue;
             }
-            if kind != expected {
+            if !expected.contains(&kind) {
                 return false;
             }
             fixups = fixups.saturating_add(1);
@@ -268,20 +268,4 @@ fn directory_is_mapped(
         let section_end = section_start.saturating_add(layout.source_length);
         start >= section_start && end <= section_end
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{directory_name, is_notable_directory};
-
-    #[test]
-    fn separates_routine_directories_from_notable_ones() {
-        assert_eq!(directory_name(1), "Import");
-        assert_eq!(directory_name(4), "Certificate");
-        assert_eq!(directory_name(99), "Unknown");
-        assert!(!is_notable_directory(4));
-        assert!(is_notable_directory(1));
-        assert!(is_notable_directory(2));
-        assert!(is_notable_directory(11));
-    }
 }

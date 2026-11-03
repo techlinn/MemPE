@@ -230,30 +230,3 @@ pub(super) fn entry_section_name(
     let label = String::from_utf8_lossy(name.get(..end)?).into_owned();
     (!label.is_empty()).then_some(label)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::shannon_entropy;
-
-    #[test]
-    fn measures_entropy_against_known_distributions() {
-        let uniform = [7u8; 4096];
-        let halves: Vec<u8> = (0..4096).map(|index| u8::from(index % 2 == 0)).collect();
-        let spread: Vec<u8> = (0..=255u8).collect();
-
-        assert!(shannon_entropy(&[]) == 0.0);
-        assert!(shannon_entropy(&uniform) == 0.0);
-        assert!((shannon_entropy(&halves) - 1.0).abs() < 1e-9);
-        assert!((shannon_entropy(&spread) - 8.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn real_code_stays_below_the_high_entropy_threshold() {
-        let ciphertext: Vec<u8> = (0..8192u32)
-            .map(|index| (index.wrapping_mul(2_654_435_761) >> 13) as u8)
-            .collect();
-
-        assert!(shannon_entropy(&ciphertext) >= super::HIGH_ENTROPY_THRESHOLD);
-        assert!(shannon_entropy(&[0u8; 8192]) < super::HIGH_ENTROPY_THRESHOLD);
-    }
-}

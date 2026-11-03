@@ -235,6 +235,9 @@ fn render_main_artifact(console: &Console, main: &output::WrittenFile<dump::Arti
             unwind_note(main.context.entry_unwind_covered)
         ),
     );
+    if let Some(packer) = &main.context.packer {
+        render_packer(console, packer);
+    }
     if main.context.managed {
         console.field(
             "Managed",
@@ -265,6 +268,33 @@ fn render_main_artifact(console: &Console, main: &output::WrittenFile<dump::Arti
     );
 }
 
+fn render_packer(console: &Console, packer: &pe::PackerReport) {
+    console.field(
+        "Packer",
+        format_args!("{packer}, {}", restored_parts(packer)),
+    );
+    render_packer_gaps(console, packer);
+}
+
+fn restored_parts(packer: &pe::PackerReport) -> String {
+    match packer.restored.is_empty() {
+        true => "nothing restored".to_owned(),
+        false => format!("restored {}", packer.restored.join(", ")),
+    }
+}
+
+fn render_packer_gaps(console: &Console, packer: &pe::PackerReport) {
+    if !packer.unrestored.is_empty() {
+        console.field(
+            "Unrestored",
+            format_args!("{}", packer.unrestored.join(", ")),
+        );
+    }
+    if !packer.lost.is_empty() {
+        console.field("Lost", format_args!("{}", packer.lost.join(", ")));
+    }
+}
+
 fn unwind_note(covered: Option<bool>) -> &'static str {
     match covered {
         Some(true) => ", unwind-covered",
@@ -275,6 +305,7 @@ fn unwind_note(covered: Option<bool>) -> &'static str {
 
 fn render_analysis(console: &Console, outcome: &DumpOutcome) {
     console.section("ANALYSIS");
+    render_packed_images(console, outcome);
     console.field(
         "Exports",
         format_args!(
@@ -317,6 +348,28 @@ fn render_analysis(console: &Console, outcome: &DumpOutcome) {
             outcome.executable_non_image_allocations
         ),
     );
+}
+
+fn render_packed_images(console: &Console, outcome: &DumpOutcome) {
+    for artifact in outcome
+        .artifacts
+        .iter()
+        .filter(|artifact| !artifact.context.is_main)
+    {
+        let Some(packer) = &artifact.context.packer else {
+            continue;
+        };
+        let name = artifact
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_default();
+        console.field(
+            "Packer",
+            format_args!("{name}: {packer}, {}", restored_parts(packer)),
+        );
+        render_packer_gaps(console, packer);
+    }
 }
 
 fn render_warnings(console: &Console, outcome: &DumpOutcome) {
@@ -374,8 +427,12 @@ fn render_repair_warnings(console: &Console, outcome: &DumpOutcome) {
     console.warning(format_args!("Notable directories cleared: {names}"));
 }
 
-fn repair_warning_counts(summary: &dump::DumpSummary) -> [(usize, &'static str); 16] {
+fn repair_warning_counts(summary: &dump::DumpSummary) -> [(usize, &'static str); 17] {
     [
+        (
+            summary.partly_unpacked,
+            "Packed images mempe could not fully restore",
+        ),
         (
             summary.never_decrypted_sections,
             "High-entropy sections never written after loading, so mempe's copy may still be encrypted",
@@ -442,14 +499,19 @@ fn render_recovery_confidence(console: &Console, summary: &dump::DumpSummary) {
         .recovered_attested
         .saturating_add(summary.recovered_scanned)
         .saturating_add(summary.recovered_delayed)
-        .saturating_add(summary.recovered_inferred);
+        .saturating_add(summary.recovered_inferred)
+        .saturating_add(summary.recovered_packer);
     if tiered == 0 {
         return;
     }
+    let from_packer = match summary.recovered_packer {
+        0 => String::new(),
+        count => format!("{count} from packer, "),
+    };
     console.field(
         "Recovered",
         format_args!(
-            "{} attested, {} scanned, {} delay, {} inferred",
+            "{from_packer}{} attested, {} scanned, {} delay, {} inferred",
             summary.recovered_attested,
             summary.recovered_scanned,
             summary.recovered_delayed,
@@ -458,7 +520,8 @@ fn render_recovery_confidence(console: &Console, summary: &dump::DumpSummary) {
     );
     let tabled = summary
         .recovered_attested
-        .saturating_add(summary.recovered_scanned);
+        .saturating_add(summary.recovered_scanned)
+        .saturating_add(summary.recovered_packer);
     if tabled > 0 {
         console.field(
             "Call sites",

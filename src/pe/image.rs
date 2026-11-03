@@ -49,6 +49,10 @@ impl SectionModel {
         }
     }
 
+    pub(super) fn raw_end(&self) -> u64 {
+        u64::from(self.raw_pointer) + u64::from(self.raw_size)
+    }
+
     pub(super) fn contains_rva(&self, rva: Rva) -> bool {
         let start = self.virtual_address.get();
         let end = start.saturating_add(self.span());

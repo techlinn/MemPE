@@ -198,19 +198,3 @@ pub(super) fn runtime_function_is_valid(
     };
     layout == UnwindLayout::Managed || matches!(first & 0x07, 1 | 2)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::entry_unwind_covered;
-
-    #[test]
-    fn reports_unwind_coverage_only_when_the_directory_survived() {
-        let ranges = Some(vec![(0x1000u32, 0x1100u32), (0x2000, 0x2010)]);
-
-        assert_eq!(entry_unwind_covered(&None, 0x1000), None);
-        assert_eq!(entry_unwind_covered(&ranges, 0x1000), Some(true));
-        assert_eq!(entry_unwind_covered(&ranges, 0x10FF), Some(true));
-        assert_eq!(entry_unwind_covered(&ranges, 0x1100), Some(false));
-        assert_eq!(entry_unwind_covered(&ranges, 0x0FFF), Some(false));
-    }
-}

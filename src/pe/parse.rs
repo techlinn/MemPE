@@ -286,6 +286,7 @@ fn parse_sections(
         let virtual_size = read_u32(bytes, checked_add(header_offset, 8, "virtual size")?)?;
         let virtual_address = read_u32(bytes, checked_add(header_offset, 12, "section RVA")?)?;
         let raw_size = read_u32(bytes, checked_add(header_offset, 16, "raw size")?)?;
+        let raw_pointer = read_u32(bytes, checked_add(header_offset, 20, "raw pointer")?)?;
         let characteristics = read_u32(
             bytes,
             checked_add(header_offset, 36, "section characteristics")?,
@@ -301,6 +302,7 @@ fn parse_sections(
             name,
             virtual_size,
             virtual_address: Rva(virtual_address),
+            raw_pointer,
             raw_size,
             characteristics,
         };

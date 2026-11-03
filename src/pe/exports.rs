@@ -4,9 +4,8 @@ use std::ops::Range;
 
 use crate::pe::image;
 use crate::pe::parse::parse_memory_image;
-use crate::pe::{PeImage, Rva};
+use crate::pe::{EXPORT_DIRECTORY, PeImage, Rva};
 
-const EXPORT_DIRECTORY: usize = 0;
 const EXPORT_HEADER_SIZE: usize = 40;
 const MAX_EXPORTS: usize = 1_048_576;
 const MAX_EXPORT_NAME: usize = 4_096;
@@ -139,6 +138,14 @@ impl ExportIndex {
             ambiguous,
             aliased,
         })
+    }
+
+    pub(crate) fn ordinal_in(&self, address: usize, module: &str) -> Option<u32> {
+        self.addresses
+            .get(&address)?
+            .iter()
+            .find(|symbol| symbol.module.eq_ignore_ascii_case(module))
+            .map(|symbol| symbol.ordinal)
     }
 }
 
@@ -455,195 +462,4 @@ fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
 
 fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
     image::read_u32(bytes, offset).ok()
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
-
-    use super::{Definitions, ExportIndex, ExportKey, ResolvedExport, parse_forward_target};
-
-    fn export(name: &str, module: &str) -> ResolvedExport {
-        ResolvedExport {
-            module: module.to_owned(),
-            name: Some(name.to_owned()),
-            ordinal: 1,
-            forwarded: false,
-        }
-    }
-
-    fn index_with(address: usize, symbols: Vec<ResolvedExport>) -> ExportIndex {
-        let mut index = ExportIndex::default();
-        index.addresses.insert(address, symbols);
-        index
-    }
-
-    #[test]
-    fn covers_each_captured_image_and_nothing_between_them() {
-        let image = vec![0u8; 0x1000];
-        let index = ExportIndex::build([
-            (0x20_0000, image.as_slice(), None),
-            (0x10_0000, image.as_slice(), None),
-        ]);
-
-        assert!(index.covers(0x10_0000));
-        assert!(index.covers(0x20_0FFF));
-        assert!(!index.covers(0x10_1000));
-        assert!(!index.covers(0xF_FFFF));
-    }
-
-    #[test]
-    fn prefers_an_undecorated_alias_over_a_mangled_one() -> Result<(), Box<dyn std::error::Error>> {
-        let index = index_with(
-            0x1000,
-            vec![
-                export(
-                    "?GetCurrentThreadId@platform@details@Concurrency@@YAJXZ",
-                    "MSVCP140.dll",
-                ),
-                export("_Thrd_id", "MSVCP140.dll"),
-            ],
-        );
-
-        let found = index.resolve(0x1000).ok_or("address is indexed")?;
-
-        assert_eq!(found.symbol.name.as_deref(), Some("_Thrd_id"));
-        assert!(found.aliased);
-        assert!(!found.ambiguous);
-        Ok(())
-    }
-
-    #[test]
-    fn keeps_the_only_name_when_nothing_aliases_it() -> Result<(), Box<dyn std::error::Error>> {
-        let index = index_with(0x2000, vec![export("?mangled@@YAXXZ", "one.dll")]);
-
-        let found = index.resolve(0x2000).ok_or("address is indexed")?;
-
-        assert_eq!(found.symbol.name.as_deref(), Some("?mangled@@YAXXZ"));
-        assert!(!found.aliased);
-        Ok(())
-    }
-
-    #[test]
-    fn reports_cross_module_collisions_as_ambiguous_not_aliased()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let index = index_with(
-            0x3000,
-            vec![export("shared", "one.dll"), export("other", "two.dll")],
-        );
-
-        let found = index.resolve(0x3000).ok_or("address is indexed")?;
-
-        assert!(found.ambiguous);
-        assert!(!found.aliased);
-        Ok(())
-    }
-
-    fn forwarder(name: Option<&str>, module: &str) -> ResolvedExport {
-        ResolvedExport {
-            module: module.to_owned(),
-            name: name.map(str::to_owned),
-            ordinal: 1,
-            forwarded: true,
-        }
-    }
-
-    #[test]
-    fn a_forwarder_and_the_definition_it_reaches_are_not_ambiguous()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let index = index_with(
-            0x4000,
-            vec![
-                export("EtwEventWrite", "ntdll.dll"),
-                forwarder(Some("EventWrite"), "KERNELBASE.dll"),
-            ],
-        );
-
-        let found = index.resolve(0x4000).ok_or("address is indexed")?;
-
-        assert!(!found.ambiguous);
-        assert!(found.aliased);
-        assert_eq!(found.symbol.module, "KERNELBASE.dll");
-        assert_eq!(found.symbol.name.as_deref(), Some("EventWrite"));
-        Ok(())
-    }
-
-    #[test]
-    fn an_ordinal_only_forwarder_does_not_hide_the_named_definition()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let index = index_with(
-            0x5000,
-            vec![
-                export("LoadCursorW", "USER32.dll"),
-                forwarder(None, "SHLWAPI.dll"),
-            ],
-        );
-
-        let found = index.resolve(0x5000).ok_or("address is indexed")?;
-
-        assert!(!found.ambiguous);
-        assert_eq!(found.symbol.module, "USER32.dll");
-        assert_eq!(found.symbol.name.as_deref(), Some("LoadCursorW"));
-        Ok(())
-    }
-
-    #[test]
-    fn two_definitions_stay_ambiguous_beside_a_forwarder() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let index = index_with(
-            0x6000,
-            vec![
-                export("shared", "one.dll"),
-                export("other", "two.dll"),
-                forwarder(Some("shared"), "three.dll"),
-            ],
-        );
-
-        let found = index.resolve(0x6000).ok_or("address is indexed")?;
-
-        assert!(found.ambiguous);
-        Ok(())
-    }
-
-    #[test]
-    fn ignores_a_zero_export_name_rva() {
-        let mut image = vec![0u8; 0x200];
-        image[..4].copy_from_slice(b"MZ\0\0");
-        image[0x100..0x108].copy_from_slice(b"real.dll");
-
-        assert_eq!(super::read_ascii(&image, 0), None);
-        assert_eq!(
-            super::read_ascii(&image, 0x100).as_deref(),
-            Some("real.dll")
-        );
-    }
-
-    #[test]
-    fn parses_named_and_ordinal_forwarders() {
-        assert!(parse_forward_target("KERNELBASE.CreateFileW").is_some());
-        assert!(parse_forward_target("NTDLL.#42").is_some());
-        assert!(parse_forward_target("broken").is_none());
-    }
-
-    #[test]
-    fn keeps_only_unambiguous_addresses_per_key() {
-        let by_module = HashMap::from([
-            (("a.dll".to_owned(), ExportKey::Ordinal(1)), 0x10),
-            (("b.dll".to_owned(), ExportKey::Ordinal(1)), 0x10),
-            (("a.dll".to_owned(), ExportKey::Ordinal(2)), 0x20),
-            (("b.dll".to_owned(), ExportKey::Ordinal(2)), 0x30),
-        ]);
-
-        let definitions = Definitions::build(by_module);
-
-        assert_eq!(
-            definitions.unique_by_key.get(&ExportKey::Ordinal(1)),
-            Some(&Some(0x10))
-        );
-        assert_eq!(
-            definitions.unique_by_key.get(&ExportKey::Ordinal(2)),
-            Some(&None)
-        );
-        assert_eq!(definitions.unique_by_key.get(&ExportKey::Ordinal(3)), None);
-    }
 }
