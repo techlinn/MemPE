@@ -1,14 +1,14 @@
-use super::exception::{
-    EXCEPTION_DIRECTORY, RUNTIME_FUNCTION_SIZE, runtime_function_is_valid, unwind_layout,
-};
+use super::exception::{runtime_function_is_valid, unwind_layout};
 use super::sections::readable_section_name;
 use super::{PAGE_SIZE, SectionLayout};
 use crate::pe::image::{read_pointer, read_u32};
-use crate::pe::{IMAGE_SCN_MEM_EXECUTE, PeImage, PeKind, PeModel, RegionEvidence, Rva};
+use crate::pe::{
+    EXCEPTION_DIRECTORY, IMAGE_SCN_MEM_EXECUTE, PeImage, PeKind, PeModel, RUNTIME_FUNCTION_SIZE,
+    RegionEvidence, Rva, TLS_DIRECTORY,
+};
 
 const PDATA_NAME: &[u8; 8] = b".pdata\0\0";
 const MAX_PDATA_ENTRIES: usize = 65_536;
-const TLS_DIRECTORY: usize = 9;
 const MAX_TLS_CALLBACKS: usize = 1_024;
 const PAGE_RESIDENT: u8 = 0b01;
 const PAGE_PRIVATE: u8 = 0b10;
@@ -47,13 +47,16 @@ fn section_absent(memory: &[u8], layout: &SectionLayout<'_>) -> bool {
     if layout.model.characteristics & IMAGE_SCN_MEM_EXECUTE == 0 {
         return false;
     }
+
     if layout.source_length < MIN_ABSENT_SECTION_BYTES {
         return false;
     }
+
     let start = layout.model.virtual_address.get() as usize;
     let Some(slice) = memory.get(start..start.saturating_add(layout.source_length)) else {
         return false;
     };
+
     slice.iter().all(|byte| *byte == 0)
 }
 
@@ -73,21 +76,27 @@ fn section_never_decrypted(memory: &[u8], layout: &SectionLayout<'_>, page_flags
     let Some(slice) = memory.get(start..start.saturating_add(layout.source_length)) else {
         return false;
     };
+
     let trimmed = trim_trailing_zeroes(slice);
+
     if trimmed.len() < MIN_ENTROPY_SECTION_BYTES {
         return false;
     }
+
     let first_page = start / PAGE_SIZE;
     let page_count = layout.source_length.div_ceil(PAGE_SIZE);
     let Some(pages) = page_flags.get(first_page..first_page.saturating_add(page_count)) else {
         return false;
     };
+
     if !pages.iter().any(|flags| flags & PAGE_RESIDENT != 0) {
         return false;
     }
+
     if pages.iter().any(|flags| flags & PAGE_PRIVATE != 0) {
         return false;
     }
+
     shannon_entropy(trimmed) >= HIGH_ENTROPY_THRESHOLD
 }
 
@@ -116,6 +125,7 @@ fn holds_rva(layout: &SectionLayout<'_>, rva: Option<u32>) -> bool {
     let Some(rva) = rva else {
         return false;
     };
+
     let start = layout.model.virtual_address.get() as usize;
     let rva = rva as usize;
     rva >= start && rva < start.saturating_add(layout.source_length)
@@ -131,6 +141,7 @@ fn unwind_table_is_bogus(
     if layout.raw_size == 0 {
         return false;
     }
+
     let unwind = unwind_layout(output, model);
     let count = (layout.source_length / RUNTIME_FUNCTION_SIZE).min(MAX_PDATA_ENTRIES);
     let mut invalid = 0usize;
@@ -141,10 +152,12 @@ fn unwind_table_is_bogus(
         let Some(entry) = output.get(offset..offset.saturating_add(RUNTIME_FUNCTION_SIZE)) else {
             break;
         };
+
         if !runtime_function_is_valid(output, entry, model, layouts, header_size, unwind) {
             invalid = invalid.saturating_add(1);
         }
     }
+
     count > 0 && invalid > count / 2
 }
 
@@ -152,6 +165,7 @@ fn trim_trailing_zeroes(bytes: &[u8]) -> &[u8] {
     let Some(last) = bytes.iter().rposition(|byte| *byte != 0) else {
         return &[];
     };
+
     bytes.get(..=last).unwrap_or(bytes)
 }
 
@@ -159,21 +173,26 @@ fn shannon_entropy(bytes: &[u8]) -> f64 {
     if bytes.is_empty() {
         return 0.0;
     }
+
     let mut counts = [0u32; ENTROPY_ALPHABET];
     for byte in bytes {
         if let Some(count) = counts.get_mut(usize::from(*byte)) {
             *count = count.saturating_add(1);
         }
     }
+
     let total = bytes.len() as f64;
     let mut entropy = 0.0f64;
+
     for count in counts {
         if count == 0 {
             continue;
         }
+
         let share = f64::from(count) / total;
         entropy -= share * share.log2();
     }
+
     entropy
 }
 
@@ -181,6 +200,7 @@ pub(super) fn count_tls_callbacks(image: &PeImage<'_>, observed_base: usize) -> 
     let Ok(Some(directory)) = image.directory(TLS_DIRECTORY) else {
         return 0;
     };
+
     let model = image.model();
     let memory = image.bytes();
     let width: usize = if model.kind() == PeKind::Pe32 { 4 } else { 8 };
@@ -190,12 +210,15 @@ pub(super) fn count_tls_callbacks(image: &PeImage<'_>, observed_base: usize) -> 
     else {
         return 0;
     };
+
     let Ok(table) = read_pointer(memory, table_offset, model.kind()) else {
         return 0;
     };
+
     let Some(table_rva) = table.checked_sub(observed_base) else {
         return 0;
     };
+
     let mut count = 0usize;
     for index in 0..MAX_TLS_CALLBACKS {
         let Some(offset) = index
@@ -204,11 +227,13 @@ pub(super) fn count_tls_callbacks(image: &PeImage<'_>, observed_base: usize) -> 
         else {
             break;
         };
+
         match read_pointer(memory, offset, model.kind()) {
             Ok(0) | Err(_) => break,
             Ok(_) => count = count.saturating_add(1),
         }
     }
+
     count
 }
 
@@ -228,5 +253,6 @@ pub(super) fn entry_section_name(
         .position(|byte| *byte == 0)
         .unwrap_or(name.len());
     let label = String::from_utf8_lossy(name.get(..end)?).into_owned();
+
     (!label.is_empty()).then_some(label)
 }

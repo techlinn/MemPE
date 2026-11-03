@@ -1,10 +1,8 @@
 use super::{SectionLayout, rva_to_file};
 use crate::pe::image::{read_u32, write_u32};
-use crate::pe::{PeKind, PeModel, Rva};
+use crate::pe::{EXCEPTION_DIRECTORY, PeKind, PeModel, RUNTIME_FUNCTION_SIZE, Rva};
 use crate::{AppError, AppResult};
 
-pub(super) const EXCEPTION_DIRECTORY: usize = 3;
-pub(super) const RUNTIME_FUNCTION_SIZE: usize = 12;
 const COM_DESCRIPTOR_DIRECTORY: usize = 14;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -23,6 +21,7 @@ pub(super) fn unwind_layout(output: &[u8], model: &PeModel) -> UnwindLayout {
     let Ok(Some(offset)) = model.directory_offset(COM_DESCRIPTOR_DIRECTORY) else {
         return UnwindLayout::Native;
     };
+
     match read_u32(output, offset) {
         Ok(rva) if rva != 0 => UnwindLayout::Managed,
         _ => UnwindLayout::Native,
@@ -38,27 +37,34 @@ pub(super) fn repair_exception_directory(
     if model.kind != PeKind::Pe32Plus || EXCEPTION_DIRECTORY >= model.directory_count {
         return Ok(ExceptionRepair::absent());
     }
+
     let entry_offset = model
         .directory_offset(EXCEPTION_DIRECTORY)?
         .ok_or_else(|| AppError::new("exception-directory slot is missing"))?;
     let rva = read_u32(output, entry_offset)?;
     let size = read_u32(output, entry_offset.saturating_add(4))? as usize;
+
     if rva == 0 || size == 0 {
         return Ok(ExceptionRepair::absent());
     }
+
     let Some(file_offset) = rva_to_file(rva, layouts, header_size) else {
         return Ok(ExceptionRepair::absent());
     };
+
     let scan =
         collect_valid_runtime_functions(output, model, layouts, header_size, file_offset, size)?;
     let ranges = runtime_function_ranges(&scan.valid);
+
     if scan.invalid == 0 {
         return Ok(ExceptionRepair {
             invalid: 0,
             ranges: Some(ranges),
         });
     }
+
     write_valid_runtime_functions(output, entry_offset, file_offset, size, &scan.valid)?;
+
     Ok(ExceptionRepair {
         invalid: scan.invalid,
         ranges: Some(ranges),
@@ -98,6 +104,7 @@ fn collect_valid_runtime_functions(
     let count = size / RUNTIME_FUNCTION_SIZE;
     let mut valid = Vec::<[u8; RUNTIME_FUNCTION_SIZE]>::with_capacity(count);
     let mut invalid = usize::from(!size.is_multiple_of(RUNTIME_FUNCTION_SIZE));
+
     for index in 0..count {
         let offset = file_offset
             .checked_add(index.saturating_mul(RUNTIME_FUNCTION_SIZE))
@@ -106,6 +113,7 @@ fn collect_valid_runtime_functions(
             invalid = invalid.saturating_add(count.saturating_sub(index));
             break;
         };
+
         if runtime_function_is_valid(output, entry, model, layouts, header_size, layout) {
             let mut copy = [0u8; RUNTIME_FUNCTION_SIZE];
             copy.copy_from_slice(entry);
@@ -114,6 +122,7 @@ fn collect_valid_runtime_functions(
             invalid = invalid.saturating_add(1);
         }
     }
+
     Ok(ExceptionScan { valid, invalid })
 }
 
@@ -138,18 +147,22 @@ fn write_valid_runtime_functions(
         .get_mut(file_offset..range_end)
         .ok_or_else(|| AppError::new("exception directory lies outside the rebuilt PE"))?;
     destination.fill(0);
+
     for (index, entry) in valid.iter().enumerate() {
         let start = index.saturating_mul(RUNTIME_FUNCTION_SIZE);
         let end = start.saturating_add(RUNTIME_FUNCTION_SIZE);
+
         if let Some(slot) = destination.get_mut(start..end) {
             slot.copy_from_slice(entry);
         }
     }
+
     if valid.is_empty() {
         write_u32(output, entry_offset, 0)?;
         write_u32(output, entry_offset.saturating_add(4), 0)?;
         return Ok(());
     }
+
     let new_size = valid
         .len()
         .checked_mul(RUNTIME_FUNCTION_SIZE)
@@ -178,23 +191,29 @@ pub(super) fn runtime_function_is_valid(
     let Ok(begin) = read_u32(entry, 0) else {
         return false;
     };
+
     let Ok(end) = read_u32(entry, 4) else {
         return false;
     };
+
     let Ok(unwind) = read_u32(entry, 8) else {
         return false;
     };
+
     if begin >= end
         || !model.executable_rva(Rva(begin))
         || !model.executable_rva(Rva(end.saturating_sub(1)))
     {
         return false;
     }
+
     let Some(unwind_offset) = rva_to_file(unwind, layouts, header_size) else {
         return false;
     };
+
     let Some(first) = output.get(unwind_offset).copied() else {
         return false;
     };
+
     layout == UnwindLayout::Managed || matches!(first & 0x07, 1 | 2)
 }

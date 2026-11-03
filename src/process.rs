@@ -114,11 +114,14 @@ pub(crate) fn enable_debug_privilege() {
     if opened.is_err() {
         return;
     }
+
     let token = OwnedHandle(raw_token);
     let mut luid = LUID::default();
+
     if unsafe { LookupPrivilegeValueW(PCWSTR::null(), SE_DEBUG_NAME, &mut luid) }.is_err() {
         return;
     }
+
     let privileges = TOKEN_PRIVILEGES {
         PrivilegeCount: 1,
         Privileges: [LUID_AND_ATTRIBUTES {
@@ -126,6 +129,7 @@ pub(crate) fn enable_debug_privilege() {
             Attributes: SE_PRIVILEGE_ENABLED,
         }],
     };
+
     let _ = unsafe { AdjustTokenPrivileges(token.raw(), false, Some(&privileges), 0, None, None) };
 }
 
@@ -168,12 +172,14 @@ pub(crate) fn watch(name: &str) -> AppResult<TargetProcess> {
     if name.is_empty() {
         return Err(AppError::new("watch name cannot be empty"));
     }
+
     let mut baseline = matching_pids(name, &list_processes()?);
 
     for _poll in 0..MAX_WATCH_POLLS {
         let entries = list_processes()?;
         let current = matching_pids(name, &entries);
         baseline.retain(|pid| current.contains(pid));
+
         if let Some(target) = find_new_target(&current, &baseline) {
             wait_until_capture_time(target.created);
             if let Ok(confirmed) = query(target.pid)
@@ -181,8 +187,10 @@ pub(crate) fn watch(name: &str) -> AppResult<TargetProcess> {
             {
                 return Ok(confirmed);
             }
+
             baseline.insert(target.pid);
         }
+
         thread::sleep(PROCESS_POLL_DELAY);
     }
 
@@ -197,6 +205,7 @@ fn list_processes() -> AppResult<Vec<ProcessEntry>> {
         dwSize: size_of::<PROCESSENTRY32W>() as u32,
         ..Default::default()
     };
+
     unsafe { Process32FirstW(snapshot.raw(), &mut entry) }
         .map_err(|error| windows_error("Process32FirstW", error))?;
 
@@ -208,12 +217,14 @@ fn list_processes() -> AppResult<Vec<ProcessEntry>> {
                 name: wide_string(&entry.szExeFile),
             });
         }
+
         match unsafe { Process32NextW(snapshot.raw(), &mut entry) } {
             Ok(()) => {}
             Err(error) if error.code() == ERROR_NO_MORE_FILES.to_hresult() => return Ok(entries),
             Err(error) => return Err(windows_error("Process32NextW", error)),
         }
     }
+
     Err(AppError::new("too many processes were returned"))
 }
 
@@ -246,6 +257,7 @@ fn wait_until_capture_time(created: u64) {
     let deadline = created.saturating_add(CAPTURE_DELAY_FILETIME);
     let now = filetime_value(unsafe { GetSystemTimePreciseAsFileTime() });
     let remaining = deadline.saturating_sub(now);
+
     if remaining > 0 {
         thread::sleep(Duration::from_nanos(remaining.saturating_mul(100)));
     }
@@ -264,6 +276,7 @@ fn get_path(handle: &OwnedHandle) -> AppResult<PathBuf> {
         )
     }
     .map_err(|error| windows_error("QueryFullProcessImageNameW", error))?;
+
     let used = usize::try_from(length)
         .map_err(|_| AppError::new("process path length does not fit memory"))?;
     let path = String::from_utf16(
@@ -272,6 +285,7 @@ fn get_path(handle: &OwnedHandle) -> AppResult<PathBuf> {
             .ok_or_else(|| AppError::new("Windows returned an invalid process path length"))?,
     )
     .map_err(|_| AppError::new("process path contains invalid UTF-16"))?;
+
     Ok(PathBuf::from(path))
 }
 
@@ -292,12 +306,15 @@ fn get_architecture(handle: &OwnedHandle) -> AppResult<TargetArchitecture> {
     } else {
         process_machine
     };
+
     if machine == IMAGE_FILE_MACHINE_I386 {
         return Ok(TargetArchitecture::X86);
     }
+
     if machine == IMAGE_FILE_MACHINE_AMD64 {
         return Ok(TargetArchitecture::X64);
     }
+
     Err(AppError::new(format!(
         "unsupported target machine: 0x{:04X}",
         machine.0
@@ -319,6 +336,7 @@ fn get_creation_time(handle: &OwnedHandle) -> AppResult<u64> {
         )
     }
     .map_err(|error| windows_error("GetProcessTimes", error))?;
+
     Ok(filetime_value(created))
 }
 
@@ -328,18 +346,21 @@ fn get_modules(pid: ProcessId) -> AppResult<Vec<ModuleInfo>> {
         dwSize: size_of::<MODULEENTRY32W>() as u32,
         ..Default::default()
     };
+
     unsafe { Module32FirstW(snapshot.raw(), &mut entry) }
         .map_err(|error| windows_error("Module32FirstW", error))?;
 
     let mut modules = Vec::with_capacity(64);
     for _index in 0..MAX_MODULES {
         modules.push(module_from_entry(&entry));
+
         match unsafe { Module32NextW(snapshot.raw(), &mut entry) } {
             Ok(()) => {}
             Err(error) if error.code() == ERROR_NO_MORE_FILES.to_hresult() => return Ok(modules),
             Err(error) => return Err(windows_error("Module32NextW", error)),
         }
     }
+
     Err(AppError::new("too many modules were returned"))
 }
 
@@ -347,6 +368,7 @@ fn explain_denied_access(pid: ProcessId, error: AppError) -> AppError {
     if OwnedHandle::open(pid, PROCESS_QUERY_INFORMATION | PROCESS_VM_READ).is_ok() {
         return error;
     }
+
     AppError::new(
         "the target refuses memory access; run mempe from an elevated terminal, and note that a \
          protected process can deny access even to an administrator",
@@ -355,6 +377,7 @@ fn explain_denied_access(pid: ProcessId, error: AppError) -> AppError {
 
 fn module_snapshot(pid: ProcessId) -> AppResult<OwnedHandle> {
     let flags = TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32;
+
     for _attempt in 0..MAX_MODULE_SNAPSHOT_TRIES {
         match unsafe { CreateToolhelp32Snapshot(flags, pid.get()) } {
             Ok(handle) => return Ok(OwnedHandle(handle)),
@@ -366,6 +389,7 @@ fn module_snapshot(pid: ProcessId) -> AppResult<OwnedHandle> {
             }
         }
     }
+
     Err(AppError::new(
         "could not get a stable module list after eight tries",
     ))
@@ -384,6 +408,7 @@ fn find_main_module(path: &Path, modules: &[ModuleInfo]) -> AppResult<ModuleInfo
     if modules.is_empty() {
         return Err(AppError::new("target has no modules"));
     }
+
     if let Some(module) = modules
         .iter()
         .find(|module| paths_equal(&module.path, path))
@@ -391,6 +416,7 @@ fn find_main_module(path: &Path, modules: &[ModuleInfo]) -> AppResult<ModuleInfo
     {
         return Ok(module.clone());
     }
+
     Err(AppError::new(format!(
         "no loaded module matches the target image {}; refusing to guess which of the {} mapped \
          modules is the main image",
@@ -408,6 +434,7 @@ fn find_by_basename<'a>(path: &Path, modules: &'a [ModuleInfo]) -> Option<&'a Mo
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.eq_ignore_ascii_case(wanted))
     });
+
     let first = matches.next()?;
     matches.next().is_none().then_some(first)
 }

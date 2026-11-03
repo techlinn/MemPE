@@ -37,12 +37,14 @@ pub(crate) fn carve_embedded(memory: &[u8], source: CarveSource) -> CarveResult 
             unscanned: 0,
         };
     };
+
     let mut found = Vec::new();
     let mut attempts = 0usize;
     let mut offset = match source {
         CarveSource::Image => 1, // offset 0 is the images own header
         CarveSource::Buffer => 0,
     };
+
     while offset <= last_candidate
         && found.len() < MAX_EMBEDDED_PER_IMAGE
         && attempts < MAX_CARVE_ATTEMPTS
@@ -51,7 +53,9 @@ pub(crate) fn carve_embedded(memory: &[u8], source: CarveSource) -> CarveResult 
             offset = offset.saturating_add(1);
             continue;
         }
+
         attempts = attempts.saturating_add(1);
+
         match try_carve(memory, offset) {
             Some(embedded) => {
                 offset = offset.saturating_add(embedded.length);
@@ -69,9 +73,11 @@ fn try_carve(memory: &[u8], offset: usize) -> Option<EmbeddedPe> {
     let slice = memory.get(offset..)?;
     let image = parse_disk_image(slice).ok()?;
     let length = embedded_length(&image)?;
+
     if !(MIN_EMBEDDED_SIZE..=MAX_EMBEDDED_SIZE).contains(&length) || length > slice.len() {
         return None;
     }
+
     Some(EmbeddedPe {
         offset,
         length,
@@ -84,6 +90,7 @@ fn embedded_length(image: &PeImage<'_>) -> Option<usize> {
     let bytes = image.bytes();
     let model = image.model();
     let mut end = usize::try_from(read_u32(bytes, model.size_of_headers_offset).ok()?).ok()?;
+
     for section in model.sections() {
         let header = section.header_offset;
         let raw_size =
@@ -92,6 +99,7 @@ fn embedded_length(image: &PeImage<'_>) -> Option<usize> {
             usize::try_from(read_u32(bytes, header.checked_add(RAW_POINTER_OFFSET)?).ok()?).ok()?;
         end = end.max(raw_offset.checked_add(raw_size)?);
     }
+
     Some(end.max(certificate_end(image)?))
 }
 
@@ -99,6 +107,7 @@ fn certificate_end(image: &PeImage<'_>) -> Option<usize> {
     let Ok(Some(certificate)) = image.directory(SECURITY_DIRECTORY) else {
         return Some(0);
     };
+
     certificate
         .rva()
         .as_usize()
@@ -107,6 +116,7 @@ fn certificate_end(image: &PeImage<'_>) -> Option<usize> {
 
 fn classify(image: &PeImage<'_>) -> &'static str {
     let model = image.model();
+
     if model.subsystem == SUBSYSTEM_NATIVE {
         "sys"
     } else if model.is_dll {

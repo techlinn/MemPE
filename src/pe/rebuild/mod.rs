@@ -7,13 +7,15 @@ mod overlay;
 mod sections;
 mod source;
 
+use std::path::Path;
+
 use crate::pe::exports::ExportIndex;
-use crate::pe::imports::{ImportPlan, build_plan, build_restored_plan};
+use crate::pe::imports::{ImportPlan, build_iat_plan, build_plan, build_restored_plan};
 use crate::pe::packers::PackerImports;
 use crate::pe::parse::parse_memory_image;
 use crate::pe::{
     EntryPointRva, IAT_DIRECTORY, IMPORT_DIRECTORY, PackerReport, PeImage, PeKind, PeModel,
-    RegionEvidence, SectionModel,
+    RegionEvidence, SECTION_HEADER_SIZE, SectionModel,
 };
 use crate::{AppError, AppResult};
 use directories::{
@@ -32,7 +34,6 @@ use source::{Source, Unpack, resolve_source_bytes};
 
 pub(crate) use overlay::{append_overlay, overlay_offset};
 
-const SECTION_HEADER_SIZE: usize = 40;
 const MAX_OUTPUT_SIZE: usize = 1024 * 1024 * 1024;
 const IMAGE_SCN_CNT_CODE: u32 = 0x0000_0020;
 const IMAGE_SCN_CNT_INITIALIZED_DATA: u32 = 0x0000_0040;
@@ -90,17 +91,23 @@ struct SectionLayout<'a> {
     raw_size: usize,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct DiskImage<'a> {
+    pub(crate) headers: Option<&'a [u8]>, // repairs headers wiped from memory
+    pub(crate) file: Option<&'a Path>,    // lets packer modules read data they erased from memory
+}
+
 pub(crate) fn rebuild(
     memory: &[u8],
     regions: &[RegionEvidence],
     observed_base: usize,
-    disk_headers: Option<&[u8]>,
+    disk: DiskImage<'_>,
     exports: &ExportIndex,
     entry_point: Option<EntryPointRva>,
     page_flags: &[u8],
 ) -> AppResult<RebuiltImage> {
     let attempt = |unpack: Unpack| {
-        let source = resolve_source_bytes(memory, regions, disk_headers, unpack)?;
+        let source = resolve_source_bytes(memory, regions, observed_base, disk, unpack)?;
         rebuild_source(
             source,
             regions,
@@ -110,6 +117,7 @@ pub(crate) fn rebuild(
             page_flags,
         )
     };
+
     attempt(Unpack::Restore).or_else(|error| match attempt(Unpack::DetectOnly) {
         Ok(rebuilt) if rebuilt.packer.is_some() => Ok(rebuilt), // fall back to the packed image
         _ => Err(error),
@@ -129,6 +137,7 @@ fn rebuild_source(
         disk_headers_used,
         packer,
     } = source;
+
     let image = parse_memory_image(&source)
         .map_err(|error| AppError::new(format!("rebuilt PE headers are invalid: {error}")))?;
     let memory = image.bytes();
@@ -143,12 +152,22 @@ fn rebuild_source(
         Some(PackerImports::Listed(modules)) => {
             build_restored_plan(&image, observed_base, exports, Some(modules))
         }
-        Some(PackerImports::Unknown) | None => build_plan(&image, observed_base, exports),
+        Some(PackerImports::FilledIat { rva, size }) => {
+            build_iat_plan(&image, observed_base, exports, (*rva, *size))
+        }
+        Some(PackerImports::Unknown) => {
+            let mut plan = build_plan(&image, observed_base, exports);
+            plan.keep_iat_directory = true; // the packer found the original iat
+            plan
+        }
+        None => build_plan(&image, observed_base, exports),
     };
+
     let (mut output, layouts, header_size) =
         build_output_buffer(model, memory, !plan.groups.is_empty())?;
 
     write_core_header_fields(&mut output, model, observed_base, header_size)?;
+
     let renamed_sections = write_sections(&mut output, memory, &layouts)?;
 
     let mut repairs = apply_repairs(&mut output, model, &layouts, header_size)?;
@@ -157,6 +176,7 @@ fn rebuild_source(
         written,
         unemitted,
     } = resolve_imports(&mut output, model, plan, &mut repairs)?;
+
     let (final_entry_point, executable_flag_added) =
         finalize_output(&mut output, model, entry_point)?;
 
@@ -226,6 +246,7 @@ fn apply_repairs(
     let exception = repair_exception_directory(output, model, layouts, header_size)?;
     let repaired_debug_entries = repair_debug_directory(output, model, layouts, header_size)?;
     let fixed_image_base = clear_dynamic_base(output, model)?;
+
     Ok(RepairStats {
         cleared,
         unwind_ranges: exception.ranges,
@@ -251,6 +272,7 @@ fn resolve_imports(
         true => ImportSection::NothingToWrite,
         false => append_import_section(output, model, &plan)?,
     };
+
     let (written, unemitted, cleared) = match section {
         ImportSection::Written { cleared } => (true, 0, cleared),
         ImportSection::NothingToWrite => (false, 0, Vec::new()),
@@ -258,12 +280,16 @@ fn resolve_imports(
             (false, plan.recovered, Vec::new())
         }
     };
+
     let unemitted = unemitted.saturating_add(plan.unrepresentable);
+
     for index in cleared {
         repairs.cleared.record(index);
     }
+
     if !written && plan.existing.is_empty() {
         let extra = clear_directory(output, model, IMPORT_DIRECTORY)?;
+
         if extra > 0 {
             repairs.cleared.record(IMPORT_DIRECTORY);
         }
@@ -280,18 +306,22 @@ fn declared_iat_slots(image: &PeImage<'_>, model: &PeModel) -> usize {
     let Ok(Some(directory)) = image.directory(IAT_DIRECTORY) else {
         return 0;
     };
+
     directory.size() as usize / model.kind.pointer_width()
 }
 
 fn rva_to_file(rva: u32, layouts: &[SectionLayout<'_>], header_size: usize) -> Option<usize> {
     let rva = rva as usize;
+
     if rva < header_size {
         return Some(rva);
     }
+
     layouts.iter().find_map(|layout| {
         if layout.raw_size == 0 {
             return None;
         }
+
         let start = layout.model.virtual_address.get() as usize;
         let delta = rva.checked_sub(start)?;
         (delta < layout.source_length).then(|| layout.raw_offset.saturating_add(delta))
@@ -302,6 +332,7 @@ fn align_up(value: usize, alignment: usize) -> AppResult<usize> {
     if alignment == 0 || !alignment.is_power_of_two() {
         return Err(AppError::new("PE alignment is invalid"));
     }
+
     value
         .checked_add(alignment - 1)
         .map(|result| result & !(alignment - 1))
@@ -312,6 +343,7 @@ fn align_up_u64(value: u64, alignment: u64) -> AppResult<u64> {
     if alignment == 0 || !alignment.is_power_of_two() {
         return Err(AppError::new("PE alignment is invalid"));
     }
+
     value
         .checked_add(alignment - 1)
         .map(|result| result & !(alignment - 1))

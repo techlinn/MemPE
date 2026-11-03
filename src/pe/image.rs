@@ -93,11 +93,14 @@ impl PeModel {
         let Some(offset) = self.directory_offset(index)? else {
             return Ok(None);
         };
+
         let rva = read_u32(bytes, offset)?;
         let size = read_u32(bytes, checked_add(offset, 4, "data-directory size")?)?;
+
         if rva == 0 || size == 0 {
             return Ok(None);
         }
+
         Ok(Some(DataDirectory {
             rva: Rva(rva),
             size,
@@ -108,6 +111,7 @@ impl PeModel {
         if index >= self.directory_count {
             return Ok(None);
         }
+
         let relative = index
             .checked_mul(DIRECTORY_ENTRY_SIZE)
             .ok_or_else(|| AppError::new("data-directory index overflowed"))?;
@@ -161,11 +165,14 @@ pub(super) fn read_ascii(bytes: &[u8], rva: Rva, limit: usize) -> Option<&str> {
     if rva.get() == 0 {
         return None;
     }
+
     let tail = bytes.get(rva.as_usize()..)?;
     let length = tail.iter().take(limit).position(|byte| *byte == 0)?;
+
     if length == 0 {
         return None;
     }
+
     std::str::from_utf8(tail.get(..length)?).ok()
 }
 

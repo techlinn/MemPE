@@ -84,9 +84,12 @@ fn enable_color(handle_name: windows::Win32::System::Console::STD_HANDLE) -> boo
     let Ok(handle) = (unsafe { GetStdHandle(handle_name) }) else {
         return false;
     };
+
     let mut mode = Default::default();
+
     if unsafe { GetConsoleMode(handle, &mut mode) }.is_err() {
         return false;
     }
+
     unsafe { SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) }.is_ok()
 }

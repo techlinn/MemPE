@@ -23,6 +23,7 @@ pub(super) fn append_import_section(
     if IMPORT_DIRECTORY >= model.directory_count {
         return Ok(ImportSection::NoImportDirectory);
     }
+
     let section_header = model
         .sections
         .iter()
@@ -35,10 +36,12 @@ pub(super) fn append_import_section(
     if section_header.saturating_add(SECTION_HEADER_SIZE) > header_limit {
         return Ok(ImportSection::NoRoomInHeaders);
     }
+
     let virtual_address = align_up_u64(
         u64::from(read_u32(output, model.size_of_image_offset)?),
         u64::from(model.section_alignment),
     )?;
+
     let virtual_address = u32::try_from(virtual_address)
         .map_err(|_| AppError::new("import section RVA exceeds u32"))?;
     let payload = build_import_payload(plan, model.kind, virtual_address)?;
@@ -53,7 +56,9 @@ pub(super) fn append_import_section(
             "recovered imports exceed the 1 GiB output safety limit",
         ));
     }
+
     output.resize(final_size, 0);
+
     let payload_end = raw_offset
         .checked_add(payload.len())
         .ok_or_else(|| AppError::new("import payload range overflowed"))?;
@@ -70,13 +75,17 @@ pub(super) fn append_import_section(
         raw_offset,
         raw_size,
     )?;
+
     let mut cleared = Vec::new();
+
     if bound_cleared {
         cleared.push(BOUND_IMPORT_DIRECTORY);
     }
+
     if commit_import_section(output, model, plan, virtual_address, payload.len())? {
         cleared.push(IAT_DIRECTORY);
     }
+
     Ok(ImportSection::Written { cleared })
 }
 
@@ -88,15 +97,18 @@ fn clear_overlapping_bound_imports(
     let Some(offset) = model.directory_offset(BOUND_IMPORT_DIRECTORY)? else {
         return Ok(false);
     };
+
     let start = read_u32(output, offset)? as usize;
     let size = read_u32(output, offset.saturating_add(4))? as usize;
     let end = start.saturating_add(size);
     let header_end = section_header.saturating_add(SECTION_HEADER_SIZE);
 
     let overlaps = size != 0 && start < header_end && end > section_header;
+
     if !overlaps {
         return Ok(false);
     }
+
     Ok(clear_directory(output, model, BOUND_IMPORT_DIRECTORY)? > 0)
 }
 
@@ -148,6 +160,7 @@ fn commit_import_section(
         .checked_add(1)
         .ok_or_else(|| AppError::new("section count overflowed"))?;
     write_u16(output, section_count_offset, section_count)?;
+
     let image_end = u64::from(virtual_address)
         .checked_add(payload_len as u64)
         .ok_or_else(|| AppError::new("import virtual range overflowed"))?;
@@ -157,6 +170,7 @@ fn commit_import_section(
         model.size_of_image_offset,
         u32::try_from(image_size).map_err(|_| AppError::new("image size exceeds u32"))?,
     )?;
+
     let descriptor_size = u32::try_from(import_descriptor_bytes(plan)?)
         .map_err(|_| AppError::new("import descriptor size exceeds u32"))?;
     write_directory(
@@ -166,9 +180,11 @@ fn commit_import_section(
         virtual_address,
         descriptor_size,
     )?;
+
     if plan.existing.is_empty() && !plan.keep_iat_directory {
         return Ok(clear_directory(output, model, IAT_DIRECTORY)? > 0);
     }
+
     Ok(false)
 }
 
@@ -176,8 +192,10 @@ fn build_import_payload(plan: &ImportPlan, kind: PeKind, section_rva: u32) -> Ap
     let width = kind.pointer_width();
     let mut payload = plan.existing.clone();
     payload.resize(import_descriptor_bytes(plan)?, 0);
+
     for (group_index, group) in plan.groups.iter().enumerate() {
         align_vec(&mut payload, width);
+
         let lookup_offset = payload.len();
         let lookup_size = group
             .entries
@@ -187,8 +205,10 @@ fn build_import_payload(plan: &ImportPlan, kind: PeKind, section_rva: u32) -> Ap
             .ok_or_else(|| AppError::new("import lookup-table size overflowed"))?;
         payload.resize(payload.len().saturating_add(lookup_size), 0);
         write_lookup_thunks(&mut payload, group, kind, section_rva, lookup_offset)?;
+
         let module_offset = payload.len();
         append_ascii(&mut payload, &group.module)?;
+
         let descriptor = group_index
             .checked_mul(IMPORT_DESCRIPTOR_SIZE)
             .and_then(|offset| offset.checked_add(plan.existing.len()))
@@ -202,6 +222,7 @@ fn build_import_payload(plan: &ImportPlan, kind: PeKind, section_rva: u32) -> Ap
             group.first_thunk,
         )?;
     }
+
     Ok(payload)
 }
 
@@ -213,10 +234,12 @@ fn write_lookup_thunks(
     lookup_offset: usize,
 ) -> AppResult<()> {
     let width = kind.pointer_width();
+
     for (entry_index, entry) in group.entries.iter().enumerate() {
         let thunk = match &entry.name {
             Some(name) => {
                 align_vec(payload, 2);
+
                 let name_offset = payload.len();
                 payload.extend_from_slice(&[0, 0]);
                 append_ascii(payload, name)?;
@@ -226,11 +249,13 @@ fn write_lookup_thunks(
             }
             None => ordinal_thunk(kind, entry.ordinal),
         };
+
         let thunk_offset = lookup_offset
             .checked_add(entry_index.saturating_mul(width))
             .ok_or_else(|| AppError::new("import thunk offset overflowed"))?;
         write_thunk(payload, thunk_offset, kind, thunk)?;
     }
+
     Ok(())
 }
 
@@ -285,6 +310,7 @@ fn append_ascii(bytes: &mut Vec<u8>, value: &str) -> AppResult<()> {
     if value.is_empty() || !value.is_ascii() || value.as_bytes().contains(&0) {
         return Err(AppError::new("import name is not valid ASCII"));
     }
+
     bytes.extend_from_slice(value.as_bytes());
     bytes.push(0);
     Ok(())

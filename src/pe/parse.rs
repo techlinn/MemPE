@@ -1,5 +1,5 @@
 use crate::pe::image::{checked_add, first_section_rva, read_u16, read_u32, require_range};
-use crate::pe::{PeImage, PeKind, PeModel, Rva, SectionModel};
+use crate::pe::{PeImage, PeKind, PeModel, Rva, SECTION_HEADER_SIZE, SectionModel};
 use crate::{AppError, AppResult};
 
 const DOS_MAGIC: u16 = 0x5A4D;
@@ -10,7 +10,6 @@ const MACHINE_I386: u16 = 0x014C;
 const MACHINE_AMD64: u16 = 0x8664;
 const IMAGE_FILE_DLL: u16 = 0x2000;
 const FILE_HEADER_SIZE: usize = 20;
-const SECTION_HEADER_SIZE: usize = 40;
 const MAX_SECTIONS: usize = 128;
 const MAX_IMAGE_SIZE: usize = 1024 * 1024 * 1024;
 const MAX_SALVAGE_SCAN: usize = 1024 * 1024;
@@ -26,6 +25,7 @@ pub(super) fn parse_memory_image(bytes: &[u8]) -> AppResult<PeImage<'_>> {
     } else {
         usize::MAX
     };
+
     let normal_error = if normal_offset != usize::MAX {
         match parse_candidate(bytes, normal_offset, false, true) {
             Ok(model) => return Ok(PeImage::new(bytes, model)),
@@ -36,10 +36,12 @@ pub(super) fn parse_memory_image(bytes: &[u8]) -> AppResult<PeImage<'_>> {
     };
 
     let scan_limit = bytes.len().min(MAX_SALVAGE_SCAN);
+
     for offset in 0..scan_limit.saturating_sub(4) {
         if offset == normal_offset || peek_u32(bytes, offset) != NT_SIGNATURE {
             continue;
         }
+
         if let Ok(model) = parse_candidate(bytes, offset, true, true) {
             return Ok(PeImage::new(bytes, model));
         }
@@ -54,6 +56,7 @@ pub(super) fn parse_disk_image(bytes: &[u8]) -> AppResult<PeImage<'_>> {
     if bytes.len() < 64 || read_u16(bytes, 0)? != DOS_MAGIC {
         return Err(AppError::new("disk DOS MZ signature is missing"));
     }
+
     let nt_offset = usize::try_from(read_u32(bytes, 0x3c)?)
         .map_err(|_| AppError::new("disk e_lfanew does not fit memory"))?;
     let model = parse_candidate(bytes, nt_offset, false, false)?;
@@ -64,6 +67,7 @@ pub(crate) fn memory_image_size(bytes: &[u8]) -> AppResult<usize> {
     if bytes.len() < 64 || read_u16(bytes, 0)? != DOS_MAGIC {
         return Err(AppError::new("DOS MZ signature is missing"));
     }
+
     let nt_offset = usize::try_from(read_u32(bytes, 0x3c)?)
         .map_err(|_| AppError::new("e_lfanew does not fit memory"))?;
     parse_candidate(bytes, nt_offset, false, false).map(|model| model.image_size as usize)
@@ -108,6 +112,7 @@ fn parse_candidate(
     require_range(bytes, optional_offset, header.optional_size)?;
 
     let shape = optional_header_shape(read_u16(bytes, optional_offset)?, header.machine)?;
+
     if header.optional_size < shape.minimum_size {
         return Err(AppError::new("optional header is truncated"));
     }
@@ -119,17 +124,20 @@ fn parse_candidate(
         shape.directory_count_relative,
         "directory count",
     )?;
+
     let data_directory_offset = checked_add(
         optional_offset,
         shape.directory_relative,
         "data directories",
     )?;
+
     let file_alignment = read_u32(bytes, checked_add(optional_offset, 36, "file alignment")?)?;
     let section_alignment = read_u32(
         bytes,
         checked_add(optional_offset, 32, "section alignment")?,
     )?;
     validate_alignments(file_alignment, section_alignment)?;
+
     let declared_image_size =
         read_declared_image_size(bytes, size_of_image_offset, require_full_image)?;
 
@@ -143,17 +151,20 @@ fn parse_candidate(
         .checked_mul(SECTION_HEADER_SIZE)
         .ok_or_else(|| AppError::new("section table size overflowed"))?;
     require_range(bytes, optional_end, section_table_size)?;
+
     let sections = parse_sections(
         bytes,
         optional_end,
         header.section_count,
         declared_image_size,
     )?;
+
     if salvaged {
         require_headers_before_sections(optional_end, section_table_size, &sections)?;
     }
 
     let offsets = optional_offsets(optional_offset, shape.image_base_relative)?;
+
     Ok(PeModel {
         kind: shape.kind,
         is_dll: header.characteristics & IMAGE_FILE_DLL != 0,
@@ -200,19 +211,24 @@ fn parse_file_header(bytes: &[u8], nt_offset: usize) -> AppResult<FileHeader> {
     if read_u32(bytes, nt_offset)? != NT_SIGNATURE {
         return Err(AppError::new("NT signature is missing"));
     }
+
     let offset = checked_add(nt_offset, 4, "file header offset")?;
     let machine = read_u16(bytes, offset)?;
     let section_count = usize::from(read_u16(bytes, checked_add(offset, 2, "section count")?)?);
+
     if section_count == 0 || section_count > MAX_SECTIONS {
         return Err(AppError::new(format!(
             "invalid section count {section_count}"
         )));
     }
+
     let optional_size = usize::from(read_u16(
         bytes,
         checked_add(offset, 16, "optional-header size")?,
     )?);
+
     let characteristics = read_u16(bytes, checked_add(offset, 18, "file characteristics")?)?;
+
     Ok(FileHeader {
         offset,
         machine,
@@ -260,11 +276,13 @@ fn read_declared_image_size(
             "declared image size {declared} is outside the safety limit"
         )));
     }
+
     if require_full_image && declared > bytes.len() {
         return Err(AppError::new(format!(
             "declared image size {declared} does not fit the captured memory"
         )));
     }
+
     Ok(declared)
 }
 
@@ -283,6 +301,7 @@ fn parse_sections(
                 .ok_or_else(|| AppError::new("section header offset overflowed"))?,
             "section header",
         )?;
+
         let virtual_size = read_u32(bytes, checked_add(header_offset, 8, "virtual size")?)?;
         let virtual_address = read_u32(bytes, checked_add(header_offset, 12, "section RVA")?)?;
         let raw_size = read_u32(bytes, checked_add(header_offset, 16, "raw size")?)?;
@@ -291,12 +310,14 @@ fn parse_sections(
             bytes,
             checked_add(header_offset, 36, "section characteristics")?,
         )?;
+
         let mut name = [0u8; 8];
         name.copy_from_slice(
             bytes
                 .get(header_offset..header_offset.saturating_add(8))
                 .ok_or_else(|| AppError::new("section name is outside the captured image"))?,
         );
+
         let section = SectionModel {
             header_offset,
             name,
@@ -306,10 +327,13 @@ fn parse_sections(
             raw_size,
             characteristics,
         };
+
         validate_section(&section, declared_image_size)?;
         sections.push(section);
     }
+
     validate_non_overlapping_sections(&sections)?;
+
     Ok(sections)
 }
 
@@ -319,6 +343,7 @@ fn validate_alignments(file_alignment: u32, section_alignment: u32) -> AppResult
             "invalid file alignment 0x{file_alignment:X}"
         )));
     }
+
     if section_alignment < file_alignment
         || section_alignment > 0x10_0000
         || !section_alignment.is_power_of_two()
@@ -327,14 +352,17 @@ fn validate_alignments(file_alignment: u32, section_alignment: u32) -> AppResult
             "invalid section alignment 0x{section_alignment:X}"
         )));
     }
+
     Ok(())
 }
 
 fn validate_section(section: &SectionModel, image_size: usize) -> AppResult<()> {
     let span = section.mapped_size();
+
     if span == 0 {
         return Ok(());
     }
+
     let end = section
         .virtual_address
         .as_usize()
@@ -345,6 +373,7 @@ fn validate_section(section: &SectionModel, image_size: usize) -> AppResult<()> 
             "section ending at RVA 0x{end:X} exceeds SizeOfImage"
         )));
     }
+
     Ok(())
 }
 
@@ -357,13 +386,16 @@ fn validate_non_overlapping_sections(sections: &[SectionModel]) -> AppResult<()>
         })
         .collect::<Vec<_>>();
     ranges.sort_unstable_by_key(|range| range.0);
+
     let mut previous_end = 0u64;
     for (start, length) in ranges {
         if u64::from(start) < previous_end {
             return Err(AppError::new("section virtual ranges overlap"));
         }
+
         previous_end = u64::from(start) + u64::from(length);
     }
+
     Ok(())
 }
 
@@ -374,12 +406,14 @@ fn require_headers_before_sections(
 ) -> AppResult<()> {
     let table_end = checked_add(table_offset, table_size, "section table end")?;
     let first_section = first_section_rva(sections).unwrap_or(usize::MAX);
+
     if table_end > first_section {
         // headers past the first section belong to a pe stored inside the image
         return Err(AppError::new(
             "salvaged headers lie inside their own section data",
         ));
     }
+
     Ok(())
 }
 
@@ -387,5 +421,6 @@ fn peek_u32(bytes: &[u8], offset: usize) -> u32 {
     let Some(value) = bytes.get(offset..offset.saturating_add(4)) else {
         return 0;
     };
+
     u32::from_le_bytes([value[0], value[1], value[2], value[3]])
 }

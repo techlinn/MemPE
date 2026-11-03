@@ -86,6 +86,8 @@ mempe snapshots the process, finds every module plus any PE hiding in non-image 
 | Packer | Status | Notes |
 |---|---|---|
 | UPX | Supported | 3.91 to 5.3.0, x86 and x64, EXEs and DLLs, tampered and modified copies too |
+| ASPack | Supported | 2.11 to 2.43 (tested on 2.11, 2.12, 2.2, 2.24, 2.28, 2.29 and 2.43), x86 EXEs and DLLs, tampered copies too. ASPack wipes the relocations and import table in memory, so mempe decompresses the originals straight out of the packed file and you get them back exactly, DLL names included. Builds before 2.2 never kept the original section flags, so those get reported as lost. 1.x and 2.000 get recognised but not restored yet |
+| MPRESS | Supported | 1.05 to 2.19 (tested on 1.05, 1.27, 2.05 and 2.19), x86 and x64, EXEs and DLLs, tampered copies too. Entry point, imports (ordinals included), DLL relocations, export forwarders and TLS come back, and the merged section gets split back into code and data. MPRESS throws away EXE relocations, debug data, parts of the load config and some x64 unwind info for good, so mempe reports those as lost |
 | VMProtect | Planned | Protector with code virtualization |
 | Themida / WinLicense | Planned | Protector with code virtualization |
 | Code Virtualizer | Planned | Virtualizer from the makers of Themida |
@@ -96,8 +98,6 @@ mempe snapshots the process, finds every module plus any PE hiding in non-image 
 | PELock | Planned | Protector |
 | Safengine Shielden | Planned | Protector with code virtualization |
 | EXECryptor | Planned | Protector with code morphing |
-| MPRESS | Planned | Compressor |
-| ASPack | Planned | Compressor |
 | PECompact | Planned | Compressor |
 | Petite | Planned | Compressor |
 | FSG | Planned | Compressor |

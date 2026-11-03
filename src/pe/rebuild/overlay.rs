@@ -32,6 +32,7 @@ pub(crate) fn append_overlay(rebuilt: &mut RebuiltImage, overlay: &[u8]) -> AppR
             "the overlay would exceed the output size limit",
         ));
     }
+
     rebuilt.bytes.resize(start, 0);
     rebuilt.bytes.extend_from_slice(overlay);
 
@@ -48,10 +49,13 @@ pub(crate) fn append_overlay(rebuilt: &mut RebuiltImage, overlay: &[u8]) -> AppR
             length,
         )?;
     }
+
     apply_checksum(&mut rebuilt.bytes, &model)?;
+
     if let Some(report) = &mut rebuilt.packer {
         report.restored.push("overlay");
     }
+
     Ok(())
 }
 

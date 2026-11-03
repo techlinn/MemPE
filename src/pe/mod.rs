@@ -12,7 +12,7 @@ pub(crate) use carve::{CarveResult, CarveSource, carve_embedded};
 pub(crate) use exports::{ExportIndex, ExportStats, embedded_module_name};
 pub(crate) use packers::PackerReport;
 pub(crate) use parse::memory_image_size;
-pub(crate) use rebuild::{RebuiltImage, append_overlay, overlay_offset, rebuild};
+pub(crate) use rebuild::{DiskImage, RebuiltImage, append_overlay, overlay_offset, rebuild};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RegionEvidence {
@@ -42,11 +42,20 @@ pub(crate) const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
 pub(crate) const EXPORT_DIRECTORY: usize = 0;
 pub(crate) const IMPORT_DIRECTORY: usize = 1;
 pub(crate) const RESOURCE_DIRECTORY: usize = 2;
+pub(crate) const EXCEPTION_DIRECTORY: usize = 3;
 pub(crate) const SECURITY_DIRECTORY: usize = 4;
 pub(crate) const BASERELOC_DIRECTORY: usize = 5;
 pub(crate) const DEBUG_DIRECTORY: usize = 6;
+pub(crate) const TLS_DIRECTORY: usize = 9;
+pub(crate) const LOAD_CONFIG_DIRECTORY: usize = 10;
 pub(crate) const BOUND_IMPORT_DIRECTORY: usize = 11;
 pub(crate) const IAT_DIRECTORY: usize = 12;
+pub(crate) const DELAY_IMPORT_DIRECTORY: usize = 13;
+pub(crate) const SECTION_HEADER_SIZE: usize = 40;
+pub(crate) const RUNTIME_FUNCTION_SIZE: usize = 12;
+pub(crate) const RELOCATION_HIGHLOW: u16 = 3;
+pub(crate) const RELOCATION_DIR64: u16 = 10;
+pub(crate) const DYNAMIC_BASE: u16 = 0x0040;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PeKind {

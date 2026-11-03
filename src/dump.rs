@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use crate::memory::{Capture, CapturedImage, RawRegion};
 use crate::output::{OutputFile, OutputPlan, WrittenFile};
 use crate::pe::{
-    self, CarveResult, CarveSource, EntryPointRva, ExportIndex, ExportStats, PackerReport, PeKind,
-    RebuiltImage,
+    self, CarveResult, CarveSource, DiskImage, EntryPointRva, ExportIndex, ExportStats,
+    PackerReport, PeKind, RebuiltImage,
 };
 use crate::process::TargetProcess;
 use crate::{AppError, AppResult};
@@ -229,6 +229,7 @@ impl BuildReport {
     pub(crate) fn write(self, output: &OutputPlan) -> AppResult<DumpOutcome> {
         let artifacts = output.write_all(self.files)?;
         let summary = DumpSummary::from_artifacts(&artifacts);
+
         Ok(DumpOutcome {
             artifacts,
             failures: self.failures,
@@ -292,9 +293,11 @@ impl DumpOutcome {
 impl DumpSummary {
     fn from_artifacts(artifacts: &[WrittenFile<ArtifactInfo>]) -> Self {
         let mut summary = Self::default();
+
         for artifact in artifacts.iter().filter(|entry| !entry.context.sidecar) {
             summary.add(&artifact.context);
         }
+
         summary
     }
 
@@ -356,10 +359,12 @@ impl DumpSummary {
                 .saturating_add(info.unreadable_pages);
             return;
         }
+
         if info.embedded {
             self.embedded_pes = self.embedded_pes.saturating_add(1);
             return;
         }
+
         self.add_imports(info);
         self.dlls = self.dlls.saturating_add(usize::from(!info.is_main));
         self.hidden_images = self.hidden_images.saturating_add(usize::from(info.hidden));
@@ -401,6 +406,7 @@ impl DumpSummary {
             .never_decrypted_sections
             .saturating_add(info.never_decrypted_sections);
         self.absent_sections = self.absent_sections.saturating_add(info.absent_sections);
+
         if let Some(packer) = &info.packer {
             self.partly_unpacked = self
                 .partly_unpacked
@@ -415,6 +421,7 @@ fn image_matches(image: &CapturedImage, want: &str) -> bool {
     {
         return image.base == base;
     }
+
     image
         .name
         .as_deref()
@@ -434,6 +441,7 @@ pub(crate) fn build(
         hidden_non_image_images: capture.images.iter().filter(|image| image.hidden).count(),
         main_image_missing: capture.main_image_missing,
     };
+
     let carve_regions = capture.carve_regions;
     let raw_regions = capture.raw_regions;
     let mut images = capture.images;
@@ -444,33 +452,43 @@ pub(crate) fn build(
             .iter()
             .map(|image| (image.base, image.bytes.as_slice(), image.name.as_deref())),
     );
+
     let export_stats = exports.stats();
     let mut report = empty_report(target, &images, export_stats, counts);
+
     if entry_point.is_some() && !images.iter().any(|image| image.is_main) {
         report.failures.push(BuildFailure {
             name: target.name.clone(),
             base: target.main_module.as_ref().map_or(0, |module| module.base),
             error: AppError::new("manual entry point requires a captured main image"),
         });
+
         return report;
     }
+
     if only.is_none() {
         push_region_embedded(&carve_regions, &mut report);
     }
+
     push_raw_regions(&raw_regions, &mut report);
+
     let mut selected = 0usize;
     for image in images {
         if only.is_some_and(|want| !image_matches(&image, want)) {
             continue;
         }
+
         selected = selected.saturating_add(1);
         push_embedded(target, &image, &mut report);
+
         let validates_manual_entry_point = image.is_main && entry_point.is_some();
         build_image(target, image, &exports, entry_point, &mut report);
+
         if validates_manual_entry_point && !report.main_rebuilt {
             break;
         }
     }
+
     report.selected_images = only.map(|_| selected);
     report
 }
@@ -480,10 +498,12 @@ fn push_region_embedded(regions: &[RawRegion], report: &mut BuildReport) {
         let CarveResult { found, unscanned } =
             pe::carve_embedded(&region.bytes, CarveSource::Buffer);
         report.counts.unscanned_bytes = report.counts.unscanned_bytes.saturating_add(unscanned);
+
         for (index, embedded) in found.into_iter().enumerate() {
             let Some(bytes) = copy_range(&region.bytes, embedded.offset, embedded.length) else {
                 continue;
             };
+
             report.files.push(OutputFile {
                 preferred_name: format!(
                     "region-{:016X}.embed{}.{}",
@@ -504,10 +524,13 @@ fn push_region_embedded(regions: &[RawRegion], report: &mut BuildReport) {
 fn push_raw_regions(regions: &[RawRegion], report: &mut BuildReport) {
     for region in regions {
         let mut bytes = Vec::new();
+
         if bytes.try_reserve_exact(region.bytes.len()).is_err() {
             continue;
         }
+
         bytes.extend_from_slice(&region.bytes);
+
         let stem = format!("region.{:016X}.{:X}", region.base, bytes.len());
         let notes = region_notes(region, bytes.len());
         report.files.push(OutputFile {
@@ -515,6 +538,7 @@ fn push_raw_regions(regions: &[RawRegion], report: &mut BuildReport) {
             bytes,
             context: ArtifactInfo::raw(region.base, region.unreadable_pages),
         });
+
         report.files.push(OutputFile {
             preferred_name: format!("{stem}.txt"),
             bytes: notes.into_bytes(),
@@ -550,10 +574,12 @@ fn push_embedded(target: &TargetProcess, image: &CapturedImage, report: &mut Bui
     let label = embedded_label(target, image);
     let CarveResult { found, unscanned } = pe::carve_embedded(&image.bytes, CarveSource::Image);
     report.counts.unscanned_bytes = report.counts.unscanned_bytes.saturating_add(unscanned);
+
     for (index, embedded) in found.into_iter().enumerate() {
         let Some(bytes) = copy_range(&image.bytes, embedded.offset, embedded.length) else {
             continue;
         };
+
         report.files.push(OutputFile {
             preferred_name: format!(
                 "{label}.embed{}.{}",
@@ -577,6 +603,7 @@ fn embedded_label(target: &TargetProcess, image: &CapturedImage) -> String {
     } else {
         return format!("module-{:016X}", image.base);
     };
+
     Path::new(name)
         .file_stem()
         .and_then(|stem| stem.to_str())
@@ -594,6 +621,7 @@ fn copy_range(bytes: &[u8], offset: usize, length: usize) -> Option<Vec<u8>> {
 
 fn prepare_images(images: &mut [CapturedImage]) {
     images.sort_unstable_by_key(|image| (!image.is_main, image.base));
+
     for image in images {
         if image.name.is_none() {
             image.name = pe::embedded_module_name(&image.bytes);
@@ -641,6 +669,7 @@ fn build_image(
     {
         Ok(rebuilt) if should_write(&image, &rebuilt, known_module) => {
             report.main_rebuilt |= image.is_main;
+
             let preferred_name = output_name(target, &image, &rebuilt);
             let context = artifact_info(&image, &rebuilt);
             report.files.push(OutputFile {
@@ -732,9 +761,11 @@ fn record_failure(
     } else {
         return;
     };
+
     if known_module && !image.is_main && !image.hidden {
         report.dll_failures = report.dll_failures.saturating_add(1);
     }
+
     report.failures.push(BuildFailure {
         name,
         base: image.base,
@@ -751,7 +782,10 @@ fn rebuild_image(
         &image.bytes,
         &image.regions,
         image.base,
-        None,
+        DiskImage {
+            headers: None,
+            file: packed_file(image),
+        },
         exports,
         entry_point,
         &image.page_flags,
@@ -770,18 +804,21 @@ fn rebuild_with_disk_headers(
     let Some(path) = &image.path else {
         return Err(memory_error);
     };
+
     if !image.image_backed {
         return Err(AppError::new(format!(
             "{memory_error}; refusing disk headers from {}: the memory at this base is no longer image-backed",
             path.display()
         )));
     }
+
     if image.path_mismatch {
         return Err(AppError::new(format!(
             "{memory_error}; refusing disk headers from {}: a different file is mapped at this base",
             path.display()
         )));
     }
+
     let disk_headers = read_disk_headers(path).map_err(|disk_error| {
         AppError::new(format!(
             "{memory_error}; could not read disk headers from {}: {disk_error}",
@@ -792,7 +829,10 @@ fn rebuild_with_disk_headers(
         &image.bytes,
         &image.regions,
         image.base,
-        Some(&disk_headers),
+        DiskImage {
+            headers: Some(&disk_headers),
+            file: Some(path),
+        },
         exports,
         entry_point,
         &image.page_flags,
@@ -804,24 +844,30 @@ fn with_overlay(image: &CapturedImage, mut rebuilt: RebuiltImage) -> RebuiltImag
         .packer
         .as_ref()
         .is_some_and(|report| !report.restored.is_empty());
-    let Some(path) = image
-        .path
-        .as_ref()
-        .filter(|_| unpacked && image.image_backed && !image.path_mismatch)
-    else {
+    let Some(path) = packed_file(image).filter(|_| unpacked) else {
         return rebuilt;
     };
+
     let appended = match read_overlay(path) {
         Ok(None) => return rebuilt,
         Ok(Some(overlay)) => pe::append_overlay(&mut rebuilt, &overlay).is_ok(),
         Err(_) => false,
     };
+
     if !appended && let Some(report) = &mut rebuilt.packer {
         report
             .unrestored
             .push("overlay (the packed file could not be read or appended)");
     }
+
     rebuilt
+}
+
+fn packed_file(image: &CapturedImage) -> Option<&Path> {
+    image
+        .path
+        .as_deref()
+        .filter(|_| image.image_backed && !image.path_mismatch)
 }
 
 fn read_overlay(path: &Path) -> AppResult<Option<Vec<u8>>> {
@@ -829,13 +875,17 @@ fn read_overlay(path: &Path) -> AppResult<Option<Vec<u8>>> {
     let Some(start) = pe::overlay_offset(&headers) else {
         return Ok(None);
     };
+
     let unreadable =
         |error: std::io::Error| AppError::new(format!("cannot read {}: {error}", path.display()));
     let mut file = File::open(path).map_err(unreadable)?;
+
     if file.metadata().map_err(unreadable)?.len() <= start {
         return Ok(None);
     }
+
     file.seek(SeekFrom::Start(start)).map_err(unreadable)?;
+
     let mut overlay = Vec::new();
     file.take(MAX_OVERLAY_BYTES)
         .read_to_end(&mut overlay)
@@ -857,8 +907,10 @@ fn output_name(target: &TargetProcess, image: &CapturedImage, rebuilt: &RebuiltI
     if image.is_main {
         return with_extension(&target.name, "exe");
     }
+
     let fallback = format!("module-{:016X}.dll", image.base);
     let name = image.name.as_deref().unwrap_or(&fallback);
+
     if rebuilt.is_dll {
         with_extension(name, "dll")
     } else {

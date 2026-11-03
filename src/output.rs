@@ -57,6 +57,7 @@ pub(crate) fn prepare() -> AppResult<Option<OutputPlan>> {
             directory.display()
         )));
     }
+
     let has_entries = if directory.is_dir() {
         directory
             .read_dir()
@@ -68,6 +69,7 @@ pub(crate) fn prepare() -> AppResult<Option<OutputPlan>> {
     } else {
         false
     };
+
     let policy = if has_entries {
         match collision_policy()? {
             Some(policy) => policy,
@@ -76,6 +78,7 @@ pub(crate) fn prepare() -> AppResult<Option<OutputPlan>> {
     } else {
         CollisionPolicy::Rename
     };
+
     Ok(Some(OutputPlan { directory, policy }))
 }
 
@@ -88,6 +91,7 @@ impl OutputPlan {
         if files.is_empty() {
             return Ok(Vec::new());
         }
+
         fs::create_dir_all(&self.directory)
             .map_err(|error| AppError::new(format!("cannot create mempe: {error}")))?;
         let destinations = self.destinations(&files)?;
@@ -102,6 +106,7 @@ impl OutputPlan {
                 final_path: destination,
                 saved: false,
             };
+
             handle
                 .write_all(&file.bytes)
                 .and_then(|_| handle.flush())
@@ -123,6 +128,7 @@ impl OutputPlan {
                         file.final_path.display()
                     )));
                 }
+
                 if self.policy == CollisionPolicy::Overwrite {
                     fs::remove_file(&file.final_path).map_err(|error| {
                         AppError::new(format!(
@@ -132,6 +138,7 @@ impl OutputPlan {
                     })?;
                 }
             }
+
             fs::rename(&file.path, &file.final_path).map_err(|error| {
                 AppError::new(format!(
                     "cannot save {}: {error}",
@@ -144,6 +151,7 @@ impl OutputPlan {
                 context,
             });
         }
+
         Ok(written)
     }
 
@@ -155,6 +163,7 @@ impl OutputPlan {
             let destination = self.unique_destination(&name, &mut used)?;
             destinations.push(destination);
         }
+
         Ok(destinations)
     }
 
@@ -165,21 +174,26 @@ impl OutputPlan {
             } else {
                 suffixed_name(name, suffix)
             };
+
             let key = candidate.to_ascii_lowercase();
             let path = self.directory.join(&candidate);
             let occupied_by_disk = self.policy == CollisionPolicy::Rename && path.exists();
+
             if !occupied_by_disk && used.insert(key) {
                 return Ok(path);
             }
         }
+
         Err(AppError::new("could not find a free output file name"))
     }
 
     fn create_temporary(&self, index: usize) -> AppResult<(PathBuf, File)> {
         let own_pid = std::process::id();
+
         for attempt in 0..MAX_TEMP_ATTEMPTS {
             let name = format!(".mempe-{own_pid}-{index}-{attempt}.tmp");
             let path = self.directory.join(name);
+
             match OpenOptions::new().write(true).create_new(true).open(&path) {
                 Ok(file) => return Ok((path, file)),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -190,6 +204,7 @@ impl OutputPlan {
                 }
             }
         }
+
         Err(AppError::new(
             "could not make a temporary file after 1024 tries",
         ))
@@ -200,6 +215,7 @@ fn collision_policy() -> AppResult<Option<CollisionPolicy>> {
     if !std::io::stdin().is_terminal() {
         return Ok(Some(CollisionPolicy::Rename));
     }
+
     print!(
         "mempe already contains files.\n[O]verwrite matching files, [R]ename conflicts, or [C]ancel? [R]: "
     );
@@ -207,6 +223,7 @@ fn collision_policy() -> AppResult<Option<CollisionPolicy>> {
         .flush()
         .map_err(|error| AppError::new(format!("cannot show the file prompt: {error}")))?;
     let input = read_prompt()?;
+
     match input.trim().to_ascii_lowercase().as_str() {
         "" | "r" | "rename" => Ok(Some(CollisionPolicy::Rename)),
         "o" | "overwrite" => Ok(Some(CollisionPolicy::Overwrite)),
@@ -221,6 +238,7 @@ fn read_prompt() -> AppResult<String> {
     let mut input = Vec::with_capacity(MAX_PROMPT_BYTES);
     let mut byte = [0u8; 1];
     let mut stdin = std::io::stdin().lock();
+
     for _index in 0..MAX_PROMPT_BYTES {
         let read = stdin
             .read(&mut byte)
@@ -228,10 +246,12 @@ fn read_prompt() -> AppResult<String> {
         if read == 0 || byte[0] == b'\n' {
             break;
         }
+
         if byte[0] != b'\r' {
             input.push(byte[0]);
         }
     }
+
     String::from_utf8(input).map_err(|_| AppError::new("collision choice is not valid UTF-8"))
 }
 
@@ -254,12 +274,15 @@ fn clean_name(name: &str) -> AppResult<String> {
     while cleaned.ends_with([' ', '.']) {
         cleaned.pop();
     }
+
     if cleaned.is_empty() {
         return Err(AppError::new("output file name is empty"));
     }
+
     if is_reserved_windows_name(&cleaned) {
         cleaned.insert(0, '_');
     }
+
     Ok(cleaned)
 }
 

@@ -35,13 +35,16 @@ pub(super) fn build_output_buffer<'a>(
             "rebuilt PE exceeds the 1 GiB output safety limit",
         ));
     }
+
     let mut output = Vec::new();
     output
         .try_reserve_exact(output_size)
         .map_err(|_| AppError::new("not enough memory for the rebuilt PE"))?;
     output.resize(output_size, 0);
+
     let copied_headers = header_size.min(memory.len());
     output[..copied_headers].copy_from_slice(&memory[..copied_headers]);
+
     Ok((output, layouts, header_size))
 }
 
@@ -52,6 +55,7 @@ fn header_size(
 ) -> AppResult<usize> {
     let alignment = model.file_alignment as usize;
     let minimum = align_up(section_table_end, alignment)?;
+
     if !reserve_import_header {
         return Ok(minimum);
     }
@@ -59,6 +63,7 @@ fn header_size(
     let next_header_end = section_table_end.saturating_add(SECTION_HEADER_SIZE); // the .mempe header
     let with_room = align_up(next_header_end, alignment)?;
     let first_section = first_section_rva(&model.sections).unwrap_or(usize::MAX);
+
     Ok(if with_room <= first_section {
         with_room
     } else {
@@ -74,6 +79,7 @@ pub(super) fn write_sections(
     let mut renamed = 0usize;
     for (index, layout) in layouts.iter().enumerate() {
         let header = layout.model.header_offset;
+
         if let Some(name) = unique_replacement_name(layouts, index) {
             output
                 .get_mut(header..header.saturating_add(SECTION_NAME_SIZE))
@@ -81,6 +87,7 @@ pub(super) fn write_sections(
                 .copy_from_slice(&name);
             renamed = renamed.saturating_add(1);
         }
+
         write_u32(
             output,
             header.saturating_add(16),
@@ -93,9 +100,11 @@ pub(super) fn write_sections(
             u32::try_from(layout.raw_offset)
                 .map_err(|_| AppError::new("section file offset does not fit a PE field"))?,
         )?;
+
         if layout.raw_size == 0 {
             continue;
         }
+
         let source_offset = layout.model.virtual_address.get() as usize;
         let source_end = source_offset
             .checked_add(layout.source_length)
@@ -112,6 +121,7 @@ pub(super) fn write_sections(
             .ok_or_else(|| AppError::new("section output range is outside rebuilt PE"))?
             .copy_from_slice(source);
     }
+
     Ok(renamed)
 }
 
@@ -123,10 +133,13 @@ pub(super) fn recover_section_headers(
     if regions.is_empty() {
         return Ok(None);
     }
+
     let mut sections = model.sections.iter().collect::<Vec<_>>();
     sections.sort_unstable_by_key(|section| section.virtual_address);
+
     let mut recovered = None;
     let mut image_end = model.image_size as usize;
+
     for (index, section) in sections.iter().enumerate() {
         let start = section.virtual_address.get() as usize;
         let limit = sections
@@ -137,6 +150,7 @@ pub(super) fn recover_section_headers(
         if start >= limit {
             continue;
         }
+
         let declared = section.virtual_size.max(section.raw_size) as usize;
         let expanded = expanded_section_length(memory, regions, start, limit, declared);
         let section_end = start.saturating_add(expanded).min(limit);
@@ -153,6 +167,7 @@ pub(super) fn recover_section_headers(
             )?;
             image_end = image_end.max(start.saturating_add(expanded));
         }
+
         if characteristics != section.characteristics {
             let output = recovered.get_or_insert_with(|| memory.to_vec());
             write_u32(
@@ -162,6 +177,7 @@ pub(super) fn recover_section_headers(
             )?;
         }
     }
+
     if image_end > model.image_size as usize {
         let image_size = align_up(image_end, model.section_alignment as usize)?;
         let image_size = u32::try_from(image_size)
@@ -169,6 +185,7 @@ pub(super) fn recover_section_headers(
         let output = recovered.get_or_insert_with(|| memory.to_vec());
         write_u32(output, model.size_of_image_offset, image_size)?;
     }
+
     Ok(recovered)
 }
 
@@ -181,20 +198,25 @@ fn expanded_section_length(
 ) -> usize {
     let scan_start = start.saturating_add(declared).min(limit);
     let mut last_byte = scan_start;
+
     for region in regions.iter().filter(|region| region.readable) {
         let region_end = region.offset.saturating_add(region.size);
         let range_start = scan_start.max(region.offset);
         let range_end = limit.min(region_end).min(memory.len());
+
         if range_start >= range_end {
             continue;
         }
+
         let Some(bytes) = memory.get(range_start..range_end) else {
             continue;
         };
+
         if let Some(index) = bytes.iter().rposition(|byte| *byte != 0) {
             last_byte = last_byte.max(range_start.saturating_add(index).saturating_add(1));
         }
     }
+
     last_byte.saturating_sub(start).max(declared)
 }
 
@@ -206,15 +228,19 @@ fn recovered_characteristics(
 ) -> u32 {
     let coverage = ProtectionCoverage::measure(regions, start, end);
     let mut recovered = characteristics;
+
     if coverage.executable > 0 {
         recovered |= IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_CNT_CODE;
     }
+
     if coverage.readable > 0 {
         recovered |= IMAGE_SCN_MEM_READ;
     }
+
     if coverage.write_is_substantial(end.saturating_sub(start)) {
         recovered |= IMAGE_SCN_MEM_WRITE;
     }
+
     recovered
 }
 
@@ -229,25 +255,32 @@ struct ProtectionCoverage {
 impl ProtectionCoverage {
     fn measure(regions: &[RegionEvidence], start: usize, end: usize) -> Self {
         let mut coverage = Self::default();
+
         for region in regions {
             let region_end = region.offset.saturating_add(region.size);
             let overlap_start = start.max(region.offset);
             let overlap_end = end.min(region_end);
             let bytes = overlap_end.saturating_sub(overlap_start);
+
             if bytes == 0 {
                 continue;
             }
+
             coverage.committed = coverage.committed.saturating_add(bytes);
+
             if region.readable {
                 coverage.readable = coverage.readable.saturating_add(bytes);
             }
+
             if region.writable {
                 coverage.writable = coverage.writable.saturating_add(bytes);
             }
+
             if region.executable {
                 coverage.executable = coverage.executable.saturating_add(bytes);
             }
         }
+
         coverage
     }
 
@@ -255,6 +288,7 @@ impl ProtectionCoverage {
         if self.committed == 0 || self.writable == 0 {
             return false;
         }
+
         let unanimous = self.writable >= section_size && self.committed >= section_size;
         let substantial = self.writable >= PAGE_SIZE.saturating_mul(2)
             && self.writable.saturating_mul(2) >= section_size;
@@ -269,8 +303,10 @@ fn layout_sections<'a>(
 ) -> AppResult<Vec<SectionLayout<'a>>> {
     let mut sections = model.sections.iter().collect::<Vec<_>>();
     sections.sort_unstable_by_key(|section| section.virtual_address);
+
     let mut layouts = Vec::with_capacity(sections.len());
     let mut raw_offset = header_size;
+
     for (index, section) in sections.iter().enumerate() {
         let source_offset = section.virtual_address.get() as usize;
         let declared_length = section.virtual_size.max(section.raw_size) as usize;
@@ -293,10 +329,12 @@ fn layout_sections<'a>(
             raw_offset: if raw_size == 0 { 0 } else { raw_offset },
             raw_size,
         });
+
         raw_offset = raw_offset
             .checked_add(raw_size)
             .ok_or_else(|| AppError::new("rebuilt section layout overflowed"))?;
     }
+
     Ok(layouts)
 }
 
@@ -309,6 +347,7 @@ fn section_is_zero(memory: &[u8], offset: usize, length: usize) -> bool {
 fn unique_replacement_name(layouts: &[SectionLayout<'_>], index: usize) -> Option<[u8; 8]> {
     let current = layouts.get(index)?;
     let mut position = index.saturating_add(1);
+
     for _attempt in 0..MAX_RENAME_ATTEMPTS {
         let candidate = readable_section_name(current.model.name(), position)?;
         let taken = layouts
@@ -318,8 +357,10 @@ fn unique_replacement_name(layouts: &[SectionLayout<'_>], index: usize) -> Optio
         if !taken {
             return Some(candidate);
         }
+
         position = position.saturating_add(layouts.len());
     }
+
     None
 }
 
@@ -336,9 +377,11 @@ pub(super) fn readable_section_name(name: &[u8; 8], position: usize) -> Option<[
     if readable {
         return None;
     }
+
     let text = format!(".sec{position:02}");
     let bytes = text.as_bytes();
     let mut replacement = [0u8; SECTION_NAME_SIZE];
     replacement.get_mut(..bytes.len())?.copy_from_slice(bytes);
+
     Some(replacement)
 }

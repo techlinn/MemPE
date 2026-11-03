@@ -1,18 +1,19 @@
 use super::tables::{
-    DEBUG_ENTRY_SIZE, DEBUG_TYPE_CODEVIEW, DEBUG_TYPE_OFFSET, Restoration, clear_directory,
-    codeview_entry, exports_intact, find_codeview_record, is_free, moved_export_directory, place,
+    DEBUG_ENTRY_SIZE, DEBUG_TYPE_CODEVIEW, DEBUG_TYPE_OFFSET, RESOURCE_DATA_SIZE_OFFSET,
+    Restoration, SECTION_COUNT_OFFSET, SECTION_RVA_OFFSET, clear_directory, codeview_entry,
+    exports_intact, find_codeview_record, is_free, moved_export_directory, place, read_c_string,
     relocation_blocks, relocations_intact, resources_intact, set_directory, walk_resources,
 };
 use super::{
-    HeaderSource, ImportedFunction, ModuleImports, PackerFindings, PackerImports, PackerReport,
-    Unpacked, find_pattern,
+    HeaderSource, ImportedFunction, ModuleImports, Origin, PackerFindings, PackerImports,
+    PackerReport, Unpacked, find_pattern,
 };
 use crate::pe::image::{read_u16, read_u32, write_u32};
 use crate::pe::parse::parse_memory_image;
 use crate::pe::{
     BASERELOC_DIRECTORY, BOUND_IMPORT_DIRECTORY, DEBUG_DIRECTORY, EXPORT_DIRECTORY,
     IMAGE_SCN_MEM_WRITE, IMPORT_DIRECTORY, PeImage, PeKind, PeModel, RESOURCE_DIRECTORY, Rva,
-    SectionModel,
+    SECTION_HEADER_SIZE, SectionModel,
 };
 
 const NAME: &str = "UPX";
@@ -25,9 +26,6 @@ const FILE_HEADER_END: usize = 24; // signature plus file header
 const TIMESTAMP_OFFSET: usize = 8;
 const OPTIONAL_SIZE_OFFSET: usize = 20;
 const FILE_FLAGS_OFFSET: usize = 22;
-const SECTION_COUNT_OFFSET: usize = 6;
-const SECTION_HEADER_SIZE: usize = 40;
-const SECTION_RVA_OFFSET: usize = 12;
 const RELOCS_STRIPPED: u16 = 0x0001;
 const EXTRA_INFO_SCAN: usize = 0x1000;
 const EXTRA_INFO_OFFSET_SIZE: usize = 4; // the u32 that ends extra info and points back at its start
@@ -48,7 +46,6 @@ const ORDINAL_RECORD_SIZE: usize = 3; // tag and u16 ordinal
 const THUNK_RECORD_SIZE: usize = 5; // tag and u32 thunk
 const MAX_IMPORT_MODULES: usize = 4_096;
 const MAX_IMPORT_FUNCTIONS: usize = 65_536;
-const MAX_NAME_LENGTH: usize = 4_096;
 const MAX_RELOCATIONS: usize = 1 << 22;
 const RELOCATION_STREAM_ORIGIN: isize = -4; // upx counts the first delta from here
 const LONG_DELTA: u8 = 0xF0; // marks a 3 or 7 byte relocation delta
@@ -60,7 +57,6 @@ const REL_BASED_LOW: u16 = 2;
 const REL_BASED_HIGHLOW: u16 = 3;
 const REL_BASED_DIR64: u16 = 10;
 const EMPTY_RELOCATION_BLOCK: [u8; 8] = [0, 0, 0, 0, 8, 0, 0, 0];
-const RESOURCE_DATA_SIZE_OFFSET: usize = 4;
 const ORIGINAL_RVA_PREFIX: usize = 4; // upx stores each kept leaf after its original rva
 
 struct StubShape {
@@ -120,22 +116,25 @@ struct ListedModule {
     functions: Vec<ImportedFunction>,
 }
 
-pub(super) fn unpack(image: &PeImage<'_>, headers: HeaderSource) -> Option<Unpacked> {
+pub(super) fn unpack(image: &PeImage<'_>, origin: &Origin<'_>) -> Option<Unpacked> {
     let model = image.model();
     let bytes = image.bytes();
     let image_start = model.sections().first()?.virtual_address().as_usize();
     let stub = find_stub(bytes, model);
     let pack_header = find_pack_header(bytes);
+
     if stub.is_none() && pack_header.is_none() {
         return None;
     }
+
     let version = pack_header
         .as_ref()
         .and_then(|header| header.version.clone());
 
     let expects_completion_mark = stub.as_ref().is_some_and(|stub| stub.marks_completion)
-        && matches!(headers, HeaderSource::Memory);
+        && matches!(origin.headers, HeaderSource::Memory);
     let ready = stub_finished(model) || !expects_completion_mark;
+
     if ready {
         let restored = restore(
             image,
@@ -144,30 +143,22 @@ pub(super) fn unpack(image: &PeImage<'_>, headers: HeaderSource) -> Option<Unpac
             image_start,
             version.clone(),
         );
+
         if restored.is_some() {
             return restored;
         }
     }
+
     if !stub.is_some_and(|stub| stub.recognised) {
         return None;
     }
+
     let reason = match ready {
         true => "image (its stored headers were not found)",
         false => "image (the stub had not finished unpacking)",
     };
-    Some(Unpacked {
-        image: None,
-        findings: PackerFindings {
-            report: PackerReport {
-                name: NAME,
-                version,
-                restored: Vec::new(),
-                unrestored: vec![reason],
-                lost: Vec::new(),
-            },
-            imports: PackerImports::Intact,
-        },
-    })
+
+    Some(Unpacked::detected_only(NAME, version, reason))
 }
 
 fn stub_finished(model: &PeModel) -> bool {
@@ -213,6 +204,7 @@ fn restore_from(
     let model = image.model();
     let mut restored = image.bytes().to_vec();
     write_stored_headers(&mut restored, model.nt_offset, stored, image_start)?;
+
     let restored_model = parse_memory_image(&restored).ok()?.model;
     let stub_list = stub
         .and_then(|stub| stub.import_loop.as_ref())
@@ -227,26 +219,28 @@ fn restore_from(
         names,
     )?;
 
-    let mut report = PackerReport {
-        name: NAME,
-        version,
-        restored: vec!["headers"],
-        unrestored: Vec::new(),
-        lost: Vec::new(),
-    };
+    let mut report = PackerReport::new(NAME, version);
+    report.restored.push("headers");
+
     if read_u32(&restored, restored_model.entry_point_offset).ok()? != 0 {
         report.restored.push("entry point");
     }
+
     let imports = restore_imports(image.bytes(), names, &extra, image_start, &mut report);
+
     if !matches!(imports, PackerImports::Intact) {
         clear_directory(&mut restored, &restored_model, BOUND_IMPORT_DIRECTORY);
     }
+
     let relocations = restore_relocations(&mut restored, &restored_model, &extra, image_start);
-    record(&mut report, "relocations", relocations);
+    report.record("relocations", relocations);
+
     let exports = restore_exports(&mut restored, &restored_model, image);
-    record(&mut report, "exports", exports);
+    report.record("exports", exports);
+
     let resources = restore_resources(&mut restored, &restored_model, image, image_start);
-    record(&mut report, "resources", resources);
+    report.record("resources", resources);
+
     restore_debug_directory(&mut restored, &restored_model, stored, &mut report);
     parse_memory_image(&restored).ok()?;
 
@@ -254,15 +248,6 @@ fn restore_from(
         image: Some(restored),
         findings: PackerFindings { report, imports },
     })
-}
-
-fn record(report: &mut PackerReport, part: &'static str, state: Restoration) {
-    match state {
-        Restoration::Restored => report.restored.push(part),
-        Restoration::Failed => report.unrestored.push(part),
-        Restoration::Lost => report.lost.push(part),
-        Restoration::Absent => {}
-    }
 }
 
 fn import_names(image: &PeImage<'_>, stub: Option<&Stub>, image_start: usize) -> Option<usize> {
@@ -284,10 +269,12 @@ fn restore_imports(
     let Some(list) = extra.import_list else {
         return PackerImports::Intact;
     };
+
     if extra.exact.is_some() {
         report.restored.push("imports");
         return PackerImports::Intact;
     }
+
     match names.and_then(|names| parse_import_list(bytes, list, names, image_start)) {
         Some(modules) => {
             report.restored.push("imports");
@@ -307,6 +294,7 @@ fn find_stub(bytes: &[u8], model: &PeModel) -> Option<Stub> {
         PeKind::Pe32Plus => &X64_STUB,
         PeKind::Pe32 => &X86_STUB,
     };
+
     let entry = Rva(read_u32(bytes, model.entry_point_offset).ok()?);
     let sections = model.sections();
     let entry_section = sections.iter().find(|section| section.contains_rva(entry));
@@ -331,16 +319,20 @@ fn stub_in_section(bytes: &[u8], section: &SectionModel, shape: &StubShape) -> O
             let at = start.checked_add(at)?.checked_add(offset)?;
             Some(read_u32(bytes, at).ok()? as usize)
         };
+
         Some(ImportLoop {
             list: operand(shape.import_list_operand)?,
             names: operand(shape.import_names_operand)?,
         })
     });
+
     let stack_clear_core = find_pattern(code, shape.stack_clear_core).is_some();
     let stack_clear = stack_clear_core && find_pattern(code, shape.stack_clear).is_some();
+
     if import_loop.is_none() && !stack_clear_core {
         return None;
     }
+
     Some(Stub {
         recognised: import_loop.is_some() || stack_clear,
         marks_completion: stack_clear_core,
@@ -373,11 +365,14 @@ fn parse_import_list(
 fn read_import_list(bytes: &[u8], start: usize) -> Option<(Vec<ListedModule>, usize)> {
     let mut modules = Vec::new();
     let mut at = start;
+
     while modules.len() < MAX_IMPORT_MODULES {
         let name_offset = read_u32(bytes, at).ok()? as usize;
+
         if name_offset == 0 {
             return Some((modules, at.checked_add(4)?));
         }
+
         let iat_offset = read_u32(bytes, at.checked_add(MODULE_IAT_OFFSET)?).ok()? as usize;
         let (functions, next) = parse_import_functions(bytes, at.checked_add(MODULE_HEADER_SIZE)?)?;
         modules.push(ListedModule {
@@ -385,14 +380,17 @@ fn read_import_list(bytes: &[u8], start: usize) -> Option<(Vec<ListedModule>, us
             iat_offset,
             functions,
         });
+
         at = next;
     }
+
     None
 }
 
 fn parse_import_functions(bytes: &[u8], start: usize) -> Option<(Vec<ImportedFunction>, usize)> {
     let mut functions = Vec::new();
     let mut at = start;
+
     while functions.len() < MAX_IMPORT_FUNCTIONS {
         match *bytes.get(at)? {
             0 => return Some((functions, at.checked_add(1)?)),
@@ -414,17 +412,8 @@ fn parse_import_functions(bytes: &[u8], start: usize) -> Option<(Vec<ImportedFun
             _ => return None,
         }
     }
-    None
-}
 
-fn read_c_string(bytes: &[u8], at: usize) -> Option<(String, usize)> {
-    let tail = bytes.get(at..)?;
-    let length = tail
-        .iter()
-        .take(MAX_NAME_LENGTH)
-        .position(|byte| *byte == 0)?;
-    let text = std::str::from_utf8(tail.get(..length)?).ok()?;
-    (!text.is_empty()).then(|| (text.to_owned(), at.saturating_add(length).saturating_add(1)))
+    None
 }
 
 struct PackHeader {
@@ -498,6 +487,7 @@ fn stored_headers_at(bytes: &[u8], offset: usize, image_start: usize) -> Option<
     if bytes.get(offset..offset.checked_add(PE_SIGNATURE.len())?)? != PE_SIGNATURE {
         return None;
     }
+
     let optional_size =
         usize::from(read_u16(bytes, offset.checked_add(OPTIONAL_SIZE_OFFSET)?).ok()?);
     let sections = usize::from(read_u16(bytes, offset.checked_add(SECTION_COUNT_OFFSET)?).ok()?);
@@ -505,13 +495,16 @@ fn stored_headers_at(bytes: &[u8], offset: usize, image_start: usize) -> Option<
         .checked_add(FILE_HEADER_END)?
         .checked_add(optional_size)?;
     let first_section = read_u32(bytes, table.checked_add(SECTION_RVA_OFFSET)?).ok()? as usize;
+
     if sections == 0 || first_section != image_start {
         return None;
     }
+
     let length = table
         .checked_add(sections.checked_mul(SECTION_HEADER_SIZE)?)?
         .checked_sub(offset)?;
     bytes.get(offset..offset.checked_add(length)?)?;
+
     Some(StoredHeaders { offset, length })
 }
 
@@ -522,14 +515,17 @@ fn write_stored_headers(
     image_start: usize,
 ) -> Option<()> {
     let end = nt_offset.checked_add(stored.length)?;
+
     if end > image_start {
         return None;
     }
+
     let headers = restored
         .get(stored.offset..stored.offset.checked_add(stored.length)?)?
         .to_vec();
     restored.get_mut(nt_offset..end)?.copy_from_slice(&headers);
     restored.get_mut(end..image_start)?.fill(0);
+
     Some(())
 }
 
@@ -543,14 +539,18 @@ fn read_extra_fields(
 ) -> Option<ExtraFields> {
     let mut cursor = stored.offset.checked_add(stored.length)?;
     let mut import_list = None;
+
     if model.directory(restored, IMPORT_DIRECTORY).ok()?.is_some() {
         let listed = read_u32(restored, cursor).ok()? as usize;
+
         if stub_list.is_some_and(|list| list != listed) {
             return None;
         }
+
         import_list = Some(listed);
         cursor = cursor.checked_add(IMPORT_FIELDS_SIZE)?;
     }
+
     let confirmed_by_imports = import_list.is_some_and(|list| {
         stub_list.is_some()
             || names.is_some_and(|names| {
@@ -573,6 +573,7 @@ fn read_extra_fields(
             start,
             flags: stream_flags,
         });
+
         cursor = cursor.checked_add(RELOCATION_FIELDS_SIZE)?;
     }
 
@@ -586,6 +587,7 @@ fn read_extra_fields(
         true => [with_icons, cursor],
         false => [cursor, cursor],
     };
+
     if candidates
         .iter()
         .any(|end| read_u32(restored, *end).ok() == Some(offset_field))
@@ -596,12 +598,14 @@ fn read_extra_fields(
             exact: None,
         });
     }
+
     let exact = candidates
         .iter()
         .find_map(|end| exact_trailer(restored, *end, offset_field));
     if exact.is_none() && !confirmed_by_imports {
         return None;
     }
+
     Some(ExtraFields {
         import_list,
         relocations,
@@ -624,9 +628,11 @@ fn walk_relocations(bytes: &[u8], start: usize) -> Option<(Vec<usize>, usize)> {
     let mut positions = Vec::new();
     let mut position = RELOCATION_STREAM_ORIGIN;
     let mut at = start;
+
     while positions.len() < MAX_RELOCATIONS {
         let lead = *bytes.get(at)?;
         at = at.checked_add(1)?;
+
         let delta = match lead {
             0 => return Some((positions, at)),
             LONG_DELTA if bytes.get(at..at.checked_add(2)?)? == [0, 0] => {
@@ -642,35 +648,45 @@ fn walk_relocations(bytes: &[u8], start: usize) -> Option<(Vec<usize>, usize)> {
             }
             lead => usize::from(lead),
         };
+
         position = position.checked_add_unsigned(delta)?;
         positions.push(usize::try_from(position).ok()?);
     }
+
     None
 }
 
 fn sixteen_bit_relocations(bytes: &[u8], start: usize, flags: u8) -> Option<Vec<(usize, u16)>> {
     let mut lists = Vec::new();
+
     if flags & LOW_LIST != 0 {
         lists.push(REL_BASED_LOW);
     }
+
     if flags & HIGH_LIST != 0 {
         lists.push(REL_BASED_HIGH);
     }
+
     let mut entries = Vec::new();
     let mut at = start;
+
     for kind in lists {
         loop {
             let offset = read_u32(bytes, at).ok()? as usize;
             at = at.checked_add(4)?;
+
             if offset == 0 {
                 break;
             }
+
             if entries.len() >= MAX_RELOCATIONS {
                 return None;
             }
+
             entries.push((offset, kind));
         }
     }
+
     Some(entries)
 }
 
@@ -688,6 +704,7 @@ fn decode_relocations(
     if stream.flags & (LOW_LIST | HIGH_LIST) != 0 {
         entries.extend(sixteen_bit_relocations(bytes, end, stream.flags)?);
     }
+
     entries
         .into_iter()
         .map(|(offset, kind)| Some((u32::try_from(image_start.checked_add(offset)?).ok()?, kind)))
@@ -703,12 +720,14 @@ fn restore_relocations(
     let Ok(Some(directory)) = model.directory(restored, BASERELOC_DIRECTORY) else {
         return Restoration::Absent;
     };
+
     if read_u16(restored, model.nt_offset.saturating_add(FILE_FLAGS_OFFSET))
         .is_ok_and(|flags| flags & RELOCS_STRIPPED != 0)
     {
         clear_directory(restored, model, BASERELOC_DIRECTORY);
         return Restoration::Lost;
     }
+
     let start = directory.rva().as_usize();
     let size = directory.size() as usize;
     let rebuilds = extra
@@ -717,6 +736,7 @@ fn restore_relocations(
     if relocations_intact(restored, start, size) || !rebuilds {
         return Restoration::Restored;
     }
+
     if size == EMPTY_RELOCATION_BLOCK.len() {
         return match place(restored, start, &EMPTY_RELOCATION_BLOCK) {
             Some(()) => Restoration::Restored,
@@ -728,6 +748,7 @@ fn restore_relocations(
         PeKind::Pe32Plus => REL_BASED_DIR64,
         PeKind::Pe32 => REL_BASED_HIGHLOW,
     };
+
     let rebuilt = extra
         .relocations
         .as_ref()
@@ -749,10 +770,13 @@ fn restore_exports(restored: &mut [u8], model: &PeModel, packed: &PeImage<'_>) -
     let Ok(Some(original)) = model.directory(restored, EXPORT_DIRECTORY) else {
         return Restoration::Absent;
     };
+
     let destination = original.rva().as_usize();
+
     if exports_intact(restored, destination) {
         return Restoration::Restored;
     }
+
     let moved = packed
         .directory(EXPORT_DIRECTORY)
         .ok()
@@ -782,20 +806,26 @@ fn restore_resources(
     let Ok(Some(destination)) = model.directory(restored, RESOURCE_DIRECTORY) else {
         return Restoration::Absent;
     };
+
     let rva = destination.rva().as_usize();
     let tree = packed_resources(packed, image_start);
+
     if resources_intact(restored, rva) {
         if let Some(tree) = &tree {
             tree.return_kept_leaves(restored, rva);
         }
+
         return Restoration::Restored;
     }
+
     let moved = tree.and_then(|tree| {
         if !tree.fits(restored, rva, destination.size() as usize) {
             return None;
         }
+
         tree.apply(restored, rva)
     });
+
     match moved {
         Some(()) => Restoration::Restored,
         None => {
@@ -814,17 +844,21 @@ fn restore_debug_directory(
     let Ok(Some(directory)) = model.directory(restored, DEBUG_DIRECTORY) else {
         return;
     };
+
     let start = directory.rva().as_usize();
     let Some(table) = restored.get(start..start.saturating_add(directory.size() as usize)) else {
         return;
     };
+
     let entries = table.as_chunks::<DEBUG_ENTRY_SIZE>().0;
     let is_erased = |entry: &&[u8; DEBUG_ENTRY_SIZE]| entry.iter().all(|byte| *byte == 0);
     let erased = entries.iter().filter(is_erased).count();
+
     if erased == 0 {
         report.restored.push("debug directory");
         return;
     }
+
     let mut kept = entries
         .iter()
         .filter(|entry| !is_erased(entry))
@@ -840,7 +874,9 @@ fn restore_debug_directory(
             find_codeview_record(restored).and_then(|record| codeview_entry(&record, timestamp))
         }
     };
+
     kept.extend(codeview);
+
     let rebuilt = kept.concat();
 
     let table_length = table.len();
@@ -861,6 +897,7 @@ fn restore_debug_directory(
         }
         _ => clear_directory(restored, model, DEBUG_DIRECTORY),
     }
+
     if erased > usize::from(codeview.is_some()) {
         report.lost.push("debug entries the packer erased");
     }
@@ -907,15 +944,18 @@ fn packed_resources<'a>(packed: &PeImage<'a>, image_start: usize) -> Option<Pack
                 true => Some(read_u32(bytes, rva.checked_sub(ORIGINAL_RVA_PREFIX)?).ok()? as usize),
                 false => None,
             };
+
             let inside_image = |original: usize| {
                 original >= image_start
                     && original
                         .checked_add(size)
                         .is_some_and(|end| end <= bytes.len())
             };
+
             if original.is_some_and(|original| !inside_image(original)) {
                 return None;
             }
+
             Some(ResourceLeaf {
                 entry,
                 rva,
@@ -942,13 +982,16 @@ impl PackedResources<'_> {
         let Some(structure) = self.structure() else {
             return false;
         };
+
         let Some(end) = destination.checked_add(structure.len()) else {
             return false;
         };
+
         let overlaps_leaf = self.leaves.iter().any(|leaf| {
             let start = leaf.original.unwrap_or(leaf.rva);
             start < end && destination < start.saturating_add(leaf.size)
         });
+
         structure.len() <= size && !overlaps_leaf && is_free(restored, destination, structure)
     }
 
@@ -956,6 +999,7 @@ impl PackedResources<'_> {
         let Some(tree) = walk_resources(restored, tree_start) else {
             return;
         };
+
         let listed = tree
             .data_entries
             .iter()
@@ -970,9 +1014,11 @@ impl PackedResources<'_> {
             let Some(original) = leaf.original else {
                 continue;
             };
+
             if original == leaf.rva || !listed.contains(&(original, leaf.size)) {
                 continue;
             }
+
             if let Some(data) = self.bytes.get(leaf.rva..leaf.rva.saturating_add(leaf.size)) {
                 let _ = place(restored, original, data);
             }
@@ -982,10 +1028,12 @@ impl PackedResources<'_> {
     fn apply(&self, restored: &mut [u8], destination: usize) -> Option<()> {
         let structure = self.structure()?.to_vec();
         place(restored, destination, &structure)?;
+
         for leaf in &self.leaves {
             let Some(original) = leaf.original else {
                 continue;
             };
+
             let data = self.bytes.get(leaf.rva..leaf.rva.checked_add(leaf.size)?)?;
             restored
                 .get_mut(original..original.checked_add(leaf.size)?)?
@@ -997,6 +1045,7 @@ impl PackedResources<'_> {
             )
             .ok()?;
         }
+
         Some(())
     }
 }

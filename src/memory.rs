@@ -158,6 +158,7 @@ impl Snapshot {
             target.pid,
             PROCESS_CREATE_PROCESS | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
         )?;
+
         let flags = PSS_CAPTURE_VA_CLONE
             | PSS_CREATE_BREAKAWAY
             | PSS_CREATE_BREAKAWAY_OPTIONAL
@@ -165,9 +166,11 @@ impl Snapshot {
         let started = Instant::now();
         let mut snapshot = HPSS::default();
         let status = unsafe { PssCaptureSnapshot(process.raw(), flags, None, &mut snapshot) };
+
         if status != ERROR_SUCCESS.0 {
             return Err(win32_status("PssCaptureSnapshot", status));
         }
+
         let elapsed = started.elapsed();
 
         let mut clone = PSS_VA_CLONE_INFORMATION::default();
@@ -181,15 +184,19 @@ impl Snapshot {
                 buffer_length,
             )
         };
+
         if query_status != ERROR_SUCCESS.0 || clone.VaCloneHandle.is_invalid() {
             let _free_status = unsafe { PssFreeSnapshot(GetCurrentProcess(), snapshot) };
+
             if query_status != ERROR_SUCCESS.0 {
                 return Err(win32_status("PssQuerySnapshot", query_status));
             }
+
             return Err(AppError::new("PSS returned an invalid VA clone handle"));
         }
 
         drop(process);
+
         Ok((
             Self {
                 handle: snapshot,
@@ -257,6 +264,7 @@ pub(crate) fn capture(target: &TargetProcess, raw_regions: bool) -> AppResult<Ca
         setup_elapsed,
         fallback_reason,
     } = AddressSpace::acquire(target)?;
+
     let captured = capture_from_space(&space, target, raw_regions)?;
     let mut images = captured.images;
     drop(space);
@@ -264,6 +272,7 @@ pub(crate) fn capture(target: &TargetProcess, raw_regions: bool) -> AppResult<Ca
     {
         annotate_images(process.raw(), &mut images, &mut coverage);
     }
+
     Ok(Capture {
         mode,
         setup_elapsed,
@@ -286,8 +295,10 @@ pub(crate) fn wait_until_stable(target: &TargetProcess) -> AppResult<StabilityIn
     for _index in 0..STABLE_POLL_COUNT {
         let regions = space.regions()?;
         let signature = memory_signature(&space, &regions);
+
         if previous == Some(signature) {
             matches = matches.saturating_add(1);
+
             if matches >= STABLE_MATCH_COUNT {
                 return Ok(StabilityInfo {
                     elapsed: started.elapsed(),
@@ -298,8 +309,10 @@ pub(crate) fn wait_until_stable(target: &TargetProcess) -> AppResult<StabilityIn
             matches = 0;
             previous = Some(signature);
         }
+
         std::thread::sleep(STABLE_POLL_DELAY);
     }
+
     Ok(StabilityInfo {
         elapsed: started.elapsed(),
         settled: false,
@@ -311,14 +324,17 @@ fn memory_signature(space: &AddressSpace, regions: &[MemoryRegion]) -> u64 {
     for region in regions.iter().filter(|region| is_stability_region(region)) {
         region.hash(&mut hash);
     }
+
     for (address, length) in stability_pages(regions) {
         let mut page = [0u8; PAGE_SIZE];
+
         if space.read_exact(address, &mut page[..length]) {
             page[..length].hash(&mut hash);
         } else {
             u64::MAX.hash(&mut hash);
         }
     }
+
     hash.finish()
 }
 
@@ -335,11 +351,14 @@ fn stability_pages(regions: &[MemoryRegion]) -> Vec<(usize, usize)> {
     for region in regions.iter().filter(|region| is_stability_region(region)) {
         let region_pages = region.size.div_ceil(PAGE_SIZE);
         let past_region = first_page.saturating_add(region_pages);
+
         while sample < sample_count {
             let target = sample_page(sample, total_pages, sample_count);
+
             if target >= past_region {
                 break;
             }
+
             let page = target.saturating_sub(first_page);
             let offset = page.saturating_mul(PAGE_SIZE);
             let address = region.base.saturating_add(offset);
@@ -347,8 +366,10 @@ fn stability_pages(regions: &[MemoryRegion]) -> Vec<(usize, usize)> {
             pages.push((address, length));
             sample = sample.saturating_add(1);
         }
+
         first_page = past_region;
     }
+
     pages
 }
 
@@ -356,6 +377,7 @@ fn sample_page(sample: usize, total_pages: usize, sample_count: usize) -> usize 
     if sample_count <= 1 {
         return 0;
     }
+
     let numerator = (sample as u128) * (total_pages.saturating_sub(1) as u128);
     let denominator = sample_count.saturating_sub(1) as u128;
     (numerator / denominator) as usize
@@ -394,29 +416,36 @@ fn read_all_images(
     let mut skipped = 0usize;
     for (base, group) in groups {
         let size = group.end.saturating_sub(base);
+
         if size == 0 {
             continue;
         }
+
         if size > MAX_IMAGE_SIZE {
             skipped = skipped.saturating_add(1);
             continue;
         }
+
         if !claim_image_budget(&mut total_size, size, main_base == Some(base)) {
             skipped = skipped.saturating_add(1);
             continue;
         }
+
         let read = read_image(space, target, main_base, base, size, &group.regions, false)?;
         images.push(read);
     }
+
     for (base, size) in hidden.iter().copied() {
         if !claim_image_budget(&mut total_size, size, false) {
             skipped = skipped.saturating_add(1);
             continue;
         }
+
         let image_regions = regions_in_range(regions, base, size)?;
         let read = read_image(space, target, main_base, base, size, &image_regions, true)?;
         images.push(read);
     }
+
     Ok((images, skipped))
 }
 
@@ -435,14 +464,17 @@ fn capture_from_space(
         found: hidden,
         unscanned: unscanned_hidden,
     } = find_hidden_images(space, &regions, &non_image_allocations)?;
+
     let (images, over_budget) =
         read_all_images(space, target, &regions, groups, &hidden, main_base)?;
     images_skipped = images_skipped.saturating_add(over_budget);
+
     if images.is_empty() {
         return Err(AppError::new(
             "no image allocations were present in the captured address space",
         ));
     }
+
     let main_image_missing = main_image_is_missing(&images);
     let unclaimed = unclaimed_executable_allocations(&regions, &non_image_allocations, &hidden);
     let mut carve_allocations = unclaimed.iter().copied().collect::<Vec<_>>(); // loader buffers get the budget first
@@ -451,6 +483,7 @@ fn capture_from_space(
         &regions,
         &non_image_allocations,
     ));
+
     let carve = read_allocations(space, &regions, &carve_allocations, MAX_NON_IMAGE_RW_BYTES);
     let raw = if want_raw_regions {
         let unclaimed = unclaimed.into_iter().collect::<Vec<_>>();
@@ -461,6 +494,7 @@ fn capture_from_space(
             skipped: 0,
         }
     };
+
     Ok(CapturedSpace {
         images,
         non_image_count,
@@ -513,6 +547,7 @@ fn unclaimed_executable_allocations(
             claimed.insert(region.allocation_base);
         }
     }
+
     executable
         .iter()
         .copied()
@@ -546,8 +581,10 @@ fn committed_runs(
         {
             continue;
         }
+
         let end = region.base.saturating_add(region.size);
         let allocation_runs = runs.entry(region.allocation_base).or_default();
+
         match allocation_runs.last_mut() {
             Some(run) if run.end == region.base => {
                 run.end = end;
@@ -563,6 +600,7 @@ fn committed_runs(
             }),
         }
     }
+
     runs
 }
 
@@ -582,11 +620,14 @@ fn read_allocations(
             let size = committed.min(remaining);
             let limit_reached = size == 0 || collected.len() >= MAX_IMAGES;
             let mut bytes = Vec::new();
+
             if limit_reached || bytes.try_reserve_exact(size).is_err() {
                 skipped = skipped.saturating_add(committed);
                 continue;
             }
+
             bytes.resize(size, 0);
+
             let unreadable_pages = read_region(space, run.base, &mut bytes);
             remaining = remaining.saturating_sub(size);
             skipped = skipped.saturating_add(committed.saturating_sub(size));
@@ -601,6 +642,7 @@ fn read_allocations(
             });
         }
     }
+
     ScannedAllocations {
         regions: collected,
         skipped,
@@ -609,9 +651,11 @@ fn read_allocations(
 
 fn claim_image_budget(total: &mut usize, size: usize, mandatory: bool) -> bool {
     let next = total.saturating_add(size);
+
     if !mandatory && next > MAX_TOTAL_IMAGE_BYTES {
         return false;
     }
+
     *total = next;
     true
 }
@@ -629,9 +673,11 @@ fn list_regions(handle: HANDLE) -> AppResult<Vec<MemoryRegion>> {
                 size_of::<MEMORY_BASIC_INFORMATION>(),
             )
         };
+
         if returned == 0 {
             return Ok(regions);
         }
+
         let base = information.BaseAddress as usize;
         let next = base
             .checked_add(information.RegionSize)
@@ -641,6 +687,7 @@ fn list_regions(handle: HANDLE) -> AppResult<Vec<MemoryRegion>> {
                 "VirtualQueryEx returned the same address twice",
             ));
         }
+
         regions.push(MemoryRegion {
             base,
             allocation_base: information.AllocationBase as usize,
@@ -649,8 +696,10 @@ fn list_regions(handle: HANDLE) -> AppResult<Vec<MemoryRegion>> {
             protect: information.Protect.0,
             kind: information.Type.0,
         });
+
         address = next;
     }
+
     Err(AppError::new("too many memory regions were returned"))
 }
 
@@ -661,11 +710,13 @@ fn image_bases(regions: &[MemoryRegion], target: &TargetProcess) -> BTreeSet<usi
             bases.insert(region.allocation_base);
         }
     }
+
     for module in &target.modules {
         if module.base != 0 {
             bases.insert(module.base);
         }
     }
+
     bases
 }
 
@@ -682,6 +733,7 @@ fn group_images(
     if let Some(base) = main_base.filter(|base| bases.contains(base)) {
         kept.insert(base);
     }
+
     let skipped = bases.len().saturating_sub(kept.len());
 
     let mut groups = BTreeMap::<usize, ImageGroup>::new();
@@ -689,6 +741,7 @@ fn group_images(
         if !kept.contains(&region.allocation_base) {
             continue;
         }
+
         let end = region
             .base
             .checked_add(region.size)
@@ -697,6 +750,7 @@ fn group_images(
         group.end = group.end.max(end);
         group.regions.push(*region);
     }
+
     Ok((groups, skipped))
 }
 
@@ -714,6 +768,7 @@ fn resolve_main_base(
     if let Some(module) = &target.main_module {
         return Some(module.base);
     }
+
     let drives = drive_map();
     let wanted = target.path.to_string_lossy().into_owned();
     let mut by_path = None;
@@ -722,15 +777,18 @@ fn resolve_main_base(
         let Some(device) = mapped_file_name(space.handle(), *base) else {
             continue;
         };
+
         if to_dos_path(&device, &drives).is_some_and(|path| path.eq_ignore_ascii_case(&wanted)) {
             if by_path.is_some() {
                 return None;
             }
+
             by_path = Some(*base);
         } else if basename(&device).eq_ignore_ascii_case(&target.name) {
             by_name.push(*base);
         }
     }
+
     by_path.or_else(|| by_name.first().copied().filter(|_| by_name.len() == 1))
 }
 
@@ -748,11 +806,13 @@ fn read_image(
         .try_reserve_exact(size)
         .map_err(|_| AppError::new(format!("not enough memory for image at 0x{base:016X}")))?;
     bytes.resize(size, 0);
+
     let image_end = base
         .checked_add(size)
         .ok_or_else(|| AppError::new("image address overflowed"))?;
     let scan = read_image_regions(space, &mut bytes, base, image_end, regions)?;
     let module = target.modules.iter().find(|module| module.base == base);
+
     Ok(CapturedImage {
         base,
         bytes,
@@ -785,18 +845,22 @@ fn read_image_regions(
         if region.state != MEM_COMMIT.0 {
             continue;
         }
+
         if region.kind != MEM_IMAGE.0 {
             image_backed = false;
         }
+
         let region_end = region
             .base
             .checked_add(region.size)
             .ok_or_else(|| AppError::new("image region address overflowed"))?;
         let read_base = region.base.max(base);
         let read_end = region_end.min(image_end);
+
         if read_base >= read_end {
             continue;
         }
+
         let offset = read_base.saturating_sub(base);
         let length = read_end.saturating_sub(read_base);
         evidence.push(RegionEvidence {
@@ -806,6 +870,7 @@ fn read_image_regions(
             writable: is_writable(region.protect),
             executable: is_executable(region.protect),
         });
+
         let destination = bytes
             .get_mut(offset..offset.saturating_add(length))
             .ok_or_else(|| AppError::new("image region lies outside its output buffer"))?;
@@ -813,9 +878,11 @@ fn read_image_regions(
             unreadable_pages = unreadable_pages.saturating_add(length.div_ceil(PAGE_SIZE));
             continue;
         }
+
         unreadable_pages =
             unreadable_pages.saturating_add(read_region(space, read_base, destination));
     }
+
     Ok(RegionScan {
         evidence,
         unreadable_pages,
@@ -828,9 +895,11 @@ fn measure_image_pages(target: &TargetProcess) -> BTreeMap<usize, PageCoverage> 
     else {
         return BTreeMap::new();
     };
+
     let Ok(regions) = list_regions(process.raw()) else {
         return BTreeMap::new();
     };
+
     let mut extents = BTreeMap::<usize, usize>::new();
     for region in regions.iter().filter(|region| {
         region.kind == MEM_IMAGE.0 && region.state == MEM_COMMIT.0 && region.allocation_base != 0
@@ -841,6 +910,7 @@ fn measure_image_pages(target: &TargetProcess) -> BTreeMap<usize, PageCoverage> 
             .and_modify(|current| *current = (*current).max(end))
             .or_insert(end);
     }
+
     extents
         .into_iter()
         .take(MAX_IMAGES)
@@ -859,6 +929,7 @@ fn annotate_images(
     coverage: &mut BTreeMap<usize, PageCoverage>,
 ) {
     let drives = drive_map();
+
     for image in images {
         let mapped = mapped_file_name(process, image.base);
         let actual = mapped
@@ -870,9 +941,11 @@ fn annotate_images(
             }
             _ => basename_mismatch(image.name.as_deref(), mapped.as_deref()),
         };
+
         if image.name.is_none() || image.path_mismatch {
             image.name = mapped.as_deref().map(|path| basename(path).to_owned());
         }
+
         if let Some(pages) = coverage.remove(&image.base) {
             image.resident_pages = pages.resident;
             image.private_pages = pages.private;
@@ -907,22 +980,28 @@ fn drive_map() -> Vec<(String, String)> {
         if mask & (1u32 << index) == 0 {
             continue;
         }
+
         let Some(letter) = char::from_u32(u32::from(b'A').saturating_add(index)) else {
             continue;
         };
+
         let dos = format!("{letter}:");
         let wide = [u16::from(letter as u8), u16::from(b':'), 0u16];
         let mut target = [0u16; MAX_MAPPED_PATH_CHARS];
         let length = unsafe { QueryDosDeviceW(PCWSTR(wide.as_ptr()), Some(target.as_mut_slice())) };
+
         if length == 0 {
             continue;
         }
+
         let end = target.iter().position(|unit| *unit == 0).unwrap_or(0);
         let device = String::from_utf16_lossy(target.get(..end).unwrap_or_default());
+
         if !device.is_empty() {
             map.push((device, dos));
         }
     }
+
     map
 }
 
@@ -937,6 +1016,7 @@ fn measure_pages(process: HANDLE, base: usize, size: usize) -> PageCoverage {
     let mut coverage = PageCoverage::default();
     let pages = size.div_ceil(PAGE_SIZE);
     coverage.flags.resize(pages, 0);
+
     let mut first = 0usize;
     while first < pages {
         let count = pages.saturating_sub(first).min(WORKING_SET_CHUNK);
@@ -945,32 +1025,42 @@ fn measure_pages(process: HANDLE, base: usize, size: usize) -> PageCoverage {
             let offset = first.saturating_add(slot).saturating_mul(PAGE_SIZE);
             entry.VirtualAddress = base.saturating_add(offset) as *mut c_void;
         }
+
         let Ok(bytes) =
             u32::try_from(count.saturating_mul(size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()))
         else {
             break;
         };
+
         if !unsafe { K32QueryWorkingSetEx(process, entries.as_mut_ptr().cast(), bytes) }.as_bool() {
             break;
         }
+
         for (slot, entry) in entries.iter().take(count).enumerate() {
             // SAFETY: Flags is the integer view of the union and every bit pattern is valid.
             let flags = unsafe { entry.VirtualAttributes.Flags };
+
             if flags & WORKING_SET_VALID == 0 {
                 continue;
             }
+
             coverage.resident = coverage.resident.saturating_add(1);
+
             let mut bits = PAGE_RESIDENT;
+
             if flags & WORKING_SET_SHARED == 0 {
                 coverage.private = coverage.private.saturating_add(1);
                 bits |= PAGE_PRIVATE;
             }
+
             if let Some(page) = coverage.flags.get_mut(first.saturating_add(slot)) {
                 *page = bits;
             }
         }
+
         first = first.saturating_add(count);
     }
+
     coverage
 }
 
@@ -997,26 +1087,33 @@ fn find_hidden_images(
         {
             continue;
         }
+
         let Some(allocation_end) = allocation_ends.get(&region.allocation_base).copied() else {
             continue;
         };
+
         for offset in (0..region.size).step_by(PAGE_SIZE) {
             if scanned_pages >= MAX_NON_IMAGE_SCAN_PAGES || found.len() >= MAX_IMAGES {
                 unscanned = unscanned.saturating_add(region.size.saturating_sub(offset));
                 break;
             }
+
             scanned_pages = scanned_pages.saturating_add(1);
+
             let Some(base) = region.base.checked_add(offset) else {
                 return Err(AppError::new("non-image PE scan address overflowed"));
             };
+
             let Some(available) = hidden_image_at(space, base, allocation_end) else {
                 continue;
             };
+
             found.push((base, available));
             captured_allocations.insert(region.allocation_base);
             break;
         }
     }
+
     Ok(HiddenScan { found, unscanned })
 }
 
@@ -1029,6 +1126,7 @@ fn allocation_extents(
         if !executable_allocations.contains(&region.allocation_base) {
             continue;
         }
+
         let end = region
             .base
             .checked_add(region.size)
@@ -1037,23 +1135,31 @@ fn allocation_extents(
             .and_modify(|current| *current = (*current).max(end))
             .or_insert(end);
     }
+
     Ok(ends)
 }
 
 fn hidden_image_at(space: &AddressSpace, base: usize, allocation_end: usize) -> Option<usize> {
     let mut magic = [0u8; 2];
+
     if !space.read_exact(base, &mut magic) || magic != *b"MZ" {
         return None;
     }
+
     let available = allocation_end.saturating_sub(base);
+
     if available > MAX_IMAGE_SIZE {
         return None;
     }
+
     let mut header = vec![0u8; available.min(MAX_HEADER_READ)];
+
     if !space.read_exact(base, &mut header) {
         return None;
     }
+
     let image_size = crate::pe::memory_image_size(&header).ok()?;
+
     (image_size <= available).then_some(available)
 }
 
@@ -1079,6 +1185,7 @@ fn read_region(space: &AddressSpace, base: usize, destination: &mut [u8]) -> usi
     let mut unreadable_pages = 0usize;
     for (index, chunk) in destination.chunks_mut(READ_CHUNK).enumerate() {
         let offset = index.saturating_mul(READ_CHUNK);
+
         if !space.read_exact(base.saturating_add(offset), chunk) {
             unreadable_pages = unreadable_pages.saturating_add(read_pages(
                 space,
@@ -1087,6 +1194,7 @@ fn read_region(space: &AddressSpace, base: usize, destination: &mut [u8]) -> usi
             ));
         }
     }
+
     unreadable_pages
 }
 
@@ -1094,11 +1202,13 @@ fn read_pages(space: &AddressSpace, base: usize, destination: &mut [u8]) -> usiz
     let mut unreadable = 0usize;
     for (index, page) in destination.chunks_mut(PAGE_SIZE).enumerate() {
         let offset = index.saturating_mul(PAGE_SIZE);
+
         if !space.read_exact(base.saturating_add(offset), page) {
             page.fill(0);
             unreadable = unreadable.saturating_add(1);
         }
     }
+
     unreadable
 }
 
@@ -1106,6 +1216,7 @@ fn read_exact(handle: HANDLE, address: usize, destination: &mut [u8]) -> bool {
     if destination.is_empty() {
         return true;
     }
+
     let mut read = 0usize;
     let result = unsafe {
         ReadProcessMemory(
@@ -1116,6 +1227,7 @@ fn read_exact(handle: HANDLE, address: usize, destination: &mut [u8]) -> bool {
             Some(&mut read),
         )
     };
+
     result.is_ok() && read == destination.len()
 }
 
@@ -1136,6 +1248,7 @@ fn is_readable(protect: u32) -> bool {
     if protect & (PAGE_GUARD.0 | PAGE_NOACCESS.0) != 0 {
         return false;
     }
+
     let base = protect & 0xff;
     [
         PAGE_READONLY.0,
@@ -1152,6 +1265,7 @@ fn is_executable(protect: u32) -> bool {
     if protect & (PAGE_GUARD.0 | PAGE_NOACCESS.0) != 0 {
         return false;
     }
+
     let base = protect & 0xff;
     [
         PAGE_EXECUTE.0,
@@ -1166,6 +1280,7 @@ fn is_writable(protect: u32) -> bool {
     if protect & (PAGE_GUARD.0 | PAGE_NOACCESS.0) != 0 {
         return false;
     }
+
     let base = protect & 0xff;
     [
         PAGE_READWRITE.0,

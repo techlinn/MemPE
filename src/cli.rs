@@ -46,6 +46,7 @@ where
         if args.next().is_some() {
             return Err(AppError::new("help does not take more arguments"));
         }
+
         return Ok(None);
     }
 
@@ -55,6 +56,7 @@ where
             option.to_string_lossy()
         )));
     }
+
     let value = args
         .next()
         .ok_or_else(|| AppError::new(format!("{} needs a value", option.to_string_lossy())))?;
@@ -63,7 +65,9 @@ where
     } else {
         parse_watch_name(value).map(Command::Watch)?
     };
+
     let options = parse_trailing_options(&mut args)?;
+
     Ok(Some(Request {
         command,
         entry_point: options.entry_point,
@@ -88,9 +92,11 @@ fn parse_watch_name(value: OsString) -> AppResult<String> {
     if name.is_empty() {
         return Err(AppError::new("process name cannot be empty"));
     }
+
     if name.contains(['\\', '/']) {
         return Err(AppError::new("-w takes a file name, not a path"));
     }
+
     Ok(name)
 }
 
@@ -103,21 +109,26 @@ struct TrailingOptions {
 
 fn parse_trailing_options(args: &mut impl Iterator<Item = OsString>) -> AppResult<TrailingOptions> {
     let mut options = TrailingOptions::default();
+
     for _slot in 0..MAX_TRAILING_OPTIONS {
         let Some(option) = args.next() else {
             return Ok(options);
         };
+
         if option == "--raw-regions" {
             if options.raw_regions {
                 return Err(AppError::new("--raw-regions was given twice"));
             }
+
             options.raw_regions = true;
             continue;
         }
+
         if option == "--only" {
             if options.only.is_some() {
                 return Err(AppError::new("--only was given twice"));
             }
+
             let value = args
                 .next()
                 .ok_or_else(|| AppError::new("--only needs a module name or base address"))?;
@@ -127,23 +138,28 @@ fn parse_trailing_options(args: &mut impl Iterator<Item = OsString>) -> AppResul
             if name.is_empty() {
                 return Err(AppError::new("--only value cannot be empty"));
             }
+
             options.only = Some(name);
             continue;
         }
+
         if option != "-e" && option != "--entry-point" {
             return Err(AppError::new(format!(
                 "unknown option: {}",
                 option.to_string_lossy()
             )));
         }
+
         if options.entry_point.is_some() {
             return Err(AppError::new("--entry-point was given twice"));
         }
+
         let value = args
             .next()
             .ok_or_else(|| AppError::new("--entry-point needs an RVA"))?;
         options.entry_point = Some(parse_entry_point(value)?);
     }
+
     Err(AppError::new("too many arguments"))
 }
 

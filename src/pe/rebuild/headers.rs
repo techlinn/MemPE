@@ -21,32 +21,39 @@ pub(super) fn finalize_output(
 ) -> AppResult<(u32, bool)> {
     apply_entry_point(output, model, entry_point)?;
     write_derived_header_fields(output, model)?;
+
     let executable_flag_added = ensure_executable_image_flag(output, model)?;
     apply_checksum(output, model)?;
+
     let final_entry_point = read_u32(output, model.entry_point_offset)?;
     PeFile::from_bytes(output).map_err(|error| {
         AppError::new(format!("rebuilt PE failed independent reparse: {error}"))
     })?;
+
     Ok((final_entry_point, executable_flag_added))
 }
 
 fn ensure_executable_image_flag(output: &mut [u8], model: &PeModel) -> AppResult<bool> {
     let offset = model.nt_offset.saturating_add(FILE_CHARACTERISTICS_OFFSET);
     let characteristics = read_u16(output, offset)?;
+
     if characteristics & IMAGE_FILE_EXECUTABLE_IMAGE != 0 {
         return Ok(false);
     }
+
     write_u16(
         output,
         offset,
         characteristics | IMAGE_FILE_EXECUTABLE_IMAGE,
     )?;
+
     Ok(true)
 }
 
 pub(super) fn apply_checksum(output: &mut [u8], model: &PeModel) -> AppResult<()> {
     let checksum_offset = model.size_of_headers_offset.saturating_add(4);
     write_u32(output, checksum_offset, 0)?;
+
     let checksum = compute_checksum(output)?;
     write_u32(output, checksum_offset, checksum)
 }
@@ -58,16 +65,20 @@ fn compute_checksum(bytes: &[u8]) -> AppResult<u32> {
         if offset.saturating_add(CHECKSUM_WORD_SIZE) > bytes.len() {
             break;
         }
+
         sum = sum.saturating_add(u64::from(read_u16(bytes, offset)?));
         sum = (sum & 0xFFFF).saturating_add(sum >> 16);
         offset = offset.saturating_add(CHECKSUM_WORD_SIZE);
     }
+
     if !bytes.len().is_multiple_of(CHECKSUM_WORD_SIZE) {
         let last = *bytes.get(bytes.len().saturating_sub(1)).unwrap_or(&0);
         sum = sum.saturating_add(u64::from(last));
         sum = (sum & 0xFFFF).saturating_add(sum >> 16);
     }
+
     sum = (sum & 0xFFFF).saturating_add(sum >> 16);
+
     let folded = (sum & 0xFFFF).saturating_add(bytes.len() as u64);
     u32::try_from(folded).map_err(|_| AppError::new("checksum overflowed a PE field"))
 }
@@ -139,34 +150,41 @@ fn apply_entry_point(
     let Some(entry_point) = entry_point else {
         return Ok(());
     };
+
     let rva = Rva(entry_point.get());
+
     if !model.executable_rva(rva) {
         return Err(AppError::new(format!(
             "manual entry point RVA 0x{:X} is not inside an executable section",
             entry_point.get()
         )));
     }
+
     write_u32(output, model.entry_point_offset, entry_point.get())
 }
 
 fn write_derived_header_fields(output: &mut [u8], model: &PeModel) -> AppResult<()> {
     let section_count = usize::from(read_u16(output, model.nt_offset.saturating_add(6))?);
     let maximum_section_count = model.sections.len().saturating_add(1);
+
     if section_count < model.sections.len() || section_count > maximum_section_count {
         return Err(AppError::new("rebuilt PE has an invalid section count"));
     }
+
     let first_section = model
         .sections
         .first()
         .map(|section| section.header_offset)
         .ok_or_else(|| AppError::new("rebuilt PE has no section table"))?;
     let mut sizes = DerivedSizes::default();
+
     for index in 0..section_count {
         let offset = first_section
             .checked_add(index.saturating_mul(SECTION_HEADER_SIZE))
             .ok_or_else(|| AppError::new("rebuilt section header offset overflowed"))?;
         sizes.add_section(output, offset, model.file_alignment)?;
     }
+
     write_u32(output, model.size_of_code_offset, sizes.code)?;
     write_u32(
         output,
@@ -195,16 +213,20 @@ impl DerivedSizes {
         let virtual_address = read_u32(output, offset.saturating_add(12))?;
         let raw_size = read_u32(output, offset.saturating_add(16))?;
         let characteristics = read_u32(output, offset.saturating_add(36))?;
+
         if characteristics & IMAGE_SCN_CNT_CODE != 0 {
             self.code = add_size(self.code, raw_size, "code size")?;
+
             if self.base_of_code == 0 || virtual_address < self.base_of_code {
                 self.base_of_code = virtual_address;
             }
         }
+
         if characteristics & IMAGE_SCN_CNT_INITIALIZED_DATA != 0 {
             self.initialized_data =
                 add_size(self.initialized_data, raw_size, "initialized-data size")?;
         }
+
         if characteristics & IMAGE_SCN_CNT_UNINITIALIZED_DATA != 0 {
             let aligned = align_up_u64(u64::from(virtual_size), u64::from(file_alignment))?;
             let aligned = u32::try_from(aligned)
@@ -212,6 +234,7 @@ impl DerivedSizes {
             self.uninitialized_data =
                 add_size(self.uninitialized_data, aligned, "uninitialized-data size")?;
         }
+
         Ok(())
     }
 }

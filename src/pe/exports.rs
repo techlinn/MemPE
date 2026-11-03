@@ -65,6 +65,7 @@ struct Definitions {
 impl Definitions {
     fn build(by_module: HashMap<(String, ExportKey), usize>) -> Self {
         let mut unique_by_key = HashMap::<ExportKey, Option<usize>>::with_capacity(by_module.len());
+
         for ((_, key), address) in &by_module {
             unique_by_key
                 .entry(key.clone())
@@ -75,6 +76,7 @@ impl Definitions {
                 })
                 .or_insert(Some(*address));
         }
+
         Self {
             by_module,
             unique_by_key,
@@ -89,7 +91,6 @@ impl ExportIndex {
         let mut index = Self::default();
         let mut definitions = HashMap::<(String, ExportKey), usize>::new();
         let mut forwarders = Vec::new();
-
         for (base, bytes, fallback_name) in images {
             index.stats.modules = index.stats.modules.saturating_add(1);
             index
@@ -98,10 +99,12 @@ impl ExportIndex {
             let Some(parsed) = parse_exports(base, bytes, fallback_name) else {
                 continue;
             };
+
             for (address, symbol) in parsed.direct {
                 add_definition(&mut definitions, address, &symbol);
                 index.addresses.entry(address).or_default().push(symbol);
             }
+
             forwarders.extend(parsed.forwarders);
         }
 
@@ -140,6 +143,22 @@ impl ExportIndex {
         })
     }
 
+    pub(crate) fn name_in(&self, address: usize, module: &str) -> Option<String> {
+        self.addresses
+            .get(&address)?
+            .iter()
+            .filter(|symbol| symbol.module.eq_ignore_ascii_case(module))
+            .find_map(|symbol| symbol.name.clone())
+    }
+
+    pub(crate) fn modules_at(&self, address: usize) -> impl Iterator<Item = (&str, bool)> {
+        self.addresses
+            .get(&address)
+            .into_iter()
+            .flatten()
+            .map(|symbol| (symbol.module.as_str(), symbol.forwarded))
+    }
+
     pub(crate) fn ordinal_in(&self, address: usize, module: &str) -> Option<u32> {
         self.addresses
             .get(&address)?
@@ -172,6 +191,7 @@ fn naming_priority(symbol: &ResolvedExport) -> NamingPriority {
     if is_api_set(&symbol.module) {
         return NamingPriority::ApiSetAlias;
     }
+
     match symbol.forwarded {
         true => NamingPriority::Facade,
         false => NamingPriority::Implementation,
@@ -205,9 +225,11 @@ fn modules_differ(left: &ResolvedExport, right: &ResolvedExport) -> bool {
 pub(crate) fn embedded_module_name(bytes: &[u8]) -> Option<String> {
     let image = parse_memory_image(bytes).ok()?;
     let (rva, size) = directory(&image, EXPORT_DIRECTORY)?;
+
     if size < EXPORT_HEADER_SIZE as u32 {
         return None;
     }
+
     let name_rva = read_u32(bytes, rva as usize + 12)?;
     read_ascii(bytes, name_rva as usize)
         .as_deref()
@@ -237,6 +259,7 @@ fn parse_exports(base: usize, bytes: &[u8], fallback_name: Option<&str>) -> Opti
             .or(fallback_name)
             .unwrap_or("unknown.dll"),
     );
+
     let names = export_names(bytes, &header)?;
 
     let mut direct = Vec::new();
@@ -248,20 +271,24 @@ fn parse_exports(base: usize, bytes: &[u8], fallback_name: Option<&str>) -> Opti
         let Some(function_rva) = entry.and_then(|offset| read_u32(bytes, offset)) else {
             continue;
         };
+
         if function_rva == 0 {
             continue;
         }
+
         let Some(ordinal) = u32::try_from(index)
             .ok()
             .and_then(|step| header.ordinal_base.checked_add(step))
         else {
             continue;
         };
+
         let aliases = names
             .get(&index)
             .cloned()
             .unwrap_or_else(|| vec![String::new()]);
         let forwarded = function_rva >= header.directory_rva && function_rva < header.directory_end;
+
         for alias in aliases {
             let symbol = ResolvedExport {
                 module: module.clone(),
@@ -269,6 +296,7 @@ fn parse_exports(base: usize, bytes: &[u8], fallback_name: Option<&str>) -> Opti
                 ordinal,
                 forwarded,
             };
+
             if forwarded {
                 if let Some(target) = read_ascii(bytes, function_rva as usize) {
                     forwarders.push(ForwardedExport {
@@ -276,8 +304,10 @@ fn parse_exports(base: usize, bytes: &[u8], fallback_name: Option<&str>) -> Opti
                         target,
                     });
                 }
+
                 continue;
             }
+
             if function_rva < model.image_size()
                 && let Some(address) = base.checked_add(function_rva as usize)
             {
@@ -285,27 +315,33 @@ fn parse_exports(base: usize, bytes: &[u8], fallback_name: Option<&str>) -> Opti
             }
         }
     }
+
     Some(ParsedExports { direct, forwarders })
 }
 
 fn export_header(image: &PeImage<'_>, bytes: &[u8]) -> Option<ExportHeader> {
     let (directory_rva, directory_size) = directory(image, EXPORT_DIRECTORY)?;
+
     if directory_size < EXPORT_HEADER_SIZE as u32 {
         return None;
     }
+
     let directory_offset = directory_rva as usize;
     let ordinal_base = read_u32(bytes, directory_offset + 16)?;
     let function_count = read_u32(bytes, directory_offset + 20)? as usize;
     let name_count = read_u32(bytes, directory_offset + 24)? as usize;
+
     if function_count == 0 || function_count > MAX_EXPORTS || name_count > MAX_EXPORTS {
         return None;
     }
+
     let functions_rva = read_u32(bytes, directory_offset + 28)? as usize;
     let names_rva = read_u32(bytes, directory_offset + 32)? as usize;
     let ordinals_rva = read_u32(bytes, directory_offset + 36)? as usize;
     checked_array(bytes, functions_rva, function_count, 4)?;
     checked_array(bytes, names_rva, name_count, 4)?;
     checked_array(bytes, ordinals_rva, name_count, 2)?;
+
     Some(ExportHeader {
         ordinal_base,
         function_count,
@@ -326,14 +362,18 @@ fn export_names(bytes: &[u8], header: &ExportHeader) -> Option<HashMap<usize, Ve
             bytes,
             header.ordinals_rva.checked_add(index.checked_mul(2)?)?,
         )?;
+
         let ordinal_index = usize::from(ordinal_index);
+
         if ordinal_index >= header.function_count {
             continue;
         }
+
         if let Some(name) = read_ascii(bytes, name_rva as usize) {
             names.entry(ordinal_index).or_default().push(name);
         }
     }
+
     Some(names)
 }
 
@@ -349,6 +389,7 @@ fn resolve_forwarders(
             (module.clone(), ExportKey::Ordinal(forwarder.source.ordinal)),
             forwarder,
         );
+
         if let Some(name) = &forwarder.source.name {
             pending.insert(
                 (module, ExportKey::Name(name.to_ascii_lowercase())),
@@ -356,15 +397,18 @@ fn resolve_forwarders(
             );
         }
     }
+
     for forwarder in forwarders {
         let Some((module, key)) = parse_forward_target(&forwarder.target) else {
             index.stats.unresolved_forwarders = index.stats.unresolved_forwarders.saturating_add(1);
             continue;
         };
+
         let Some(address) = resolve_key(&module, &key, definitions, &pending) else {
             index.stats.unresolved_forwarders = index.stats.unresolved_forwarders.saturating_add(1);
             continue;
         };
+
         index
             .addresses
             .entry(address)
@@ -381,11 +425,14 @@ fn resolve_key(
 ) -> Option<usize> {
     let mut module = normalize_module(module).to_ascii_lowercase();
     let mut key = key.clone();
+
     for _hop in 0..MAX_FORWARD_DEPTH {
         let lookup = (module.clone(), key.clone());
+
         if let Some(address) = definitions.by_module.get(&lookup) {
             return Some(*address);
         }
+
         if is_api_set(&module) {
             match definitions.unique_by_key.get(&key) {
                 Some(Some(address)) => return Some(*address),
@@ -393,10 +440,12 @@ fn resolve_key(
                 None => {}
             }
         }
+
         let next = pending.get(&lookup)?;
         (module, key) = parse_forward_target(&next.target)?;
         module.make_ascii_lowercase();
     }
+
     None
 }
 
@@ -404,6 +453,7 @@ fn is_api_set(module: &str) -> bool {
     let Some(head) = module.as_bytes().get(..4) else {
         return false;
     };
+
     head.eq_ignore_ascii_case(b"api-") || head.eq_ignore_ascii_case(b"ext-")
 }
 
@@ -429,11 +479,13 @@ fn parse_forward_target(target: &str) -> Option<(String, ExportKey)> {
         Some(value) => ExportKey::Ordinal(value.parse().ok()?),
         None => ExportKey::Name(symbol.to_ascii_lowercase()),
     };
+
     Some((normalize_module(module), key))
 }
 
 fn normalize_module(name: &str) -> String {
     let basename = name.rsplit(['/', '\\']).next().unwrap_or(name);
+
     if basename.contains('.') {
         basename.to_owned()
     } else {

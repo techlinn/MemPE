@@ -1,9 +1,15 @@
-use crate::pe::PeModel;
-use crate::pe::image::{read_u16, read_u32, write_u32};
+use crate::pe::image::{read_pointer, read_u16, read_u32, write_u32};
+use crate::pe::{PeKind, PeModel, TLS_DIRECTORY};
 
 const PAGE_MASK: u32 = 0xFFF;
-const RELOCATION_BLOCK_HEADER: usize = 8;
-const RELOCATION_BLOCK_SIZE_OFFSET: usize = 4;
+pub(super) const RELOCATION_BLOCK_HEADER: usize = 8;
+pub(super) const RELOCATION_BLOCK_SIZE_OFFSET: usize = 4;
+pub(super) const SECTION_COUNT_OFFSET: usize = 6; // from the nt signature
+pub(super) const SECTION_RVA_OFFSET: usize = 12;
+pub(super) const SECTION_CHARACTERISTICS_OFFSET: usize = 36;
+pub(super) const RESOURCE_DATA_SIZE_OFFSET: usize = 4;
+const TLS_DIRECTORY_PE32: usize = 24;
+const TLS_DIRECTORY_PE32_PLUS: usize = 40;
 const RELOCATION_KIND_SHIFT: u16 = 12;
 const KNOWN_RELOCATION_KINDS: [u16; 5] = [0, 1, 2, 3, 10];
 const EXPORT_DIRECTORY_SIZE: usize = 40;
@@ -39,6 +45,23 @@ const CODEVIEW_RSDS_HEADER: usize = 24; // signature, guid and age
 const CODEVIEW_NB10_HEADER: usize = 16; // signature, offset, timestamp and age
 const PDB_EXTENSION: &[u8] = b".pdb";
 const MAX_PDB_PATH: usize = 1_024;
+const MAX_NAME_LENGTH: usize = 4_096;
+const DELAY_DESCRIPTOR_SIZE: usize = 32;
+const DELAY_ATTRIBUTES_RVA_BASED: u32 = 1;
+const DELAY_NAME_OFFSET: usize = 4;
+const DELAY_HANDLE_OFFSET: usize = 8;
+const DELAY_IAT_OFFSET: usize = 12;
+const DELAY_NAMES_OFFSET: usize = 16;
+const MAX_DELAY_DESCRIPTORS: usize = 256;
+const MAX_DLL_NAME: usize = 256;
+const LOAD_CONFIG_TIMESTAMP_OFFSET: usize = 4;
+const LOAD_CONFIG_COOKIE_PE32: usize = 0x3C;
+const LOAD_CONFIG_COOKIE_PE32_PLUS: usize = 0x58;
+const LOAD_CONFIG_HANDLERS_PE32: usize = 0x40; // safeseh table, then its count
+const MAX_SAFESEH_HANDLERS: u32 = 0x10000;
+const MAX_LOAD_CONFIG_SIZE: u32 = 0x400;
+pub(super) const FIRST_SECTION_RVA: usize = 0x1000;
+const SCAN_STEP: usize = 4;
 
 pub(super) enum Restoration {
     Restored,
@@ -51,6 +74,7 @@ pub(super) fn relocation_blocks(entries: &[(u32, u16)]) -> Option<Vec<u8>> {
     let mut sorted = entries.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
+
     let mut blocks = Vec::new();
     for page in sorted.chunk_by(|(left, _), (right, _)| left & !PAGE_MASK == right & !PAGE_MASK) {
         let mut words = page
@@ -60,6 +84,7 @@ pub(super) fn relocation_blocks(entries: &[(u32, u16)]) -> Option<Vec<u8>> {
         if !words.len().is_multiple_of(2) {
             words.push(0);
         }
+
         let size = u32::try_from(
             words
                 .len()
@@ -69,10 +94,12 @@ pub(super) fn relocation_blocks(entries: &[(u32, u16)]) -> Option<Vec<u8>> {
         .ok()?;
         blocks.extend_from_slice(&(page.first()?.0 & !PAGE_MASK).to_le_bytes());
         blocks.extend_from_slice(&size.to_le_bytes());
+
         for word in words {
             blocks.extend_from_slice(&word.to_le_bytes());
         }
     }
+
     Some(blocks)
 }
 
@@ -80,35 +107,45 @@ pub(super) fn relocations_intact(bytes: &[u8], start: usize, size: usize) -> boo
     let Some(table) = bytes.get(start..start.saturating_add(size)) else {
         return false;
     };
+
     if table.iter().all(|byte| *byte == 0) {
         return false;
     }
+
     let mut cursor = 0usize;
     while cursor < table.len() {
         let Ok(block_size) = read_u32(table, cursor.saturating_add(RELOCATION_BLOCK_SIZE_OFFSET))
         else {
             return false;
         };
+
         let block_size = block_size as usize;
+
         if block_size == 0 && read_u32(table, cursor).is_ok_and(|page| page == 0) {
             return true;
         }
+
         if block_size < RELOCATION_BLOCK_HEADER || !block_size.is_multiple_of(2) {
             return false;
         }
+
         let Some(words) = table
             .get(cursor.saturating_add(RELOCATION_BLOCK_HEADER)..cursor.saturating_add(block_size))
         else {
             return false;
         };
+
         let known = words.as_chunks::<2>().0.iter().all(|word| {
             KNOWN_RELOCATION_KINDS.contains(&(u16::from_le_bytes(*word) >> RELOCATION_KIND_SHIFT))
         });
+
         if !known {
             return false;
         }
+
         cursor = cursor.saturating_add(block_size);
     }
+
     true
 }
 
@@ -121,12 +158,118 @@ pub(super) fn exports_intact(bytes: &[u8], start: usize) -> bool {
     ) else {
         return false;
     };
+
     functions > 0
         && table != 0
         && bytes
             .get(name as usize..)
             .and_then(|text| text.first())
             .is_some_and(|first| first.is_ascii_graphic())
+}
+
+pub(super) fn export_functions(bytes: &[u8], start: usize) -> Option<Vec<usize>> {
+    let count = read_u32(bytes, start.checked_add(EXPORT_FUNCTION_COUNT_OFFSET)?).ok()? as usize;
+    let table = read_u32(bytes, start.checked_add(EXPORT_FUNCTIONS_OFFSET)?).ok()? as usize;
+    (0..count.min(MAX_RESOURCE_ENTRIES))
+        .map(|index| {
+            let at = table.checked_add(index.checked_mul(EXPORT_TABLE_ENTRY_SIZE)?)?;
+            Some(read_u32(bytes, at).ok()? as usize)
+        })
+        .collect()
+}
+
+pub(super) fn linker_export_layout(
+    bytes: &[u8],
+    copy: usize,
+    forwarders: &[(usize, String)],
+) -> Option<(usize, Vec<u8>)> {
+    let field = |offset: usize| Some(read_u32(bytes, copy.checked_add(offset)?).ok()? as usize);
+    let functions = export_functions(bytes, copy)?;
+    let name_count = field(EXPORT_NAME_COUNT_OFFSET)?.min(MAX_RESOURCE_ENTRIES);
+    let (names, ordinals) = (field(EXPORT_NAMES_OFFSET)?, field(EXPORT_ORDINALS_OFFSET)?);
+    let module = read_c_string(bytes, field(EXPORT_NAME_OFFSET)?)?.0;
+
+    let mut exported = Vec::with_capacity(name_count); // name, its function index, its forwarder
+    for index in 0..name_count {
+        let name = read_u32(bytes, names.checked_add(index.checked_mul(4)?)?).ok()? as usize;
+        let function = read_u16(bytes, ordinals.checked_add(index.checked_mul(2)?)?).ok()?;
+        let forwarder = functions
+            .get(usize::from(function))
+            .and_then(|rva| forwarders.iter().find(|(at, _)| at == rva));
+        exported.push((read_c_string(bytes, name)?.0, function, forwarder));
+    }
+
+    let placed = exported
+        .iter()
+        .filter(|(_, _, forwarder)| forwarder.is_some())
+        .count();
+    (placed == forwarders.len()).then_some(())?;
+
+    let name_table = EXPORT_DIRECTORY_SIZE.checked_add(functions.len().checked_mul(4)?)?;
+    let ordinal_table = name_table.checked_add(name_count.checked_mul(4)?)?;
+    let module_offset = ordinal_table.checked_add(name_count.checked_mul(2)?)?;
+    let mut cursor = module_offset.checked_add(module.len())?.checked_add(1)?;
+    let mut name_offsets = Vec::with_capacity(name_count);
+    let mut start = None;
+    for (name, _, forwarder) in &exported {
+        name_offsets.push(cursor);
+        cursor = cursor.checked_add(name.len())?.checked_add(1)?;
+
+        if let Some((rva, target)) = forwarder {
+            let here = rva.checked_sub(cursor)?;
+            (*start.get_or_insert(here) == here).then_some(())?;
+            cursor = cursor.checked_add(target.len())?.checked_add(1)?;
+        }
+    }
+
+    let start = start?;
+    let mut block = bytes
+        .get(copy..copy.checked_add(EXPORT_DIRECTORY_SIZE)?)?
+        .to_vec();
+    for (offset, value) in [
+        (EXPORT_NAME_OFFSET, module_offset),
+        (EXPORT_FUNCTIONS_OFFSET, EXPORT_DIRECTORY_SIZE),
+        (EXPORT_NAMES_OFFSET, name_table),
+        (EXPORT_ORDINALS_OFFSET, ordinal_table),
+    ] {
+        write_u32(
+            &mut block,
+            offset,
+            u32::try_from(start.checked_add(value)?).ok()?,
+        )
+        .ok()?;
+    }
+
+    for rva in &functions {
+        block.extend_from_slice(&u32::try_from(*rva).ok()?.to_le_bytes());
+    }
+
+    for offset in &name_offsets {
+        block.extend_from_slice(
+            &u32::try_from(start.checked_add(*offset)?)
+                .ok()?
+                .to_le_bytes(),
+        );
+    }
+
+    for (_, function, _) in &exported {
+        block.extend_from_slice(&function.to_le_bytes());
+    }
+
+    block.extend_from_slice(module.as_bytes());
+    block.push(0);
+
+    for (name, _, forwarder) in &exported {
+        block.extend_from_slice(name.as_bytes());
+        block.push(0);
+
+        if let Some((_, target)) = forwarder {
+            block.extend_from_slice(target.as_bytes());
+            block.push(0);
+        }
+    }
+
+    Some((start, block))
 }
 
 pub(super) fn moved_export_directory(
@@ -138,6 +281,7 @@ pub(super) fn moved_export_directory(
     if size < EXPORT_DIRECTORY_SIZE {
         return None;
     }
+
     let mut block = bytes.get(packed..packed.checked_add(size)?)?.to_vec();
     let packed_range = packed..packed.checked_add(size)?;
     let shift = |value: u32| -> Option<u32> {
@@ -146,8 +290,10 @@ pub(super) fn moved_export_directory(
             true => value.checked_sub(packed)?.checked_add(original)?,
             false => value,
         };
+
         u32::try_from(moved).ok()
     };
+
     for field in EXPORT_RVA_OFFSETS {
         let moved = shift(read_u32(&block, field).ok()?)?;
         write_u32(&mut block, field, moved).ok()?;
@@ -160,12 +306,14 @@ pub(super) fn moved_export_directory(
         (EXPORT_FUNCTIONS_OFFSET, functions),
     ] {
         let table = (read_u32(&block, table_field).ok()? as usize).checked_sub(original)?;
+
         for index in 0..count {
             let at = table.checked_add(index.checked_mul(EXPORT_TABLE_ENTRY_SIZE)?)?;
             let moved = shift(read_u32(&block, at).ok()?)?; // name strings and forwarder strings
             write_u32(&mut block, at, moved).ok()?;
         }
     }
+
     Some(block)
 }
 
@@ -179,6 +327,7 @@ pub(super) fn walk_resources(bytes: &[u8], start: usize) -> Option<ResourceTree>
         structure_length: 0,
         data_entries: Vec::new(),
     };
+
     walk_resource_table(bytes, start, 0, 0, &mut tree)?;
     Some(tree)
 }
@@ -193,6 +342,7 @@ fn walk_resource_table(
     if depth >= MAX_RESOURCE_DEPTH || tree.data_entries.len() >= MAX_RESOURCE_ENTRIES {
         return None;
     }
+
     let header = start.checked_add(table)?;
     let named =
         usize::from(read_u16(bytes, header.checked_add(RESOURCE_NAMED_COUNT_OFFSET)?).ok()?);
@@ -210,13 +360,16 @@ fn walk_resource_table(
             .checked_add(index.checked_mul(RESOURCE_ENTRY_SIZE)?)?;
         let name = read_u32(bytes, entry).ok()?;
         let target = read_u32(bytes, entry.checked_add(RESOURCE_ENTRY_TARGET_OFFSET)?).ok()?;
+
         if name & RESOURCE_SUBDIRECTORY != 0 {
             let string = (name & !RESOURCE_SUBDIRECTORY) as usize;
             let length = usize::from(read_u16(bytes, start.checked_add(string)?).ok()?);
-            let string_end = string.checked_add(2)?.checked_add(length.checked_mul(2)?)?; // a u16 count of utf-16 units
+            let string_end = string.checked_add(2)?.checked_add(length.checked_mul(2)?)?; // a u16 count of utf16 units
             tree.structure_length = tree.structure_length.max(string_end);
         }
+
         let offset = (target & !RESOURCE_SUBDIRECTORY) as usize;
+
         if target & RESOURCE_SUBDIRECTORY != 0 {
             walk_resource_table(bytes, start, offset, depth.checked_add(1)?, tree)?;
         } else {
@@ -225,6 +378,7 @@ fn walk_resource_table(
             tree.data_entries.push(offset);
         }
     }
+
     Some(())
 }
 
@@ -258,12 +412,15 @@ pub(super) fn find_codeview_record(bytes: &[u8]) -> Option<CodeViewRecord> {
             let Some(size) = codeview_size(bytes, start, header) else {
                 continue;
             };
+
             if found.is_some() {
                 return None;
             }
+
             found = Some(CodeViewRecord { rva: start, size });
         }
     }
+
     found
 }
 
@@ -302,6 +459,7 @@ pub(super) fn codeview_entry(
         u32::try_from(record.rva).ok()?,
     )
     .ok()?;
+
     Some(entry)
 }
 
@@ -320,6 +478,7 @@ pub(super) fn place(restored: &mut [u8], destination: usize, content: &[u8]) -> 
     if !is_free(restored, destination, content) {
         return None;
     }
+
     restored
         .get_mut(destination..destination.checked_add(content.len())?)?
         .copy_from_slice(content);
@@ -338,6 +497,175 @@ pub(super) fn set_directory(
     write_u32(restored, offset.checked_add(4)?, u32::try_from(size).ok()?).ok()
 }
 
+pub(super) fn iat_span(
+    tables: impl IntoIterator<Item = (usize, usize)>, // first slot and slot count of each table
+    width: usize,
+) -> Option<(usize, usize)> {
+    let mut first = usize::MAX;
+    let mut end = 0;
+    for (start, slots) in tables {
+        first = first.min(start);
+        end = end.max(start.checked_add(slots.checked_add(1)?.checked_mul(width)?)?); // plus the terminator
+    }
+
+    (first < end).then(|| (first, end - first))
+}
+
+pub(super) fn set_tls_directory(restored: &mut [u8], model: &PeModel, rva: usize) -> Option<()> {
+    let size = match model.kind() {
+        PeKind::Pe32 => TLS_DIRECTORY_PE32,
+        PeKind::Pe32Plus => TLS_DIRECTORY_PE32_PLUS,
+    };
+
+    set_directory(restored, model, TLS_DIRECTORY, rva, size)
+}
+
 pub(super) fn clear_directory(restored: &mut [u8], model: &PeModel, index: usize) {
     let _ = set_directory(restored, model, index, 0, 0);
+}
+
+pub(super) fn find_delay_directory(bytes: &[u8], end: usize) -> Option<(usize, usize)> {
+    unique(
+        (FIRST_SECTION_RVA..end)
+            .step_by(SCAN_STEP)
+            .filter_map(|at| {
+                let count = delay_descriptor_count(bytes, at, end)?;
+                Some((
+                    at,
+                    count.checked_add(1)?.checked_mul(DELAY_DESCRIPTOR_SIZE)?,
+                ))
+            }),
+    )
+}
+
+fn delay_descriptor_count(bytes: &[u8], start: usize, end: usize) -> Option<usize> {
+    let in_image = |rva: u32| (FIRST_SECTION_RVA..end).contains(&(rva as usize));
+
+    for index in 0..MAX_DELAY_DESCRIPTORS {
+        let at = start.checked_add(index.checked_mul(DELAY_DESCRIPTOR_SIZE)?)?;
+        let descriptor = bytes.get(at..at.checked_add(DELAY_DESCRIPTOR_SIZE)?)?;
+
+        if index > 0 && descriptor.iter().all(|byte| *byte == 0) {
+            return Some(index);
+        }
+
+        let field = |offset: usize| read_u32(descriptor, offset).ok();
+        let valid = field(0) == Some(DELAY_ATTRIBUTES_RVA_BASED)
+            && field(DELAY_HANDLE_OFFSET).is_some_and(in_image)
+            && field(DELAY_IAT_OFFSET).is_some_and(in_image)
+            && field(DELAY_NAMES_OFFSET).is_some_and(in_image)
+            && field(DELAY_NAME_OFFSET).is_some_and(|name| is_dll_name(bytes, name as usize));
+        if !valid {
+            return None;
+        }
+    }
+
+    None
+}
+
+fn is_dll_name(bytes: &[u8], at: usize) -> bool {
+    let Some(text) = bytes.get(at..at.saturating_add(MAX_DLL_NAME).min(bytes.len())) else {
+        return false;
+    };
+
+    let Some(length) = text.iter().position(|byte| *byte == 0) else {
+        return false;
+    };
+
+    let name = &text[..length];
+    name.iter().all(u8::is_ascii_graphic)
+        && name.len() > 4
+        && name[name.len() - 4..].eq_ignore_ascii_case(b".dll")
+}
+
+pub(super) fn find_load_config(
+    bytes: &[u8],
+    kind: PeKind,
+    base: usize,
+    end: usize,
+) -> Option<usize> {
+    let cookie_offset = match kind {
+        PeKind::Pe32 => LOAD_CONFIG_COOKIE_PE32,
+        PeKind::Pe32Plus => LOAD_CONFIG_COOKIE_PE32_PLUS,
+    };
+
+    let width = kind.pointer_width();
+    let in_image = |value: usize| (base..base.saturating_add(end)).contains(&value);
+    unique((FIRST_SECTION_RVA..end).step_by(SCAN_STEP).filter(|at| {
+        let size = read_u32(bytes, *at).unwrap_or(0);
+        let cookie = read_pointer(bytes, at.saturating_add(cookie_offset), kind).ok();
+        size as usize > cookie_offset.saturating_add(width)
+            && size <= MAX_LOAD_CONFIG_SIZE
+            && size.is_multiple_of(4)
+            && read_u32(bytes, at.saturating_add(LOAD_CONFIG_TIMESTAMP_OFFSET)) == Ok(0)
+            && cookie.is_some_and(in_image)
+            && (matches!(kind, PeKind::Pe32Plus) || safeseh_fits(bytes, *at, in_image))
+    }))
+}
+
+fn safeseh_fits(bytes: &[u8], at: usize, in_image: impl Fn(usize) -> bool) -> bool {
+    let table = read_u32(bytes, at.saturating_add(LOAD_CONFIG_HANDLERS_PE32)).unwrap_or(u32::MAX);
+    let count =
+        read_u32(bytes, at.saturating_add(LOAD_CONFIG_HANDLERS_PE32 + 4)).unwrap_or(u32::MAX);
+    (table == 0 || in_image(table as usize)) && count <= MAX_SAFESEH_HANDLERS
+}
+
+pub(super) fn find_original_tls(
+    bytes: &[u8],
+    copy: usize,
+    kind: PeKind,
+    end: usize,
+) -> Option<usize> {
+    let width = kind.pointer_width();
+    let callbacks = width.checked_mul(3)?;
+    let length = width.checked_mul(4)?.checked_add(8)?;
+    let wanted = bytes.get(copy..copy.checked_add(length)?)?;
+    let (before, after) = (wanted.get(..callbacks)?, wanted.get(callbacks + width..)?);
+    unique((FIRST_SECTION_RVA..end).step_by(SCAN_STEP).filter(|at| {
+        *at != copy
+            && bytes.get(*at..at.saturating_add(callbacks)) == Some(before)
+            && bytes.get(at.saturating_add(callbacks + width)..at.saturating_add(length))
+                == Some(after)
+    }))
+}
+
+pub(super) fn find_tls_by_template(
+    bytes: &[u8],
+    copy: usize,
+    kind: PeKind,
+    base: usize,
+    end: usize,
+) -> Option<usize> {
+    let width = kind.pointer_width();
+    let template = |at: usize, limit: usize| -> Option<(usize, usize)> {
+        let image = |pointer: usize| pointer.checked_sub(base).filter(|rva| *rva < limit);
+        let start = image(read_pointer(bytes, at, kind).ok()?)?;
+        let stop = image(read_pointer(bytes, at.checked_add(width)?, kind).ok()?)?;
+        image(read_pointer(bytes, at.checked_add(width * 2)?, kind).ok()?)?;
+        (stop > start).then_some((start, stop))
+    };
+
+    let (start, stop) = template(copy, bytes.len())?;
+    let wanted = bytes.get(start..stop)?;
+    unique((FIRST_SECTION_RVA..end).step_by(SCAN_STEP).filter(|at| {
+        *at != copy
+            && template(*at, end).is_some_and(|(other_start, other_stop)| {
+                other_start != start && bytes.get(other_start..other_stop) == Some(wanted)
+            })
+    }))
+}
+
+fn unique<T>(mut found: impl Iterator<Item = T>) -> Option<T> {
+    let first = found.next()?;
+    found.next().is_none().then_some(first)
+}
+
+pub(super) fn read_c_string(bytes: &[u8], at: usize) -> Option<(String, usize)> {
+    let tail = bytes.get(at..)?;
+    let length = tail
+        .iter()
+        .take(MAX_NAME_LENGTH)
+        .position(|byte| *byte == 0)?;
+    let text = std::str::from_utf8(tail.get(..length)?).ok()?;
+    (!text.is_empty()).then(|| (text.to_owned(), at.saturating_add(length).saturating_add(1)))
 }

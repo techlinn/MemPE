@@ -36,6 +36,7 @@ impl std::error::Error for AppError {}
 
 fn main() -> ExitCode {
     let console = Console::new();
+
     match cli::parse(std::env::args_os()) {
         Ok(None) => {
             print!("{}", cli::HELP);
@@ -61,6 +62,7 @@ fn run(console: &Console, request: Request) -> ExitCode {
         raw_regions,
         only,
     } = request;
+
     let watched = matches!(&command, Command::Watch(_));
     let output = match output::prepare() {
         Ok(Some(plan)) => plan,
@@ -70,6 +72,7 @@ fn run(console: &Console, request: Request) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+
     let target = match find_target(console, command) {
         Ok(target) => target,
         Err(error) => {
@@ -77,7 +80,9 @@ fn run(console: &Console, request: Request) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
     render_target(console, &target);
+
     if watched {
         render_stability(console, &target);
     }
@@ -89,6 +94,7 @@ fn run(console: &Console, request: Request) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
     console.section("CAPTURE");
     console.field("Method", format_args!("{}", capture.mode));
     console.field(
@@ -96,11 +102,13 @@ fn run(console: &Console, request: Request) -> ExitCode {
         format_args!("{} ms", capture.setup_elapsed.as_millis()),
     );
     console.field("Images", format_args!("{}", capture.images.len()));
+
     if let Some(reason) = &capture.fallback_reason {
         console.warning(format_args!(
             "PSS was unavailable ({reason}); live memory may have changed"
         ));
     }
+
     console.blank();
 
     finish_dump(
@@ -118,6 +126,7 @@ fn render_target(console: &Console, target: &TargetProcess) {
     console.field("Name", format_args!("{}", target.name));
     console.field("PID", format_args!("{}", target.pid.get()));
     console.field("Arch", format_args!("{}", target.architecture));
+
     match &target.main_module {
         Some(module) => console.field(
             "Image",
@@ -125,11 +134,13 @@ fn render_target(console: &Console, target: &TargetProcess) {
         ),
         None => console.field("Image", format_args!("resolved during capture")),
     }
+
     if target.module_listing_denied {
         console.warning(format_args!(
             "Module enumeration was denied, so image names come from mapped files, not the loader"
         ));
     }
+
     console.blank();
 }
 
@@ -162,6 +173,7 @@ fn finish_dump(
             return ExitCode::from(2);
         }
     };
+
     render_output(console, output, &outcome);
     render_analysis(console, &outcome);
     render_warnings(console, &outcome);
@@ -179,6 +191,7 @@ fn finish_dump(
                 outcome.main_rebuilt, outcome.dll_failures
             )),
         }
+
         ExitCode::from(3)
     }
 }
@@ -192,6 +205,7 @@ fn render_output(console: &Console, output: &OutputPlan, outcome: &DumpOutcome) 
     {
         render_main_artifact(console, main);
     }
+
     console.field("DLLs", format_args!("{}", outcome.summary.dlls));
     console.field(
         "Hidden PEs",
@@ -201,12 +215,14 @@ fn render_output(console: &Console, output: &OutputPlan, outcome: &DumpOutcome) 
         "Embedded",
         format_args!("{} carved PEs", outcome.summary.embedded_pes),
     );
+
     if outcome.summary.raw_regions > 0 {
         console.field(
             "Regions",
             format_args!("{} written", outcome.summary.raw_regions),
         );
     }
+
     console.field("Folder", format_args!("{}", output.directory().display()));
     console.blank();
 }
@@ -235,9 +251,11 @@ fn render_main_artifact(console: &Console, main: &output::WrittenFile<dump::Arti
             unwind_note(main.context.entry_unwind_covered)
         ),
     );
+
     if let Some(packer) = &main.context.packer {
         render_packer(console, packer);
     }
+
     if main.context.managed {
         console.field(
             "Managed",
@@ -246,12 +264,14 @@ fn render_main_artifact(console: &Console, main: &output::WrittenFile<dump::Arti
             ),
         );
     }
+
     if main.context.declared_iat_slots > 0 {
         console.field(
             "IAT",
             format_args!("{} slots declared", main.context.declared_iat_slots),
         );
     }
+
     if main.context.private_pages > 0 {
         console.field(
             "Runtime",
@@ -262,6 +282,7 @@ fn render_main_artifact(console: &Console, main: &output::WrittenFile<dump::Arti
         );
         return;
     }
+
     console.field(
         "Runtime",
         format_args!("not measurable; re-run against a freshly started process"),
@@ -290,6 +311,7 @@ fn render_packer_gaps(console: &Console, packer: &pe::PackerReport) {
             format_args!("{}", packer.unrestored.join(", ")),
         );
     }
+
     if !packer.lost.is_empty() {
         console.field("Lost", format_args!("{}", packer.lost.join(", ")));
     }
@@ -325,6 +347,7 @@ fn render_analysis(console: &Console, outcome: &DumpOutcome) {
         ),
     );
     render_recovery_confidence(console, &outcome.summary);
+
     if outcome.summary.unresolved_delay > 0 {
         console.field(
             "Delay",
@@ -334,6 +357,7 @@ fn render_analysis(console: &Console, outcome: &DumpOutcome) {
             ),
         );
     }
+
     console.field(
         "TLS",
         format_args!(
@@ -359,6 +383,7 @@ fn render_packed_images(console: &Console, outcome: &DumpOutcome) {
         let Some(packer) = &artifact.context.packer else {
             continue;
         };
+
         let name = artifact
             .path
             .file_name()
@@ -376,28 +401,34 @@ fn render_warnings(console: &Console, outcome: &DumpOutcome) {
     if !outcome.has_warnings() {
         return;
     }
+
     console.blank();
     console.section("WARNINGS");
+
     if outcome.main_image_missing {
         console.warning(format_args!(
             "The main image was not present in the captured address space; every other module was still dumped"
         ));
     }
+
     render_repair_warnings(console, outcome);
     render_import_warnings(console, outcome);
     render_build_failures(console, outcome);
+
     if outcome.images_skipped > 0 {
         console.warning(format_args!(
             "Images skipped for the memory budget: {}",
             outcome.images_skipped
         ));
     }
+
     if outcome.unscanned_bytes > 0 {
         console.warning(format_args!(
             "Memory left unscanned for embedded PEs: {}",
             format_size(outcome.unscanned_bytes)
         ));
     }
+
     let unmatched_non_image = outcome
         .executable_non_image_allocations
         .saturating_sub(outcome.hidden_non_image_images);
@@ -410,14 +441,17 @@ fn render_warnings(console: &Console, outcome: &DumpOutcome) {
 
 fn render_repair_warnings(console: &Console, outcome: &DumpOutcome) {
     let summary = &outcome.summary;
+
     for (count, label) in repair_warning_counts(summary) {
         if count > 0 {
             console.warning(format_args!("{label}: {count}"));
         }
     }
+
     if summary.notable_cleared_directories.is_empty() {
         return;
     }
+
     let names = summary
         .notable_cleared_directories
         .iter()
@@ -504,10 +538,12 @@ fn render_recovery_confidence(console: &Console, summary: &dump::DumpSummary) {
     if tiered == 0 {
         return;
     }
+
     let from_packer = match summary.recovered_packer {
         0 => String::new(),
         count => format!("{count} from packer, "),
     };
+
     console.field(
         "Recovered",
         format_args!(
@@ -518,6 +554,7 @@ fn render_recovery_confidence(console: &Console, summary: &dump::DumpSummary) {
             summary.recovered_inferred
         ),
     );
+
     let tabled = summary
         .recovered_attested
         .saturating_add(summary.recovered_scanned)
@@ -531,6 +568,7 @@ fn render_recovery_confidence(console: &Console, summary: &dump::DumpSummary) {
             ),
         );
     }
+
     if summary.mixed_module_runs > 0 {
         console.field(
             "Mixed runs",
@@ -544,48 +582,56 @@ fn render_recovery_confidence(console: &Console, summary: &dump::DumpSummary) {
 
 fn render_import_warnings(console: &Console, outcome: &DumpOutcome) {
     let summary = &outcome.summary;
+
     if summary.ambiguous_imports > 0 {
         console.warning(format_args!(
             "Ambiguous import pointers skipped: {}",
             summary.ambiguous_imports
         ));
     }
+
     if summary.unresolved_unknown_stub > 0 {
         console.warning(format_args!(
             "Called pointers into their own image's code that mempe could not trace to an export: {}",
             summary.unresolved_unknown_stub
         ));
     }
+
     if summary.unresolved_other_module > 0 {
         console.warning(format_args!(
             "Called pointers into another module at no export: {}",
             summary.unresolved_other_module
         ));
     }
+
     if summary.unresolved_outside_image > 0 {
         console.warning(format_args!(
             "Called pointers outside every captured image: {}",
             summary.unresolved_outside_image
         ));
     }
+
     if summary.unresolved_chain_exhausted > 0 {
         console.warning(format_args!(
             "Called pointers whose thunk chain never reached an export: {}",
             summary.unresolved_chain_exhausted
         ));
     }
+
     if summary.slots_outside_data_sections > 0 {
         console.warning(format_args!(
             "Called import slots skipped because they lie outside any data section: {}",
             summary.slots_outside_data_sections
         ));
     }
+
     if summary.invalid_unwind_entries > 0 {
         console.warning(format_args!(
             "Invalid x64 unwind entries removed: {}",
             summary.invalid_unwind_entries
         ));
     }
+
     if outcome.export_stats.unresolved_forwarders > 0 {
         console.warning(format_args!(
             "Forwarded exports with no matching image: {}",
@@ -620,7 +666,9 @@ fn format_size(bytes: usize) -> String {
     const KIB: f64 = 1024.0;
     const MIB: f64 = KIB * 1024.0;
     const GIB: f64 = MIB * 1024.0;
+
     let bytes = bytes as f64;
+
     if bytes >= GIB {
         format!("{:.2} GiB", bytes / GIB)
     } else if bytes >= MIB {
