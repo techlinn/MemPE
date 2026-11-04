@@ -829,12 +829,13 @@ fn restore_forwarders(restored: &mut [u8], model: &PeModel, end: usize) -> Resto
         return Restoration::Absent;
     }
 
-    let rebuilt = linker_export_layout(restored, copy, &forwarders).and_then(|(start, block)| {
-        place(restored, start, &block)?;
+    let rebuilt =
+        linker_export_layout(restored, copy, &forwarders, None).and_then(|(start, block)| {
+            place(restored, start, &block)?;
 
-        let size = block.len().checked_next_multiple_of(EXPORT_ALIGNMENT)?;
-        set_directory(restored, model, EXPORT_DIRECTORY, start, size)
-    });
+            let size = block.len().checked_next_multiple_of(EXPORT_ALIGNMENT)?;
+            set_directory(restored, model, EXPORT_DIRECTORY, start, size)
+        });
 
     match rebuilt {
         Some(()) => Restoration::Restored,

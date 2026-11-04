@@ -2,9 +2,9 @@ use super::nrv::{self, Variant};
 use super::tables::{
     DEBUG_ENTRY_SIZE, DEBUG_TYPE_CODEVIEW, DEBUG_TYPE_OFFSET, RESOURCE_DATA_SIZE_OFFSET,
     Restoration, SECTION_COUNT_OFFSET, SECTION_RVA_OFFSET, clear_directory, codeview_entry,
-    exports_intact, find_codeview_record, fresh_image, is_free, moved_export_directory, place,
-    read_c_string, relocate, relocation_blocks, relocations_intact, resources_intact,
-    set_directory, walk_resources,
+    export_functions, exports_intact, find_codeview_record, fresh_image, is_free,
+    linker_export_layout, moved_export_directory, place, read_c_string, relocate,
+    relocation_blocks, relocations_intact, resources_intact, set_directory, walk_resources,
 };
 use super::{
     FreshImage, HeaderSource, ImportedFunction, ModuleImports, Origin, PackerFindings,
@@ -14,8 +14,8 @@ use crate::pe::image::{read_pointer, read_u16, read_u32, write_u32};
 use crate::pe::parse::{parse_disk_image, parse_memory_image};
 use crate::pe::{
     BASERELOC_DIRECTORY, BOUND_IMPORT_DIRECTORY, DEBUG_DIRECTORY, EXPORT_DIRECTORY,
-    IMAGE_SCN_MEM_WRITE, IMPORT_DIRECTORY, PeImage, PeKind, PeModel, RESOURCE_DIRECTORY, Rva,
-    SECTION_HEADER_SIZE, SectionModel,
+    IMAGE_SCN_MEM_WRITE, IMPORT_DIRECTORY, LOAD_CONFIG_DIRECTORY, PeImage, PeKind, PeModel,
+    RESOURCE_DIRECTORY, Rva, SECTION_HEADER_SIZE, SectionModel,
 };
 
 const NAME: &str = "UPX";
@@ -77,6 +77,11 @@ const LZMA_POSITION_MASK: u8 = 0x07;
 const ADLER_MODULO: u32 = 65_521;
 const CODE_SIZE_OFFSET: usize = 4; // inside the optional header
 const CODE_BASE_OFFSET: usize = 20;
+const GUARD_FUNCTION_COUNT_PE32: usize = 0x54; // inside the load config
+const GUARD_FLAGS_PE32: usize = 0x58;
+const GUARD_FUNCTION_COUNT_PE32_PLUS: usize = 0x88;
+const GUARD_FLAGS_PE32_PLUS: usize = 0x90;
+const GUARD_CF_INSTRUMENTED: u32 = 0x100;
 
 struct StubShape {
     stack_clear: &'static str,
@@ -146,9 +151,11 @@ pub(super) fn unpack(image: &PeImage<'_>, origin: &Origin<'_>) -> Option<Unpacke
         return None;
     }
 
+    let file = origin.read_file();
     let version = pack_header
         .as_ref()
-        .and_then(|header| header.version.clone());
+        .and_then(|header| header.version.clone())
+        .or_else(|| find_pack_header(file.as_deref()?)?.version); // big programs unpack over it when the header page is small
 
     let expects_completion_mark = stub.as_ref().is_some_and(|stub| stub.marks_completion)
         && matches!(origin.headers, HeaderSource::Memory);
@@ -164,10 +171,16 @@ pub(super) fn unpack(image: &PeImage<'_>, origin: &Origin<'_>) -> Option<Unpacke
         );
 
         if let Some(mut unpacked) = restored {
-            unpacked.fresh = unpacked
-                .image
-                .as_deref()
-                .and_then(|restored| fresh(bytes, restored, model.kind(), origin, image_start));
+            if let (Some(restored), Some(file)) = (unpacked.image.as_deref(), file.as_deref()) {
+                unpacked.fresh = fresh(
+                    bytes,
+                    restored,
+                    file,
+                    model.kind(),
+                    origin.base,
+                    image_start,
+                );
+            }
             return Some(unpacked);
         }
     }
@@ -265,6 +278,11 @@ fn restore_from(
     report.record("resources", resources);
 
     restore_debug_directory(&mut restored, &restored_model, stored, &mut report);
+    if guard_flags_cleared(&restored, &restored_model) {
+        report
+            .lost
+            .push("control flow guard flags the packer cleared");
+    }
     parse_memory_image(&restored).ok()?;
 
     Some(Unpacked {
@@ -472,18 +490,18 @@ fn find_pack_header(bytes: &[u8]) -> Option<PackHeader> {
 fn fresh(
     memory: &[u8],
     restored: &[u8],
+    file: &[u8],
     kind: PeKind,
-    origin: &Origin<'_>,
+    base: usize,
     image_start: usize,
 ) -> Option<FreshImage> {
-    let file = origin.read_file()?;
-    let header = find_pack_header(&file)?;
-    let field = |offset| read_u32(&file, header.offset + offset).ok();
+    let header = find_pack_header(file)?;
+    let field = |offset| read_u32(file, header.offset + offset).ok();
     let packed_length = field(COMPRESSED_LENGTH_OFFSET)? as usize;
     let packed_adler = field(COMPRESSED_ADLER_OFFSET)?;
 
-    let disk = parse_disk_image(&file).ok()?;
-    let file_base = read_pointer(&file, disk.model().image_base_offset, kind).ok()?;
+    let disk = parse_disk_image(file).ok()?;
+    let file_base = read_pointer(file, disk.model().image_base_offset, kind).ok()?;
     let after_header = header.offset + PACK_HEADER_SIZE; // small files keep the pack header at the front of the data
     let stream = disk
         .model()
@@ -530,7 +548,7 @@ fn fresh(
         restored,
         &pristine,
         file_base,
-        origin.base,
+        base,
         restored.len(),
         &filtered,
     )
@@ -900,7 +918,9 @@ fn restore_exports(restored: &mut [u8], model: &PeModel, packed: &PeImage<'_>) -
             let block =
                 moved_export_directory(packed.bytes(), copy.rva().as_usize(), size, destination)?;
             place(restored, destination, &block)?;
-            set_directory(restored, model, EXPORT_DIRECTORY, destination, block.len())
+            set_directory(restored, model, EXPORT_DIRECTORY, destination, block.len())?;
+            linker_order(restored, destination, block.len());
+            Some(())
         });
     match moved {
         Some(()) => Restoration::Restored,
@@ -909,6 +929,42 @@ fn restore_exports(restored: &mut [u8], model: &PeModel, packed: &PeImage<'_>) -
             Restoration::Failed
         }
     }
+}
+
+fn linker_order(restored: &mut [u8], start: usize, size: usize) {
+    let end = start + size;
+    let forwarders = export_functions(restored, start)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|rva| (start..end).contains(rva))
+        .filter_map(|rva| Some((rva, read_c_string(restored, rva)?.0)))
+        .collect::<Vec<_>>();
+    if forwarders.is_empty() {
+        return; // upx only moves forwarder strings, everything else is already in linker order
+    }
+
+    let Some((_, block)) = linker_export_layout(restored, start, &forwarders, Some(start)) else {
+        return;
+    };
+    if let Some(target) = restored.get_mut(start..end).filter(|_| block.len() == size) {
+        target.copy_from_slice(&block);
+    }
+}
+
+fn guard_flags_cleared(restored: &[u8], model: &PeModel) -> bool {
+    let Ok(Some(directory)) = model.directory(restored, LOAD_CONFIG_DIRECTORY) else {
+        return false;
+    };
+    let start = directory.rva().as_usize();
+    let (count, flags) = match model.kind() {
+        PeKind::Pe32 => (GUARD_FUNCTION_COUNT_PE32, GUARD_FLAGS_PE32),
+        PeKind::Pe32Plus => (GUARD_FUNCTION_COUNT_PE32_PLUS, GUARD_FLAGS_PE32_PLUS),
+    };
+    let field = |offset: usize| read_u32(restored, start + offset).ok();
+
+    field(0).is_some_and(|size| size as usize >= flags + 4)
+        && field(count).is_some_and(|count| count != 0)
+        && field(flags).is_some_and(|flags| flags & GUARD_CF_INSTRUMENTED == 0) // --force keeps the table but drops the flags
 }
 
 fn restore_resources(

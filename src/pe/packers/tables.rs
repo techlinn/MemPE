@@ -192,6 +192,7 @@ pub(super) fn linker_export_layout(
     bytes: &[u8],
     copy: usize,
     forwarders: &[(usize, String)],
+    known_start: Option<usize>,
 ) -> Option<(usize, Vec<u8>)> {
     let field = |offset: usize| Some(read_u32(bytes, copy.checked_add(offset)?).ok()? as usize);
     let functions = export_functions(bytes, copy)?;
@@ -220,19 +221,23 @@ pub(super) fn linker_export_layout(
     let module_offset = ordinal_table.checked_add(name_count.checked_mul(2)?)?;
     let mut cursor = module_offset.checked_add(module.len())?.checked_add(1)?;
     let mut name_offsets = Vec::with_capacity(name_count);
-    let mut start = None;
-    for (name, _, forwarder) in &exported {
+    let mut inferred = None;
+    let mut forwarder_offsets = Vec::new(); // function index and where its forwarder string lands
+    for (name, function, forwarder) in &exported {
         name_offsets.push(cursor);
         cursor = cursor.checked_add(name.len())?.checked_add(1)?;
 
         if let Some((rva, target)) = forwarder {
-            let here = rva.checked_sub(cursor)?;
-            (*start.get_or_insert(here) == here).then_some(())?;
+            forwarder_offsets.push((usize::from(*function), cursor));
+            if known_start.is_none() {
+                let here = rva.checked_sub(cursor)?; // each forwarder still sits where the linker put it
+                (*inferred.get_or_insert(here) == here).then_some(())?;
+            }
             cursor = cursor.checked_add(target.len())?.checked_add(1)?;
         }
     }
 
-    let start = start?;
+    let start = known_start.or(inferred)?;
     let mut block = bytes
         .get(copy..copy.checked_add(EXPORT_DIRECTORY_SIZE)?)?
         .to_vec();
@@ -250,8 +255,15 @@ pub(super) fn linker_export_layout(
         .ok()?;
     }
 
-    for rva in &functions {
-        block.extend_from_slice(&u32::try_from(*rva).ok()?.to_le_bytes());
+    for (index, rva) in functions.iter().enumerate() {
+        let rva = match forwarder_offsets
+            .iter()
+            .find(|(function, _)| *function == index)
+        {
+            Some((_, offset)) => start.checked_add(*offset)?,
+            None => *rva,
+        };
+        block.extend_from_slice(&u32::try_from(rva).ok()?.to_le_bytes());
     }
 
     for offset in &name_offsets {
