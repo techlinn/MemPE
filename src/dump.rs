@@ -194,6 +194,7 @@ pub(crate) struct DumpSummary {
 
 pub(crate) struct BuildReport {
     files: Vec<OutputFile<ArtifactInfo>>,
+    fresh: Vec<OutputFile<(String, usize)>>, // the dump's name and how many data bytes changed
     failures: Vec<BuildFailure>,
     main_rebuilt: bool,
     dll_failures: usize,
@@ -212,6 +213,7 @@ struct CaptureCounts {
 
 pub(crate) struct DumpOutcome {
     pub(crate) artifacts: Vec<WrittenFile<ArtifactInfo>>,
+    pub(crate) fresh_copies: Vec<PathBuf>,
     pub(crate) failures: Vec<BuildFailure>,
     pub(crate) summary: DumpSummary,
     pub(crate) export_stats: ExportStats,
@@ -230,8 +232,24 @@ impl BuildReport {
         let artifacts = output.write_all(self.files)?;
         let summary = DumpSummary::from_artifacts(&artifacts);
 
+        let changes = self
+            .fresh
+            .iter()
+            .map(|file| file.context.clone())
+            .collect::<Vec<_>>();
+        let fresh_copies = match !changes.is_empty() && crate::output::wants_fresh_copies(&changes)?
+        {
+            true => output
+                .write_all(self.fresh)?
+                .into_iter()
+                .map(|file| file.path)
+                .collect(),
+            false => Vec::new(),
+        };
+
         Ok(DumpOutcome {
             artifacts,
+            fresh_copies,
             failures: self.failures,
             summary,
             export_stats: self.export_stats,
@@ -646,6 +664,7 @@ fn empty_report(
         .count();
     BuildReport {
         files: Vec::with_capacity(images.len()),
+        fresh: Vec::new(),
         failures: Vec::new(),
         main_rebuilt: false,
         dll_failures,
@@ -667,10 +686,18 @@ fn build_image(
     match rebuild_image(&image, exports, image_entry_point)
         .map(|rebuilt| with_overlay(&image, rebuilt))
     {
-        Ok(rebuilt) if should_write(&image, &rebuilt, known_module) => {
+        Ok(mut rebuilt) if should_write(&image, &rebuilt, known_module) => {
             report.main_rebuilt |= image.is_main;
 
             let preferred_name = output_name(target, &image, &rebuilt);
+            if let Some(fresh) = rebuilt.fresh.take() {
+                report.fresh.push(OutputFile {
+                    preferred_name: fresh_name(&preferred_name),
+                    bytes: fresh.image.bytes,
+                    context: (preferred_name.clone(), fresh.changed),
+                });
+            }
+
             let context = artifact_info(&image, &rebuilt);
             report.files.push(OutputFile {
                 preferred_name,
@@ -850,7 +877,17 @@ fn with_overlay(image: &CapturedImage, mut rebuilt: RebuiltImage) -> RebuiltImag
 
     let appended = match read_overlay(path) {
         Ok(None) => return rebuilt,
-        Ok(Some(overlay)) => pe::append_overlay(&mut rebuilt, &overlay).is_ok(),
+        Ok(Some(overlay)) => {
+            let copy_failed = rebuilt
+                .fresh
+                .as_mut()
+                .is_some_and(|fresh| pe::append_overlay(&mut fresh.image, &overlay).is_err());
+            if copy_failed {
+                rebuilt.fresh = None; // without its overlay the copy would not run like the original
+            }
+
+            pe::append_overlay(&mut rebuilt, &overlay).is_ok()
+        }
         Err(_) => false,
     };
 
@@ -915,6 +952,17 @@ fn output_name(target: &TargetProcess, image: &CapturedImage, rebuilt: &RebuiltI
         with_extension(name, "dll")
     } else {
         with_extension(name, "exe")
+    }
+}
+
+fn fresh_name(name: &str) -> String {
+    let path = Path::new(name);
+    let stem = path.file_stem().and_then(|stem| stem.to_str());
+    let extension = path.extension().and_then(|extension| extension.to_str());
+
+    match (stem, extension) {
+        (Some(stem), Some(extension)) => format!("{stem}.fresh.{extension}"),
+        _ => format!("{name}.fresh"),
     }
 }
 

@@ -7,6 +7,7 @@ mod overlay;
 mod sections;
 mod source;
 
+use std::borrow::Cow;
 use std::path::Path;
 
 use crate::pe::exports::ExportIndex;
@@ -82,6 +83,12 @@ pub(crate) struct RebuiltImage {
     pub(crate) never_decrypted_sections: usize,
     pub(crate) absent_sections: usize,
     pub(crate) packer: Option<PackerReport>,
+    pub(crate) fresh: Option<FreshCopy>,
+}
+
+pub(crate) struct FreshCopy {
+    pub(crate) image: Box<RebuiltImage>,
+    pub(crate) changed: usize,
 }
 
 struct SectionLayout<'a> {
@@ -107,15 +114,37 @@ pub(crate) fn rebuild(
     page_flags: &[u8],
 ) -> AppResult<RebuiltImage> {
     let attempt = |unpack: Unpack| {
-        let source = resolve_source_bytes(memory, regions, observed_base, disk, unpack)?;
-        rebuild_source(
-            source,
-            regions,
-            observed_base,
-            exports,
-            entry_point,
-            page_flags,
-        )
+        let mut source = resolve_source_bytes(memory, regions, observed_base, disk, unpack)?;
+        let fresh = source.fresh.take().map(|fresh| {
+            let copy = Source {
+                bytes: Cow::Owned(fresh.bytes),
+                disk_headers_used: source.disk_headers_used,
+                packer: source.packer.clone(),
+                fresh: None,
+            };
+            (copy, fresh.changed)
+        });
+
+        let rebuild = |source| {
+            rebuild_source(
+                source,
+                regions,
+                observed_base,
+                exports,
+                entry_point,
+                page_flags,
+            )
+        };
+
+        let mut rebuilt = rebuild(source)?;
+        rebuilt.fresh = fresh.and_then(|(copy, changed)| {
+            Some(FreshCopy {
+                image: Box::new(rebuild(copy).ok()?),
+                changed,
+            })
+        });
+
+        Ok(rebuilt)
     };
 
     attempt(Unpack::Restore).or_else(|error| match attempt(Unpack::DetectOnly) {
@@ -136,6 +165,7 @@ fn rebuild_source(
         bytes: source,
         disk_headers_used,
         packer,
+        ..
     } = source;
 
     let image = parse_memory_image(&source)
@@ -224,6 +254,7 @@ fn rebuild_source(
         },
         absent_sections: absent_sections(memory, &layouts),
         packer: packer.map(|findings| findings.report),
+        fresh: None,
         bytes: output,
     })
 }

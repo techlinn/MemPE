@@ -234,6 +234,31 @@ fn collision_policy() -> AppResult<Option<CollisionPolicy>> {
     }
 }
 
+pub(crate) fn wants_fresh_copies(changes: &[(String, usize)]) -> AppResult<bool> {
+    if !std::io::stdin().is_terminal() {
+        return Ok(true); // nobody to ask, and the copy never touches the dump itself
+    }
+
+    for (name, changed) in changes {
+        println!("{name} changed {changed} bytes of its data since it started.");
+    }
+
+    let copies = match changes.len() {
+        1 => "a copy",
+        _ => "copies",
+    };
+    print!("Also save {copies} with the original data so it runs on its own? [Y/n]: ");
+    std::io::stdout()
+        .flush()
+        .map_err(|error| AppError::new(format!("cannot show the copy prompt: {error}")))?;
+
+    match read_prompt()?.trim().to_ascii_lowercase().as_str() {
+        "" | "y" | "yes" => Ok(true),
+        "n" | "no" => Ok(false),
+        _ => Err(AppError::new("the answer must be yes or no")),
+    }
+}
+
 fn read_prompt() -> AppResult<String> {
     let mut input = Vec::with_capacity(MAX_PROMPT_BYTES);
     let mut byte = [0u8; 1];
@@ -242,7 +267,7 @@ fn read_prompt() -> AppResult<String> {
     for _index in 0..MAX_PROMPT_BYTES {
         let read = stdin
             .read(&mut byte)
-            .map_err(|error| AppError::new(format!("cannot read collision choice: {error}")))?;
+            .map_err(|error| AppError::new(format!("cannot read the answer: {error}")))?;
         if read == 0 || byte[0] == b'\n' {
             break;
         }
@@ -252,7 +277,7 @@ fn read_prompt() -> AppResult<String> {
         }
     }
 
-    String::from_utf8(input).map_err(|_| AppError::new("collision choice is not valid UTF-8"))
+    String::from_utf8(input).map_err(|_| AppError::new("the answer is not valid UTF-8"))
 }
 
 fn clean_name(name: &str) -> AppResult<String> {

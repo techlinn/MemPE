@@ -4,7 +4,7 @@ use super::DiskImage;
 use super::sections::recover_section_headers;
 use super::{SECTION_HEADER_SIZE, align_up};
 use crate::pe::image::{read_u16, read_u32, write_u32, write_u64};
-use crate::pe::packers::{HeaderSource, Origin, PackerFindings, Unpacked, unpack};
+use crate::pe::packers::{FreshImage, HeaderSource, Origin, PackerFindings, Unpacked, unpack};
 use crate::pe::parse::{parse_disk_image, parse_memory_image};
 use crate::pe::{PeKind, PeModel, RegionEvidence, Rva};
 use crate::{AppError, AppResult};
@@ -21,6 +21,7 @@ pub(super) struct Source<'a> {
     pub(super) bytes: Cow<'a, [u8]>,
     pub(super) disk_headers_used: bool,
     pub(super) packer: Option<PackerFindings>,
+    pub(super) fresh: Option<FreshImage>,
 }
 
 pub(super) fn resolve_source_bytes<'a>(
@@ -64,6 +65,7 @@ pub(super) fn resolve_source_bytes<'a>(
             Some(Unpacked {
                 image: Some(rebuilt),
                 findings,
+                fresh,
             }),
             Unpack::Restore,
         ) => {
@@ -71,6 +73,7 @@ pub(super) fn resolve_source_bytes<'a>(
                 bytes: Cow::Owned(rebuilt),
                 disk_headers_used,
                 packer: Some(findings),
+                fresh,
             });
         }
         (detected, Unpack::Restore) => detected.map(|unpacked| unpacked.findings),
@@ -86,6 +89,7 @@ pub(super) fn resolve_source_bytes<'a>(
         bytes,
         disk_headers_used,
         packer,
+        fresh: None,
     })
 }
 

@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 
+use super::aplib;
 use super::lzx::{Tables, decompress, unfilter_calls};
 use super::tables::{
-    FIRST_SECTION_RVA, RELOCATION_BLOCK_HEADER, RELOCATION_BLOCK_SIZE_OFFSET,
-    RESOURCE_DATA_SIZE_OFFSET, Restoration, SECTION_CHARACTERISTICS_OFFSET, SECTION_COUNT_OFFSET,
-    clear_directory, find_delay_directory, find_load_config, find_original_tls, iat_span, is_free,
-    read_c_string, set_directory, set_tls_directory, walk_resources,
+    FIRST_SECTION_RVA, RELOCATION_BLOCK_HEADER, RELOCATION_BLOCK_SIZE_OFFSET, Restoration,
+    SECTION_CHARACTERISTICS_OFFSET, SECTION_COUNT_OFFSET, clear_directory, find_delay_directory,
+    find_load_config, find_original_tls, fresh_image, iat_span, read_c_string, return_moved_leaves,
+    set_directory, set_tls_directory,
 };
 use super::{
     ImportedFunction, ModuleImports, Origin, PackerFindings, PackerImports, PackerReport, Unpacked,
@@ -42,12 +43,18 @@ const LEGACY_ENTRIES: [(&str, &str); 8] = [
 ];
 const TAIL: &str = "C2 0C 00 68 ?? ?? ?? ?? C3"; // ret 0Ch, then push and ret to the entry point
 const TAIL_PUSH_OFFSET: usize = 4;
+const LEGACY_TAIL: &str = "8B 85 ?? ?? ?? ?? 03 85 ?? ?? ?? ?? 89 44 24 1C 61 FF E0"; // 1.x adds the loaded base to an entry rva
+const LEGACY_TAIL_ENTRY_OFFSET: usize = 2;
+const LEGACY_STUB_START: &str = "60 E8 00 00 00 00 5D 81 ED";
 const IMPORT_LOAD: &str = "BE ?? ?? ?? ?? 8B 95 ?? ?? ?? ??"; // import rva, then the loaded base field
 const IMPORT_RVA_OFFSET: usize = 1;
 const IMPORT_BASE_OFFSET: usize = 7;
 const IMPORT_FIELD_LOAD: &str = "8B B5 ?? ?? ?? ?? 8B 95 ?? ?? ?? ?? 03 F2"; // older builds keep the rva in data
 const IMPORT_FIELD_OFFSET: usize = 2;
 const IMPORT_FIELD_BASE_OFFSET: usize = 8;
+const LEGACY_IMPORT_LOAD: &str = "8B 95 ?? ?? ?? ?? 8B B5 ?? ?? ?? ?? 8B BD ?? ?? ?? ?? 03 F2";
+const LEGACY_IMPORT_FIELD_OFFSET: usize = 8;
+const LEGACY_IMPORT_BASE_OFFSET: usize = 2;
 const RELOCATION_LOAD: &str = "C1 E8 10 ?? ?? 8B B5 ?? ?? ?? ??";
 const RELOCATION_FIELD_OFFSET: usize = 7;
 const BLOCK_LOOP: &str = "8D B5 ?? ?? ?? ?? 83 3E 00 0F 84"; // the decompression loop walks the block table
@@ -65,6 +72,11 @@ const LENGTH_BASE: &str =
     "00 01 02 03 04 05 06 07 08 0A 0C 0E 10 14 18 1C 20 28 30 38 40 50 60 70 80 A0 C0 E0";
 const CALL_FILTER: &str = "EB 00 80 3E ?? 75 F3"; // a zero jump selects the marker based call filter
 const CALL_MARKER_OFFSET: usize = 4;
+const APLIB_DEPACKER: &str = "B2 80 8A 06 46 88 07 47 02 D2 75 05 8A 16 46 12 D2";
+const CALL: u8 = 0xE8;
+const JUMP: u8 = 0xE9;
+const CALL_SIZE: usize = 5;
+const POSITION_FILTER_TAIL: usize = 6; // the 1.x filter stops this far from the end
 const IMPORT_DESCRIPTOR_SIZE: usize = 20;
 const IMPORT_NAME_OFFSET: usize = 12;
 const IMPORT_IAT_OFFSET: usize = 16;
@@ -77,7 +89,6 @@ const MAX_NAME: usize = 4_096;
 const MAX_RELOCATION_BLOCK: usize = 0x10000;
 const WIPED_RELOCATION: u16 = 0xFFFF; // the stub overwrites each entry after applying it
 const LOAD_CONFIG_DIRECTORY_SIZE: usize = 0x40; // msvc PE32 value, the loader reads the struct's own size
-const RESOURCE_LEAF_ALIGNMENT: usize = 4;
 const RESERVED_DIRECTORY: usize = 15;
 
 struct Stub {
@@ -88,8 +99,16 @@ struct Stub {
     import_rva: usize,
     relocation_rva: Option<usize>,
     block_table: Option<usize>,
-    lzx_tables: Option<usize>,
-    call_marker: Option<u8>,
+    codec: Option<Codec>,
+}
+
+#[derive(Clone, Copy)]
+enum Codec {
+    Lzx {
+        tables: usize,
+        call_marker: Option<u8>,
+    },
+    Aplib,
 }
 
 struct ThunkTable {
@@ -113,10 +132,11 @@ struct RawSection {
 
 struct PackedFile<'a> {
     file: Vec<u8>,
+    base: usize,
     sections: Vec<RawSection>,
     blocks: Vec<Block>,
+    codec: Codec,
     tables: &'a [u8],
-    call_marker: Option<u8>,
 }
 
 pub(super) fn unpack(image: &PeImage<'_>, origin: &Origin<'_>) -> Option<Unpacked> {
@@ -160,8 +180,19 @@ fn find_stub(bytes: &[u8], model: &PeModel, base: usize) -> Option<Stub> {
         .iter()
         .enumerate()
         .skip(1)
-        .filter(|(_, section)| section.is_executable() || section.contains_rva(entry)) // 2.12 and older mark nothing executable
+        .filter(|(_, section)| {
+            section.is_executable()
+                || section.contains_rva(entry)
+                || starts_legacy_stub(bytes, section)
+        }) // 2.12 and older mark nothing executable
         .find_map(|(index, section)| stub_in_section(bytes, index, section, base))
+}
+
+fn starts_legacy_stub(bytes: &[u8], section: &SectionModel) -> bool {
+    let start = section.virtual_address().as_usize();
+    bytes
+        .get(start..start.saturating_add(LEGACY_PROLOGUE).min(bytes.len()))
+        .is_some_and(|code| find_pattern(code, LEGACY_STUB_START) == Some(0)) // the stub puts the planted jump back once it runs
 }
 
 fn stub_in_section(
@@ -175,22 +206,34 @@ fn stub_in_section(
         .saturating_add(section.span() as usize)
         .min(bytes.len());
     let code = bytes.get(start..end)?;
-    let tail = start.checked_add(find_pattern(code, TAIL)?)?;
+    let tail = find_pattern(code, TAIL).and_then(|at| start.checked_add(at));
+    (tail.is_some() || find_pattern(code, LEGACY_TAIL).is_some()).then_some(())?;
 
     let read = |at: usize| read_u32(bytes, at).ok();
-    let (import_rva, base_field) = match find_pattern(code, IMPORT_LOAD) {
-        Some(at) => {
-            let at = start.checked_add(at)?;
-            (
-                Some(read(at.checked_add(IMPORT_RVA_OFFSET)?)?),
-                read(at.checked_add(IMPORT_BASE_OFFSET)?)?,
-            )
-        }
-        None => {
-            let at = start.checked_add(find_pattern(code, IMPORT_FIELD_LOAD)?)?;
-            (None, read(at.checked_add(IMPORT_FIELD_BASE_OFFSET)?)?)
-        }
+    let load = |pattern: &str, field: usize, base: usize| -> Option<(u32, u32)> {
+        let at = start.checked_add(find_pattern(code, pattern)?)?;
+        Some((read(at.checked_add(field)?)?, read(at.checked_add(base)?)?))
     };
+
+    let (import_rva, import_field, base_field) =
+        match load(IMPORT_LOAD, IMPORT_RVA_OFFSET, IMPORT_BASE_OFFSET) {
+            Some((rva, base)) => (Some(rva), None, base),
+            None => {
+                let (field, base) = load(
+                    IMPORT_FIELD_LOAD,
+                    IMPORT_FIELD_OFFSET,
+                    IMPORT_FIELD_BASE_OFFSET,
+                )
+                .or_else(|| {
+                    load(
+                        LEGACY_IMPORT_LOAD,
+                        LEGACY_IMPORT_FIELD_OFFSET,
+                        LEGACY_IMPORT_BASE_OFFSET,
+                    )
+                })?;
+                (None, Some(field), base)
+            }
+        };
 
     let base32 = u32::try_from(base).ok()?; // aspack only packs PE32 images
     let in_original = |rva: usize| (FIRST_SECTION_RVA..start).contains(&rva);
@@ -202,10 +245,6 @@ fn stub_in_section(
         )
     };
 
-    let import_field = import_rva
-        .is_none()
-        .then(|| displacement(IMPORT_FIELD_LOAD, IMPORT_FIELD_OFFSET))
-        .flatten();
     let block_field = displacement(BLOCK_LOOP, BLOCK_LOOP_OFFSET);
     let consistent = |ebp: u32| {
         let at = |field: u32| read(ebp.wrapping_add(field) as usize);
@@ -221,9 +260,9 @@ fn stub_in_section(
         Some(ebp?.wrapping_add(displacement(pattern, offset)?) as usize)
     };
 
-    let import_rva = match import_rva {
-        Some(rva) => rva as usize,
-        None => read(field(IMPORT_FIELD_LOAD, IMPORT_FIELD_OFFSET)?)? as usize,
+    let import_rva = match (import_rva, import_field) {
+        (Some(rva), _) => rva as usize,
+        (None, field) => read(ebp?.wrapping_add(field?) as usize)? as usize,
     };
     in_original(import_rva).then_some(())?;
 
@@ -232,11 +271,28 @@ fn stub_in_section(
         .map(|rva| rva as usize)
         .filter(|rva| in_original(*rva));
 
-    let pushed = read(tail.checked_add(TAIL_PUSH_OFFSET)?)? as usize;
-    let entry = pushed
-        .checked_sub(base)
-        .filter(|rva| ebp.is_some() && pushed != 0 && (*rva == 0 || in_original(*rva))) // a dll without an entry point pushes its base
-        .and_then(|rva| u32::try_from(rva).ok());
+    let entry = match tail {
+        Some(tail) => {
+            let pushed = read(tail.checked_add(TAIL_PUSH_OFFSET)?)? as usize;
+            pushed
+                .checked_sub(base)
+                .filter(|rva| ebp.is_some() && pushed != 0 && (*rva == 0 || in_original(*rva))) // a dll without an entry point pushes its base
+        }
+        None => field(LEGACY_TAIL, LEGACY_TAIL_ENTRY_OFFSET)
+            .and_then(read)
+            .map(|rva| rva as usize)
+            .filter(|rva| *rva == 0 || in_original(*rva)),
+    }
+    .and_then(|rva| u32::try_from(rva).ok());
+
+    let codec = match find_pattern(code, LENGTH_BASE).and_then(|at| start.checked_add(at)) {
+        Some(tables) => Some(Codec::Lzx {
+            tables,
+            call_marker: find_pattern(code, CALL_FILTER)
+                .and_then(|at| code.get(at.checked_add(CALL_MARKER_OFFSET)?).copied()),
+        }),
+        None => find_pattern(code, APLIB_DEPACKER).map(|_| Codec::Aplib),
+    };
     let flagged = field(BLOCK_FLAGS_LOAD, BLOCK_FLAGS_OFFSET);
 
     Some(Stub {
@@ -250,9 +306,7 @@ fn stub_in_section(
         import_rva,
         relocation_rva,
         block_table: field(BLOCK_LOOP, BLOCK_LOOP_OFFSET).or(flagged),
-        lzx_tables: find_pattern(code, LENGTH_BASE).and_then(|at| start.checked_add(at)),
-        call_marker: find_pattern(code, CALL_FILTER)
-            .and_then(|at| code.get(at.checked_add(CALL_MARKER_OFFSET)?).copied()),
+        codec,
     })
 }
 
@@ -331,18 +385,32 @@ fn restore(image: &PeImage<'_>, stub: &Stub, origin: &Origin<'_>) -> Option<Unpa
     clear_directory(&mut restored, model, RESERVED_DIRECTORY);
     parse_memory_image(&restored).ok()?;
 
+    let fresh = packed.as_mut().and_then(|packed| {
+        let original = packed.original_image(original_end)?;
+        fresh_image(
+            image.bytes(),
+            &restored,
+            &original,
+            packed.base,
+            origin.base,
+            original_end,
+        )
+    });
+
     Some(Unpacked {
         image: Some(restored),
         findings: PackerFindings {
             report,
             imports: imports.unwrap_or(PackerImports::Unknown),
         },
+        fresh,
     })
 }
 
 impl<'a> PackedFile<'a> {
     fn open(file: Vec<u8>, memory: &'a [u8], stub: &Stub) -> Option<Self> {
         let disk = parse_disk_image(&file).ok()?;
+        let base = read_u32(&file, disk.model().image_base_offset).ok()? as usize;
         let sections = disk
             .model()
             .sections()
@@ -354,16 +422,23 @@ impl<'a> PackedFile<'a> {
                 size: section.raw_size as usize,
             })
             .collect::<Vec<_>>();
-        let tables = memory.get(stub.lzx_tables?..)?.get(..Tables::SIZE)?;
+        let codec = stub.codec?;
+        let tables = match codec {
+            Codec::Lzx { tables, .. } => memory.get(tables..)?.get(..Tables::SIZE)?,
+            Codec::Aplib => &[],
+        };
         let mut packed = Self {
             file,
+            base,
             sections,
             blocks: Vec::new(),
+            codec,
             tables,
-            call_marker: stub.call_marker,
         };
 
-        (packed.raw(stub.lzx_tables?, Tables::SIZE)? == tables).then_some(())?;
+        if let Codec::Lzx { tables, .. } = codec {
+            (packed.raw(tables, Tables::SIZE)? == packed.tables).then_some(())?;
+        }
 
         let table = stub.block_table?;
         let mut filtered = false;
@@ -433,14 +508,56 @@ impl<'a> PackedFile<'a> {
     fn decode(&self, index: usize) -> Option<Vec<u8>> {
         let block = self.blocks.get(index)?;
         let size = block.size?;
-        let source = self.raw(block.rva, size.checked_add(BLOCK_READ_SLACK)?)?;
-        let mut decoded = decompress(source, size, &Tables::new(self.tables)?)?;
 
-        if block.filtered {
-            unfilter_calls(&mut decoded, self.call_marker?);
+        match self.codec {
+            Codec::Lzx { call_marker, .. } => {
+                let source = self.raw(block.rva, size.checked_add(BLOCK_READ_SLACK)?)?;
+                let mut decoded = decompress(source, size, &Tables::new(self.tables)?)?;
+                if block.filtered {
+                    unfilter_calls(&mut decoded, call_marker?);
+                }
+
+                Some(decoded)
+            }
+            Codec::Aplib => {
+                let source = self.raw(block.rva, usize::MAX)?; // the stream ends at its own marker
+                let mut decoded = aplib::decompress(source, size)?;
+                (decoded.len() == size).then_some(())?;
+                if block.filtered {
+                    unfilter_positions(&mut decoded);
+                }
+
+                Some(decoded)
+            }
+        }
+    }
+
+    fn original_image(&mut self, end: usize) -> Option<Vec<u8>> {
+        let mut image = vec![0u8; end];
+
+        for section in &self.sections {
+            let length = section.size.min(section.span);
+            let raw = self
+                .file
+                .get(section.offset..section.offset.checked_add(length)?)?;
+            if let Some(slot) = image.get_mut(section.rva..section.rva.saturating_add(raw.len())) {
+                slot.copy_from_slice(raw);
+            }
         }
 
-        Some(decoded)
+        for index in 0..self.blocks.len() {
+            let Some(size) = self.blocks[index].size else {
+                continue;
+            };
+
+            let rva = self.blocks[index].rva;
+            let decoded = self.original(rva, size)?.to_vec();
+            if let Some(slot) = image.get_mut(rva..rva.saturating_add(decoded.len())) {
+                slot.copy_from_slice(&decoded);
+            }
+        }
+
+        Some(image)
     }
 
     fn read_u32(&mut self, rva: usize) -> Option<u32> {
@@ -452,6 +569,35 @@ impl<'a> PackedFile<'a> {
         let mut terminated = text.to_vec();
         terminated.push(0);
         read_c_string(&terminated, 0).map(|(name, _)| name)
+    }
+}
+
+fn unfilter_positions(bytes: &mut [u8]) {
+    let mut remaining = bytes.len().saturating_sub(POSITION_FILTER_TAIL);
+    let mut at = 0;
+
+    while remaining > 0 {
+        let Some(&opcode) = bytes.get(at) else {
+            return;
+        };
+
+        if !matches!(opcode, CALL | JUMP) {
+            at += 1;
+            remaining -= 1;
+            continue;
+        }
+
+        let operand = at + 1;
+        let Ok(target) = read_u32(bytes, operand) else {
+            return;
+        };
+        let relative = target.wrapping_sub(at as u32); // the packer stored call targets as positions
+        if write_u32(bytes, operand, relative).is_err() {
+            return;
+        }
+
+        at += CALL_SIZE;
+        remaining = remaining.saturating_sub(CALL_SIZE);
     }
 }
 
@@ -878,70 +1024,7 @@ fn return_moved_resources(
         return Restoration::Failed;
     };
 
-    let Some(tree) = walk_resources(restored, tree_start) else {
-        return Restoration::Failed;
-    };
-
-    let leaves = tree
-        .data_entries
-        .iter()
-        .filter_map(|entry| {
-            let at = tree_start.checked_add(*entry)?;
-            let rva = read_u32(restored, at).ok()? as usize;
-            let size =
-                read_u32(restored, at.checked_add(RESOURCE_DATA_SIZE_OFFSET)?).ok()? as usize;
-            Some((at, rva, size))
-        })
-        .collect::<Vec<_>>();
-    let moved = leaves
-        .iter()
-        .filter(|(_, rva, _)| *rva >= original_end)
-        .copied()
-        .collect::<Vec<_>>();
-    if moved.is_empty() {
-        return Restoration::Absent;
-    }
-
-    let mut used = leaves
-        .iter()
-        .filter(|(_, rva, _)| *rva < original_end)
-        .map(|(_, rva, size)| (*rva, rva.saturating_add(*size)))
-        .collect::<Vec<_>>();
-    used.push((tree_start, tree_start.saturating_add(tree.structure_length)));
-
-    let section_start = section.virtual_address().as_usize();
-    let section_end = section_start.saturating_add(section.span() as usize);
-
-    for (entry, rva, size) in moved {
-        let Some(data) = restored
-            .get(rva..rva.saturating_add(size))
-            .map(<[u8]>::to_vec)
-        else {
-            return Restoration::Failed;
-        };
-
-        let overlaps = |at: usize| {
-            used.iter()
-                .any(|(start, end)| at < *end && *start < at.saturating_add(size))
-        };
-
-        let Some(destination) = (section_start..section_end.saturating_sub(size))
-            .step_by(RESOURCE_LEAF_ALIGNMENT)
-            .find(|at| !overlaps(*at) && is_free(restored, *at, &data))
-        else {
-            return Restoration::Failed;
-        };
-
-        let written = restored
-            .get_mut(destination..destination.saturating_add(size))
-            .map(|slot| slot.copy_from_slice(&data))
-            .and_then(|()| write_u32(restored, entry, u32::try_from(destination).ok()?).ok());
-        if written.is_none() {
-            return Restoration::Failed;
-        }
-
-        used.push((destination, destination.saturating_add(size)));
-    }
-
-    Restoration::Restored
+    let region_start = section.virtual_address().as_usize();
+    let region = region_start..region_start.saturating_add(section.span() as usize);
+    return_moved_leaves(restored, tree_start, region, original_end)
 }

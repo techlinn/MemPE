@@ -1,5 +1,12 @@
-use crate::pe::image::{read_pointer, read_u16, read_u32, write_u32};
-use crate::pe::{PeKind, PeModel, TLS_DIRECTORY};
+use std::collections::HashMap;
+use std::ops::Range;
+
+use super::FreshImage;
+use crate::pe::image::{read_pointer, read_u16, read_u32, write_u32, write_u64};
+use crate::pe::parse::parse_memory_image;
+use crate::pe::{
+    BASERELOC_DIRECTORY, PeKind, PeModel, RELOCATION_DIR64, RELOCATION_HIGHLOW, Rva, TLS_DIRECTORY,
+};
 
 const PAGE_MASK: u32 = 0xFFF;
 pub(super) const RELOCATION_BLOCK_HEADER: usize = 8;
@@ -35,6 +42,7 @@ const RESOURCE_DATA_ENTRY_SIZE: usize = 16;
 const RESOURCE_SUBDIRECTORY: u32 = 0x8000_0000;
 const MAX_RESOURCE_DEPTH: usize = 4;
 const MAX_RESOURCE_ENTRIES: usize = 65_536;
+const RESOURCE_LEAF_ALIGNMENTS: [usize; 2] = [8, 4]; // linkers put leaves on 8 bytes, windows only needs 4
 pub(super) const DEBUG_ENTRY_SIZE: usize = 28;
 const DEBUG_TIMESTAMP_OFFSET: usize = 4;
 pub(super) const DEBUG_TYPE_OFFSET: usize = 12;
@@ -62,6 +70,8 @@ const MAX_SAFESEH_HANDLERS: u32 = 0x10000;
 const MAX_LOAD_CONFIG_SIZE: u32 = 0x400;
 pub(super) const FIRST_SECTION_RVA: usize = 0x1000;
 const SCAN_STEP: usize = 4;
+const DIRECTORY_COUNT: usize = 16;
+const RELOCATION_OFFSET_MASK: u16 = 0xFFF;
 
 pub(super) enum Restoration {
     Restored,
@@ -364,7 +374,7 @@ fn walk_resource_table(
         if name & RESOURCE_SUBDIRECTORY != 0 {
             let string = (name & !RESOURCE_SUBDIRECTORY) as usize;
             let length = usize::from(read_u16(bytes, start.checked_add(string)?).ok()?);
-            let string_end = string.checked_add(2)?.checked_add(length.checked_mul(2)?)?; // a u16 count of utf16 units
+            let string_end = string.checked_add(2)?.checked_add(length.checked_mul(2)?)?;
             tree.structure_length = tree.structure_length.max(string_end);
         }
 
@@ -377,6 +387,328 @@ fn walk_resource_table(
             tree.structure_length = tree.structure_length.max(entry_end);
             tree.data_entries.push(offset);
         }
+    }
+
+    Some(())
+}
+
+pub(super) fn return_moved_leaves(
+    restored: &mut [u8],
+    tree_start: usize,
+    region: Range<usize>,
+    original_end: usize,
+) -> Restoration {
+    let Some(tree) = walk_resources(restored, tree_start) else {
+        return Restoration::Failed;
+    };
+
+    let leaves = tree
+        .data_entries
+        .iter()
+        .filter_map(|entry| {
+            let at = tree_start.checked_add(*entry)?;
+            let rva = read_u32(restored, at).ok()? as usize;
+            let size =
+                read_u32(restored, at.checked_add(RESOURCE_DATA_SIZE_OFFSET)?).ok()? as usize;
+            Some((at, rva, size))
+        })
+        .collect::<Vec<_>>();
+    let moved = leaves
+        .iter()
+        .filter(|(_, rva, _)| *rva >= original_end)
+        .copied()
+        .collect::<Vec<_>>();
+    if moved.is_empty() {
+        return Restoration::Absent;
+    }
+
+    let mut used = leaves
+        .iter()
+        .filter(|(_, rva, _)| *rva < original_end)
+        .map(|(_, rva, size)| (*rva, rva.saturating_add(*size)))
+        .collect::<Vec<_>>();
+    used.push((tree_start, tree_start.saturating_add(tree.structure_length)));
+
+    for (entry, rva, size) in moved {
+        let Some(data) = restored
+            .get(rva..rva.saturating_add(size))
+            .map(<[u8]>::to_vec)
+        else {
+            return Restoration::Failed;
+        };
+
+        let overlaps = |at: usize| {
+            used.iter()
+                .any(|(start, end)| at < *end && *start < at.saturating_add(size))
+        };
+
+        let Some(destination) = RESOURCE_LEAF_ALIGNMENTS.iter().find_map(|alignment| {
+            (region.start..region.end.saturating_sub(size))
+                .step_by(*alignment)
+                .find(|at| !overlaps(*at) && is_free(restored, *at, &data))
+        }) else {
+            return Restoration::Failed;
+        };
+
+        let written = restored
+            .get_mut(destination..destination.saturating_add(size))
+            .map(|slot| slot.copy_from_slice(&data))
+            .and_then(|()| write_u32(restored, entry, u32::try_from(destination).ok()?).ok());
+        if written.is_none() {
+            return Restoration::Failed;
+        }
+
+        used.push((destination, destination.saturating_add(size)));
+    }
+
+    Restoration::Restored
+}
+
+pub(super) struct LinkerTree {
+    pub(super) bytes: Vec<u8>,
+    pub(super) data_entries: Vec<usize>,
+}
+
+pub(super) fn linker_resource_layout(bytes: &[u8], start: usize) -> Option<LinkerTree> {
+    let entries_of = |table: usize| -> Option<Vec<(u32, u32)>> {
+        let header = start.checked_add(table)?;
+        let named = read_u16(bytes, header.checked_add(RESOURCE_NAMED_COUNT_OFFSET)?).ok()?;
+        let numbered = read_u16(bytes, header.checked_add(RESOURCE_ID_COUNT_OFFSET)?).ok()?;
+
+        (0..usize::from(named) + usize::from(numbered))
+            .map(|index| {
+                let entry =
+                    header.checked_add(RESOURCE_TABLE_SIZE + index * RESOURCE_ENTRY_SIZE)?;
+                let target = entry.checked_add(RESOURCE_ENTRY_TARGET_OFFSET)?;
+                Some((read_u32(bytes, entry).ok()?, read_u32(bytes, target).ok()?))
+            })
+            .collect()
+    };
+
+    let mut tables = vec![(0usize, entries_of(0)?)]; // breadth first, the order msvc writes them in
+    let mut next = 0;
+
+    while let Some((_, entries)) = tables.get(next) {
+        let children = entries
+            .iter()
+            .filter(|(_, target)| target & RESOURCE_SUBDIRECTORY != 0)
+            .map(|(_, target)| (target & !RESOURCE_SUBDIRECTORY) as usize)
+            .collect::<Vec<_>>();
+
+        for child in children {
+            (tables.len() < MAX_RESOURCE_ENTRIES).then_some(())?;
+            tables.push((child, entries_of(child)?));
+        }
+        next += 1;
+    }
+
+    let mut table_offsets = HashMap::new();
+    let mut length = 0usize;
+    for (table, entries) in &tables {
+        table_offsets.insert(*table, length);
+        length = length.checked_add(RESOURCE_TABLE_SIZE + entries.len() * RESOURCE_ENTRY_SIZE)?;
+    }
+
+    let mut leaves = Vec::new();
+    collect_leaves(&tables, 0, 0, &mut leaves)?; // depth first, unlike the tables
+
+    let mut leaf_offsets = HashMap::new();
+    for leaf in &leaves {
+        leaf_offsets.insert(*leaf, length);
+        length = length.checked_add(RESOURCE_DATA_ENTRY_SIZE)?;
+    }
+
+    let mut string_offsets = HashMap::new();
+    let mut strings = Vec::new();
+    for (name, _) in tables.iter().flat_map(|(_, entries)| entries) {
+        if name & RESOURCE_SUBDIRECTORY == 0 {
+            continue;
+        }
+
+        let at = start.checked_add((name & !RESOURCE_SUBDIRECTORY) as usize)?;
+        let units = usize::from(read_u16(bytes, at).ok()?);
+        let string = bytes.get(at..at.checked_add(2 + units * 2)?)?;
+
+        if !string_offsets.contains_key(string) {
+            string_offsets.insert(string, length);
+            strings.push(string);
+            length = length.checked_add(string.len())?;
+        }
+    }
+
+    let mut layout = vec![0u8; length];
+    let named_string = |name: u32| -> Option<u32> {
+        let at = start.checked_add((name & !RESOURCE_SUBDIRECTORY) as usize)?;
+        let units = usize::from(read_u16(bytes, at).ok()?);
+        let offset = string_offsets.get(bytes.get(at..at.checked_add(2 + units * 2)?)?)?;
+        Some(u32::try_from(*offset).ok()? | RESOURCE_SUBDIRECTORY)
+    };
+
+    for (table, entries) in &tables {
+        let to = *table_offsets.get(table)?;
+        let from = start.checked_add(*table)?;
+        layout
+            .get_mut(to..to + RESOURCE_TABLE_SIZE)?
+            .copy_from_slice(bytes.get(from..from.checked_add(RESOURCE_TABLE_SIZE)?)?);
+
+        for (index, (name, target)) in entries.iter().enumerate() {
+            let name = match name & RESOURCE_SUBDIRECTORY {
+                0 => *name,
+                _ => named_string(*name)?,
+            };
+            let offset = (target & !RESOURCE_SUBDIRECTORY) as usize;
+            let target = match target & RESOURCE_SUBDIRECTORY {
+                0 => u32::try_from(*leaf_offsets.get(&offset)?).ok()?,
+                _ => u32::try_from(*table_offsets.get(&offset)?).ok()? | RESOURCE_SUBDIRECTORY,
+            };
+
+            let entry = to + RESOURCE_TABLE_SIZE + index * RESOURCE_ENTRY_SIZE;
+            write_u32(&mut layout, entry, name).ok()?;
+            write_u32(&mut layout, entry + RESOURCE_ENTRY_TARGET_OFFSET, target).ok()?;
+        }
+    }
+
+    for leaf in &leaves {
+        let to = *leaf_offsets.get(leaf)?;
+        let from = start.checked_add(*leaf)?;
+        layout
+            .get_mut(to..to + RESOURCE_DATA_ENTRY_SIZE)?
+            .copy_from_slice(bytes.get(from..from.checked_add(RESOURCE_DATA_ENTRY_SIZE)?)?);
+    }
+
+    for string in strings {
+        let to = *string_offsets.get(string)?;
+        layout
+            .get_mut(to..to + string.len())?
+            .copy_from_slice(string);
+    }
+
+    let data_entries = leaves
+        .iter()
+        .map(|leaf| leaf_offsets.get(leaf).copied())
+        .collect::<Option<Vec<_>>>()?;
+
+    Some(LinkerTree {
+        bytes: layout,
+        data_entries,
+    })
+}
+
+fn collect_leaves(
+    tables: &[(usize, Vec<(u32, u32)>)],
+    table: usize,
+    depth: usize,
+    leaves: &mut Vec<usize>,
+) -> Option<()> {
+    (depth < MAX_RESOURCE_DEPTH).then_some(())?;
+    let (_, entries) = tables.iter().find(|(offset, _)| *offset == table)?;
+
+    for (_, target) in entries {
+        let offset = (target & !RESOURCE_SUBDIRECTORY) as usize;
+        match target & RESOURCE_SUBDIRECTORY {
+            0 => leaves.push(offset),
+            _ => collect_leaves(tables, offset, depth + 1, leaves)?,
+        }
+    }
+
+    Some(())
+}
+
+pub(super) fn fresh_image(
+    memory: &[u8],
+    restored: &[u8],
+    pristine: &[u8],
+    pristine_base: usize,
+    base: usize,
+    end: usize,
+) -> Option<FreshImage> {
+    let image = parse_memory_image(restored).ok()?;
+    let model = image.model();
+    let mut pristine = pristine.get(..end.min(pristine.len()))?.to_vec();
+
+    let delta = base.wrapping_sub(pristine_base);
+    if delta != 0 {
+        rebase(&mut pristine, restored, model, delta)?;
+    }
+
+    let entry = read_u32(restored, model.entry_point_offset).ok()?;
+    let mut kept = (0..DIRECTORY_COUNT)
+        .filter_map(|index| model.directory(restored, index).ok().flatten())
+        .map(|directory| {
+            let start = directory.rva().as_usize();
+            start..start.saturating_add(directory.size() as usize)
+        })
+        .collect::<Vec<_>>(); // tables mempe rebuilt or the loader fills in stay as restored
+
+    let mut fresh = restored.to_vec();
+    let mut changed = 0usize;
+
+    for section in model.sections() {
+        let start = section.virtual_address().as_usize();
+        let span = start..start.saturating_add(section.span() as usize);
+        if section.contains_rva(Rva(entry)) {
+            kept.push(span); // the code may carry the packer's own jumps in the file
+            continue;
+        }
+
+        let stop = span
+            .end
+            .min(pristine.len())
+            .min(memory.len())
+            .min(fresh.len());
+        for at in span.start.max(FIRST_SECTION_RVA)..stop {
+            let untouched = restored[at] == memory[at];
+            if untouched
+                && pristine[at] != memory[at]
+                && !kept.iter().any(|range| range.contains(&at))
+            {
+                fresh[at] = pristine[at];
+                changed += 1;
+            }
+        }
+    }
+
+    (changed > 0).then_some(FreshImage {
+        bytes: fresh,
+        changed,
+    })
+}
+
+fn rebase(bytes: &mut [u8], restored: &[u8], model: &PeModel, delta: usize) -> Option<()> {
+    let directory = model.directory(restored, BASERELOC_DIRECTORY).ok()??;
+    let start = directory.rva().as_usize();
+    let table = restored.get(start..start.checked_add(directory.size() as usize)?)?;
+
+    let mut cursor = 0usize;
+    while cursor + RELOCATION_BLOCK_HEADER <= table.len() {
+        let page = read_u32(table, cursor).ok()? as usize;
+        let size = read_u32(table, cursor + RELOCATION_BLOCK_SIZE_OFFSET).ok()? as usize;
+        if page == 0 || size < RELOCATION_BLOCK_HEADER {
+            break;
+        }
+
+        let words = table.get(cursor + RELOCATION_BLOCK_HEADER..cursor.checked_add(size)?)?;
+        for word in words.as_chunks::<2>().0 {
+            let word = u16::from_le_bytes(*word);
+            let at = page + usize::from(word & RELOCATION_OFFSET_MASK);
+
+            let kind = match word >> RELOCATION_KIND_SHIFT {
+                RELOCATION_HIGHLOW => PeKind::Pe32,
+                RELOCATION_DIR64 => PeKind::Pe32Plus,
+                _ => continue,
+            };
+
+            let Ok(value) = read_pointer(bytes, at, kind) else {
+                continue;
+            };
+            let moved = value.wrapping_add(delta);
+            let _ = match kind {
+                PeKind::Pe32 => write_u32(bytes, at, moved as u32),
+                PeKind::Pe32Plus => write_u64(bytes, at, moved as u64),
+            };
+        }
+
+        cursor += size;
     }
 
     Some(())

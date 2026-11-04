@@ -1,4 +1,7 @@
+mod aplib;
 mod aspack;
+mod lzma;
+mod lzmat;
 mod lzx;
 mod mpress;
 mod tables;
@@ -45,6 +48,12 @@ impl Origin<'_> {
 pub(super) struct Unpacked {
     pub(super) image: Option<Vec<u8>>,
     pub(super) findings: PackerFindings,
+    pub(super) fresh: Option<FreshImage>,
+}
+
+pub(super) struct FreshImage {
+    pub(super) bytes: Vec<u8>,
+    pub(super) changed: usize,
 }
 
 impl Unpacked {
@@ -57,15 +66,18 @@ impl Unpacked {
                 report,
                 imports: PackerImports::Intact,
             },
+            fresh: None,
         }
     }
 }
 
+#[derive(Clone)]
 pub(super) struct PackerFindings {
     pub(super) report: PackerReport,
     pub(super) imports: PackerImports,
 }
 
+#[derive(Clone)]
 pub(super) enum PackerImports {
     Intact,
     Listed(Vec<ModuleImports>),
@@ -112,6 +124,7 @@ impl Display for PackerReport {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct ModuleImports {
     pub(super) module: String,
     pub(super) first_thunk: u32,

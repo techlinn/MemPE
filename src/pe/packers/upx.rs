@@ -247,6 +247,7 @@ fn restore_from(
     Some(Unpacked {
         image: Some(restored),
         findings: PackerFindings { report, imports },
+        fresh: None,
     })
 }
 

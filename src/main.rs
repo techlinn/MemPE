@@ -206,6 +206,10 @@ fn render_output(console: &Console, output: &OutputPlan, outcome: &DumpOutcome) 
         render_main_artifact(console, main);
     }
 
+    for copy in &outcome.fresh_copies {
+        console.field("Fresh copy", format_args!("{}", copy.display()));
+    }
+
     console.field("DLLs", format_args!("{}", outcome.summary.dlls));
     console.field(
         "Hidden PEs",

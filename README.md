@@ -54,6 +54,7 @@ DONE  Analysis-ready memory images
 - Imports put back together, even when the packer trashed the import table
 - PEs that were mapped by hand or stashed in random memory, the kind the module list never shows you
 - Packers undone when mempe knows them (see [the table](#supported-packers))
+- For ASPack and MPRESS, a second copy that starts on its own, built with the data the program began with
 - A report that tells you what it couldn't recover, so a broken dump never passes itself off as a good one
 
 ## How it works
@@ -86,8 +87,8 @@ mempe snapshots the process, finds every module plus any PE hiding in non-image 
 | Packer | Status | Notes |
 |---|---|---|
 | UPX | Supported | 3.91 to 5.3.0, x86 and x64, EXEs and DLLs, tampered and modified copies too |
-| ASPack | Supported | 2.11 to 2.43 (tested on 2.11, 2.12, 2.2, 2.24, 2.28, 2.29 and 2.43), x86 EXEs and DLLs, tampered copies too. ASPack wipes the relocations and import table in memory, so mempe decompresses the originals straight out of the packed file and you get them back exactly, DLL names included. Builds before 2.2 never kept the original section flags, so those get reported as lost. 1.x and 2.000 get recognised but not restored yet |
-| MPRESS | Supported | 1.05 to 2.19 (tested on 1.05, 1.27, 2.05 and 2.19), x86 and x64, EXEs and DLLs, tampered copies too. Entry point, imports (ordinals included), DLL relocations, export forwarders and TLS come back, and the merged section gets split back into code and data. MPRESS throws away EXE relocations, debug data, parts of the load config and some x64 unwind info for good, so mempe reports those as lost |
+| ASPack | Supported | 1.07b and 2.11 to 2.43 (tested on 1.07b, 2.11, 2.12, 2.2, 2.24, 2.28, 2.29 and 2.43), x86 EXEs and DLLs, tampered copies too. ASPack wipes the relocations and import table in memory, so mempe decompresses the originals straight out of the packed file and you get them back exactly, DLL names included. The icons and version info it moves into its own section go back to their original spots too. 1.07b compresses with aPLib instead, which mempe decodes too. Builds before 2.2 never kept the original section flags, so those get reported as lost. Other 1.x builds and 2.000 to 2.1 get recognised but haven't been tested |
+| MPRESS | Supported | 1.05 to 2.19 (tested on 1.05, 1.27, 2.05 and 2.19), x86 and x64, EXEs and DLLs, tampered copies too. Entry point, imports (ordinals included, with their real DLL names read back out of the packed file when it is still on disk), DLL relocations, export forwarders and TLS come back, and the merged section gets split back into code and data. Resources it moved out get put back at their original offsets, except with `-r`, where it moves every one of them and nothing is left to show where they were. MPRESS throws away EXE relocations, debug data, parts of the load config and some x64 unwind info for good, so mempe reports those as lost |
 | VMProtect | Planned | Protector with code virtualization |
 | Themida / WinLicense | Planned | Protector with code virtualization |
 | Code Virtualizer | Planned | Virtualizer from the makers of Themida |
@@ -137,6 +138,8 @@ mempe.exe -w target.exe
 
 Everything lands in a `mempe` folder in the current directory.
 
+A dump keeps the data exactly as it was while the program ran, decrypted strings and all, so a program that sets itself up at startup usually crashes if you start the dump. For ASPack and MPRESS, mempe can read the data the program started with out of the packed file. When the running data differs, it asks once whether to also save a copy like `target.fresh.exe` that starts on its own. The main dump never changes. When nobody is there to answer, like in a script, it saves the copy.
+
 To build it yourself, you need Windows 10 or later and stable Rust:
 
 ```text
@@ -152,7 +155,7 @@ cargo build --release
 - Only x86 and x64 Windows PE files are supported.
 - mempe needs permission to read the target. Elevated targets need an elevated terminal, and protected processes can still say no.
 - Heavy API hashing or custom loaders can leave some imports unresolved. mempe counts those instead of dropping them quietly.
-- Dumps are for static analysis. Getting one to run again can take some manual work.
+- Dumps are for static analysis. Getting one to run again can take some manual work, unless mempe gave you a `.fresh` copy.
 
 ## When to reach for something else
 
