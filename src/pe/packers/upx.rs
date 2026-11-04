@@ -1,15 +1,17 @@
+use super::nrv::{self, Variant};
 use super::tables::{
     DEBUG_ENTRY_SIZE, DEBUG_TYPE_CODEVIEW, DEBUG_TYPE_OFFSET, RESOURCE_DATA_SIZE_OFFSET,
     Restoration, SECTION_COUNT_OFFSET, SECTION_RVA_OFFSET, clear_directory, codeview_entry,
-    exports_intact, find_codeview_record, is_free, moved_export_directory, place, read_c_string,
-    relocation_blocks, relocations_intact, resources_intact, set_directory, walk_resources,
+    exports_intact, find_codeview_record, fresh_image, is_free, moved_export_directory, place,
+    read_c_string, relocate, relocation_blocks, relocations_intact, resources_intact,
+    set_directory, walk_resources,
 };
 use super::{
-    HeaderSource, ImportedFunction, ModuleImports, Origin, PackerFindings, PackerImports,
-    PackerReport, Unpacked, find_pattern,
+    FreshImage, HeaderSource, ImportedFunction, ModuleImports, Origin, PackerFindings,
+    PackerImports, PackerReport, Unpacked, find_pattern, lzma,
 };
-use crate::pe::image::{read_u16, read_u32, write_u32};
-use crate::pe::parse::parse_memory_image;
+use crate::pe::image::{read_pointer, read_u16, read_u32, write_u32};
+use crate::pe::parse::{parse_disk_image, parse_memory_image};
 use crate::pe::{
     BASERELOC_DIRECTORY, BOUND_IMPORT_DIRECTORY, DEBUG_DIRECTORY, EXPORT_DIRECTORY,
     IMAGE_SCN_MEM_WRITE, IMPORT_DIRECTORY, PeImage, PeKind, PeModel, RESOURCE_DIRECTORY, Rva,
@@ -58,6 +60,23 @@ const REL_BASED_HIGHLOW: u16 = 3;
 const REL_BASED_DIR64: u16 = 10;
 const EMPTY_RELOCATION_BLOCK: [u8; 8] = [0, 0, 0, 0, 8, 0, 0, 0];
 const ORIGINAL_RVA_PREFIX: usize = 4; // upx stores each kept leaf after its original rva
+const PACK_HEADER_SIZE: usize = 32;
+const METHOD_OFFSET: usize = 6;
+const UNCOMPRESSED_ADLER_OFFSET: usize = 8;
+const COMPRESSED_ADLER_OFFSET: usize = 12;
+const COMPRESSED_LENGTH_OFFSET: usize = 20;
+const FILTER_OFFSET: usize = 28;
+const METHOD_NRV2B: u8 = 2;
+const METHOD_NRV2D: u8 = 5;
+const METHOD_NRV2E: u8 = 8;
+const METHOD_LZMA: u8 = 14;
+const LZMA_HEADER: usize = 2; // upx's own property bytes instead of the usual five
+const LZMA_LITERAL_CONTEXT_MASK: u8 = 0x0F;
+const LZMA_LITERAL_POSITION_SHIFT: u8 = 4;
+const LZMA_POSITION_MASK: u8 = 0x07;
+const ADLER_MODULO: u32 = 65_521;
+const CODE_SIZE_OFFSET: usize = 4; // inside the optional header
+const CODE_BASE_OFFSET: usize = 20;
 
 struct StubShape {
     stack_clear: &'static str,
@@ -144,8 +163,12 @@ pub(super) fn unpack(image: &PeImage<'_>, origin: &Origin<'_>) -> Option<Unpacke
             version.clone(),
         );
 
-        if restored.is_some() {
-            return restored;
+        if let Some(mut unpacked) = restored {
+            unpacked.fresh = unpacked
+                .image
+                .as_deref()
+                .and_then(|restored| fresh(bytes, restored, model.kind(), origin, image_start));
+            return Some(unpacked);
         }
     }
 
@@ -418,6 +441,7 @@ fn parse_import_functions(bytes: &[u8], start: usize) -> Option<(Vec<ImportedFun
 }
 
 struct PackHeader {
+    offset: usize,
     version: Option<String>,
     uncompressed_length: usize,
 }
@@ -439,9 +463,98 @@ fn find_pack_header(bytes: &[u8]) -> Option<PackHeader> {
         .and_then(|text| std::str::from_utf8(text).ok())
         .map(str::to_owned);
     Some(PackHeader {
+        offset: magic,
         version,
         uncompressed_length,
     })
+}
+
+fn fresh(
+    memory: &[u8],
+    restored: &[u8],
+    kind: PeKind,
+    origin: &Origin<'_>,
+    image_start: usize,
+) -> Option<FreshImage> {
+    let file = origin.read_file()?;
+    let header = find_pack_header(&file)?;
+    let field = |offset| read_u32(&file, header.offset + offset).ok();
+    let packed_length = field(COMPRESSED_LENGTH_OFFSET)? as usize;
+    let packed_adler = field(COMPRESSED_ADLER_OFFSET)?;
+
+    let disk = parse_disk_image(&file).ok()?;
+    let file_base = read_pointer(&file, disk.model().image_base_offset, kind).ok()?;
+    let after_header = header.offset + PACK_HEADER_SIZE; // small files keep the pack header at the front of the data
+    let stream = disk
+        .model()
+        .sections()
+        .iter()
+        .flat_map(|section| [section.raw_pointer as usize, after_header])
+        .filter_map(|start| file.get(start..start.checked_add(packed_length)?))
+        .find(|stream| adler32(stream) == packed_adler)?;
+
+    let size = header.uncompressed_length;
+    let data = match *file.get(header.offset + METHOD_OFFSET)? {
+        METHOD_NRV2B => nrv::decompress(stream, size, Variant::B),
+        METHOD_NRV2D => nrv::decompress(stream, size, Variant::D),
+        METHOD_NRV2E => nrv::decompress(stream, size, Variant::E),
+        METHOD_LZMA => decompress_lzma(stream, size),
+        _ => None,
+    }?;
+    (adler32(&data) == field(UNCOMPRESSED_ADLER_OFFSET)?).then_some(())?;
+
+    let mut pristine = vec![0; image_start];
+    pristine.extend(data);
+
+    let model = parse_memory_image(restored).ok()?.model;
+    let stored = |value: usize, kind| match kind {
+        PeKind::Pe32 => (value as u32).swap_bytes() as usize,
+        PeKind::Pe32Plus => (value as u64).swap_bytes() as usize,
+    }; // upx keeps relocated pointers big endian and relative to the first section
+    let decoded = relocate(&mut pristine, restored, &model, |value, kind| {
+        stored(value, kind).wrapping_add(image_start + file_base)
+    });
+    let flags = read_u16(restored, model.nt_offset + FILE_FLAGS_OFFSET).ok()?;
+    (decoded.is_some() || flags & RELOCS_STRIPPED != 0).then_some(())?;
+
+    let mut filtered = Vec::new();
+    if *file.get(header.offset + FILTER_OFFSET)? != 0 {
+        let optional = model.nt_offset + FILE_HEADER_END;
+        let code_size = read_u32(restored, optional + CODE_SIZE_OFFSET).ok()? as usize;
+        let code_base = read_u32(restored, optional + CODE_BASE_OFFSET).ok()? as usize;
+        filtered.push(code_base..code_base.saturating_add(code_size)); // call filtered code stays as it ran
+    }
+
+    fresh_image(
+        memory,
+        restored,
+        &pristine,
+        file_base,
+        origin.base,
+        restored.len(),
+        &filtered,
+    )
+}
+
+fn decompress_lzma(stream: &[u8], size: usize) -> Option<Vec<u8>> {
+    let [positions, literals, ..] = *stream else {
+        return None;
+    };
+
+    let properties = lzma::Properties {
+        literal_context: literals & LZMA_LITERAL_CONTEXT_MASK,
+        literal_position: literals >> LZMA_LITERAL_POSITION_SHIFT,
+        position: positions & LZMA_POSITION_MASK,
+    };
+    lzma::decompress(stream.get(LZMA_HEADER..)?, &properties, size)
+}
+
+fn adler32(bytes: &[u8]) -> u32 {
+    let (low, high) = bytes.iter().fold((1u32, 0u32), |(low, high), byte| {
+        let low = (low + u32::from(*byte)) % ADLER_MODULO;
+        (low, (high + low) % ADLER_MODULO)
+    });
+    (high << 16) | low
 }
 
 fn headers_from_pack_header(

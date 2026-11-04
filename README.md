@@ -54,7 +54,7 @@ DONE  Analysis-ready memory images
 - Imports put back together, even when the packer trashed the import table
 - PEs that were mapped by hand or stashed in random memory, the kind the module list never shows you
 - Packers undone when mempe knows them (see [the table](#supported-packers))
-- For ASPack and MPRESS, a second copy that starts on its own, built with the data the program began with
+- For UPX, ASPack and MPRESS, a second copy that starts on its own, built with the data the program began with
 - A report that tells you what it couldn't recover, so a broken dump never passes itself off as a good one
 
 ## How it works
@@ -138,7 +138,7 @@ mempe.exe -w target.exe
 
 Everything lands in a `mempe` folder in the current directory.
 
-A dump keeps the data exactly as it was while the program ran, decrypted strings and all, so a program that sets itself up at startup usually crashes if you start the dump. For ASPack and MPRESS, mempe can read the data the program started with out of the packed file. When the running data differs, it asks once whether to also save a copy like `target.fresh.exe` that starts on its own. The main dump never changes. When nobody is there to answer, like in a script, it saves the copy.
+A dump keeps the data exactly as it was while the program ran, decrypted strings and all, so a program that sets itself up at startup usually crashes if you start the dump. For UPX, ASPack and MPRESS, mempe can read the data the program started with out of the packed file. When the running data differs, it asks once whether to also save a copy like `target.fresh.exe` that starts on its own. The main dump never changes. When nobody is there to answer, like in a script, it saves the copy.
 
 To build it yourself, you need Windows 10 or later and stable Rust:
 

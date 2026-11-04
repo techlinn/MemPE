@@ -394,6 +394,7 @@ fn restore(image: &PeImage<'_>, stub: &Stub, origin: &Origin<'_>) -> Option<Unpa
             packed.base,
             origin.base,
             original_end,
+            &[],
         )
     });
 

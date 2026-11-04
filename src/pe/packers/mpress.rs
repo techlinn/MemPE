@@ -321,6 +321,7 @@ fn restore(
             file_base,
             base,
             stub.stub_start,
+            &[],
         )
     });
 

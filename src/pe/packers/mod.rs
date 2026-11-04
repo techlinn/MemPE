@@ -4,6 +4,7 @@ mod lzma;
 mod lzmat;
 mod lzx;
 mod mpress;
+mod nrv;
 mod tables;
 mod upx;
 

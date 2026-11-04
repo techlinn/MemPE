@@ -621,6 +621,7 @@ pub(super) fn fresh_image(
     pristine_base: usize,
     base: usize,
     end: usize,
+    left_alone: &[Range<usize>],
 ) -> Option<FreshImage> {
     let image = parse_memory_image(restored).ok()?;
     let model = image.model();
@@ -638,6 +639,7 @@ pub(super) fn fresh_image(
             let start = directory.rva().as_usize();
             start..start.saturating_add(directory.size() as usize)
         })
+        .chain(left_alone.iter().cloned())
         .collect::<Vec<_>>(); // tables mempe rebuilt or the loader fills in stay as restored
 
     let mut fresh = restored.to_vec();
@@ -675,6 +677,15 @@ pub(super) fn fresh_image(
 }
 
 fn rebase(bytes: &mut [u8], restored: &[u8], model: &PeModel, delta: usize) -> Option<()> {
+    relocate(bytes, restored, model, |value, _| value.wrapping_add(delta))
+}
+
+pub(super) fn relocate(
+    bytes: &mut [u8],
+    restored: &[u8],
+    model: &PeModel,
+    adjust: impl Fn(usize, PeKind) -> usize,
+) -> Option<()> {
     let directory = model.directory(restored, BASERELOC_DIRECTORY).ok()??;
     let start = directory.rva().as_usize();
     let table = restored.get(start..start.checked_add(directory.size() as usize)?)?;
@@ -701,7 +712,7 @@ fn rebase(bytes: &mut [u8], restored: &[u8], model: &PeModel, delta: usize) -> O
             let Ok(value) = read_pointer(bytes, at, kind) else {
                 continue;
             };
-            let moved = value.wrapping_add(delta);
+            let moved = adjust(value, kind);
             let _ = match kind {
                 PeKind::Pe32 => write_u32(bytes, at, moved as u32),
                 PeKind::Pe32Plus => write_u64(bytes, at, moved as u64),
