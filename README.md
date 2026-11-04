@@ -87,8 +87,8 @@ mempe snapshots the process, finds every module plus any PE hiding in non-image 
 | Packer | Status | Notes |
 |---|---|---|
 | UPX | Supported | 3.91 to 5.3.0, x86 and x64, EXEs and DLLs, tampered and modified copies too |
-| ASPack | Supported | 1.07b and 2.11 to 2.43 (tested on 1.07b, 2.11, 2.12, 2.2, 2.24, 2.28, 2.29 and 2.43), x86 EXEs and DLLs, tampered copies too. ASPack wipes the relocations and import table in memory, so mempe decompresses the originals straight out of the packed file and you get them back exactly, DLL names included. The icons and version info it moves into its own section go back to their original spots too. 1.07b compresses with aPLib instead, which mempe decodes too. Builds before 2.2 never kept the original section flags, so those get reported as lost. Other 1.x builds and 2.000 to 2.1 get recognised but haven't been tested |
-| MPRESS | Supported | 1.05 to 2.19 (tested on 1.05, 1.27, 2.05 and 2.19), x86 and x64, EXEs and DLLs, tampered copies too. Entry point, imports (ordinals included, with their real DLL names read back out of the packed file when it is still on disk), DLL relocations, export forwarders and TLS come back, and the merged section gets split back into code and data. Resources it moved out get put back at their original offsets, except with `-r`, where it moves every one of them and nothing is left to show where they were. MPRESS throws away EXE relocations, debug data, parts of the load config and some x64 unwind info for good, so mempe reports those as lost |
+| ASPack | Supported | 1.07b and 2.11 to 2.43, x86 EXEs and DLLs, with imports and relocations decompressed straight from the packed file |
+| MPRESS | Supported | 1.05 to 2.19, x86 and x64, EXEs and DLLs, merged sections split back into code and data |
 | VMProtect | Planned | Protector with code virtualization |
 | Themida / WinLicense | Planned | Protector with code virtualization |
 | Code Virtualizer | Planned | Virtualizer from the makers of Themida |
