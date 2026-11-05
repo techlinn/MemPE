@@ -24,6 +24,16 @@ pub(crate) trait Bits {
     }
 }
 
+impl<T: Bits + ?Sized> Bits for &mut T {
+    fn bit(&mut self) -> Option<u32> {
+        (**self).bit()
+    }
+
+    fn byte(&mut self) -> Option<u8> {
+        (**self).byte()
+    }
+}
+
 struct Cursor<'a> {
     data: &'a [u8],
     next: usize,
@@ -54,6 +64,10 @@ impl<'a> ByteTags<'a> {
             cursor: Cursor { data, next: 0 },
             tag: BYTE_TAG_SENTINEL,
         }
+    }
+
+    pub(crate) fn position(&self) -> usize {
+        self.cursor.next
     }
 }
 

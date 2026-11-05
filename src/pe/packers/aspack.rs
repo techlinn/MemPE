@@ -7,9 +7,9 @@ use super::tables::{
     FIRST_SECTION_RVA, HINT_SIZE, IMPORT_DESCRIPTOR_SIZE, MAX_IMPORT_DESCRIPTORS,
     MAX_RELOCATION_BLOCK, ORDINAL_FLAG, OriginalImage, RELOCATION_BLOCK_HEADER,
     RELOCATION_BLOCK_SIZE_OFFSET, Restoration, SECTION_CHARACTERISTICS_OFFSET,
-    SECTION_COUNT_OFFSET, THUNK_SIZE, clear_directory, find_delay_directory, find_load_config,
-    find_original_tls, fresh_image, iat_span, imports_from_original, map_disk_image, read_c_string,
-    return_moved_leaves, set_directory, set_tls_directory,
+    SECTION_COUNT_OFFSET, THUNK_SIZE, clear_directory, fresh_image, iat_span,
+    imports_from_original, map_disk_image, read_c_string, recover_directories, restore_tls,
+    return_moved_leaves, set_directory,
 };
 use super::{
     ImportedFunction, ModuleImports, Origin, PackerFindings, PackerImports, PackerReport, Unpacked,
@@ -18,9 +18,8 @@ use super::{
 use crate::pe::image::{read_u32, write_u16, write_u32};
 use crate::pe::parse::{parse_disk_image, parse_memory_image};
 use crate::pe::{
-    BASERELOC_DIRECTORY, BOUND_IMPORT_DIRECTORY, DELAY_IMPORT_DIRECTORY, IAT_DIRECTORY,
-    IMPORT_DIRECTORY, LOAD_CONFIG_DIRECTORY, PeImage, PeKind, PeModel, RESOURCE_DIRECTORY, Rva,
-    SECTION_HEADER_SIZE, SectionModel, TLS_DIRECTORY,
+    BASERELOC_DIRECTORY, BOUND_IMPORT_DIRECTORY, IAT_DIRECTORY, IMPORT_DIRECTORY, PeImage, PeKind,
+    PeModel, RESOURCE_DIRECTORY, Rva, SECTION_HEADER_SIZE, SectionModel,
 };
 
 const NAME: &str = "ASPack";
@@ -82,7 +81,6 @@ const CALL_SIZE: usize = 5;
 const POSITION_FILTER_TAIL: usize = 6; // the 1.x filter stops this far from the end
 const MAX_NAME: usize = 4_096;
 const WIPED_RELOCATION: u16 = 0xFFFF; // the stub overwrites each entry after applying it
-const LOAD_CONFIG_DIRECTORY_SIZE: usize = 0x40; // msvc PE32 value, the loader reads the struct's own size
 const RESERVED_DIRECTORY: usize = 15;
 
 struct Stub {
@@ -356,24 +354,10 @@ fn restore(image: &PeImage<'_>, stub: &Stub, origin: &Origin<'_>) -> Option<Unpa
     };
     report.record("relocations", relocations);
 
-    let tls = restore_tls(&mut restored, model, original_end);
+    let tls = restore_tls(&mut restored, model, origin.base, original_end, None);
     report.record("TLS", tls);
 
-    if let Some(rva) = find_load_config(&restored, PeKind::Pe32, origin.base, original_end) {
-        set_directory(
-            &mut restored,
-            model,
-            LOAD_CONFIG_DIRECTORY,
-            rva,
-            LOAD_CONFIG_DIRECTORY_SIZE,
-        )?;
-        report.restored.push("load config");
-    }
-
-    if let Some((rva, size)) = find_delay_directory(&restored, original_end) {
-        set_directory(&mut restored, model, DELAY_IMPORT_DIRECTORY, rva, size)?;
-        report.restored.push("delay imports");
-    }
+    recover_directories(&mut restored, model, origin.base, original_end, &mut report);
 
     clear_directory(&mut restored, model, BOUND_IMPORT_DIRECTORY);
     clear_directory(&mut restored, model, RESERVED_DIRECTORY);
@@ -913,22 +897,6 @@ fn restore_relocations(
     match set_directory(restored, model, BASERELOC_DIRECTORY, start, at - start) {
         Some(()) => Restoration::Restored,
         None => Restoration::Failed,
-    }
-}
-
-fn restore_tls(restored: &mut [u8], model: &PeModel, original_end: usize) -> Restoration {
-    let Ok(Some(copy)) = model.directory(restored, TLS_DIRECTORY) else {
-        return Restoration::Absent;
-    };
-
-    let original = find_original_tls(restored, copy.rva().as_usize(), PeKind::Pe32, original_end);
-
-    match original.and_then(|rva| set_tls_directory(restored, model, rva)) {
-        Some(()) => Restoration::Restored,
-        None => {
-            clear_directory(restored, model, TLS_DIRECTORY);
-            Restoration::Failed
-        }
     }
 }
 

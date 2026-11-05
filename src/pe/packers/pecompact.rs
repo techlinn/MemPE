@@ -5,13 +5,14 @@ use std::sync::Arc;
 use super::codecs::bitstream::{ByteTags, WordTags};
 use super::codecs::{aplib, brieflz, ffce, jcalg1, lzma};
 use super::tables::{
-    CODE_SECTION, DATA_SECTION, HINT_SIZE, IMPORT_DESCRIPTOR_SIZE, IMPORT_IAT_OFFSET,
-    IMPORT_NAME_OFFSET, MAX_IMPORT_DESCRIPTORS, MAX_RELOCATION_BLOCK, MAX_THUNKS,
-    RELOCATION_BLOCK_HEADER, RELOCATION_BLOCK_SIZE_OFFSET, RELOCATION_SECTION, RESOURCE_SECTION,
-    Restoration, SectionPiece, THUNK_SIZE, apply_listed_imports, clear_directory, export_functions,
-    fresh_image, iat_filled, lay_out_resources, linker_export_layout, linker_export_start,
-    listed_imports, map_disk_image, read_c_string, relocate, relocation_blocks,
-    replace_first_section, set_directory, walk_resources,
+    HINT_SIZE, IMPORT_DESCRIPTOR_SIZE, IMPORT_IAT_OFFSET, IMPORT_NAME_OFFSET,
+    MAX_IMPORT_DESCRIPTORS, MAX_RELOCATION_BLOCK, MAX_THUNKS, RELOCATION_BLOCK_HEADER,
+    RELOCATION_BLOCK_SIZE_OFFSET, Restoration, SectionHints, SectionPiece, THUNK_SIZE,
+    apply_listed_imports, clear_directory, export_functions, fresh_image, iat_filled,
+    linker_export_layout, linker_export_start, listed_imports, lowest_moved_leaf, map_disk_image,
+    name_sections, place, pogo_parts, pogo_sections, pogo_tls_directory, read_c_string, relocate,
+    relocated_fields, relocation_blocks, replace_first_section, resource_layout,
+    restore_moved_resources, restore_tls, set_directory,
 };
 use super::{
     ImportedFunction, ModuleImports, Origin, PackerFindings, PackerImports, PackerReport, Unpacked,
@@ -21,7 +22,7 @@ use crate::pe::image::{read_u16, read_u32, write_u32};
 use crate::pe::parse::{parse_disk_image, parse_memory_image};
 use crate::pe::{
     BASERELOC_DIRECTORY, BOUND_IMPORT_DIRECTORY, DYNAMIC_BASE, EXPORT_DIRECTORY, PeImage, PeKind,
-    PeModel, RELOCATION_HIGHLOW, RESOURCE_DIRECTORY, Rva, TLS_DIRECTORY,
+    PeModel, RELOCATION_HIGHLOW, Rva, TLS_DIRECTORY,
 };
 
 const NAME: &str = "PECompact";
@@ -243,7 +244,14 @@ fn restore(
             .copy_from_slice(moved.get(image_start..end)?); // only the file's bytes hold values for its own base
     }
 
-    let sections = packed.original_sections(&restored, model, entry);
+    let pogo = pogo_parts(&restored, model, end);
+    let merged = packed.original_sections(&restored, model, entry);
+    let linker_pieces = merged
+        .as_ref()
+        .and(pogo.as_deref())
+        .and_then(|parts| pogo_sections(parts, model, packed_section_end(model)?, Some(entry))); // only where the packer merged sections
+    let from_linker = linker_pieces.is_some();
+    let sections = linker_pieces.or(merged);
     let ranges = match &sections {
         Some(sections) => sections
             .iter()
@@ -251,24 +259,38 @@ fn restore(
             .collect(),
         None => packed.stored.clone(), // without merging the packer keeps the section table
     };
-    let resources = restore_resources(&mut restored, model, &ranges, end);
+    let layout = resource_layout(&restored, model, std::iter::empty());
+    let resources = restore_moved_resources(&mut restored, model, &ranges, end, layout, None);
     report.record("resources", resources);
 
     let exports = restore_exports(&mut restored, model, end);
     report.record("exports", exports);
 
     if directory_moved(&restored, model, TLS_DIRECTORY, end) {
-        report.lost.push("TLS directory"); // the packer runs its own and wipes the original
+        let tls = restore_tls(
+            &mut restored,
+            model,
+            origin.base,
+            end,
+            pogo.as_deref().and_then(pogo_tls_directory),
+        ); // the packer wipes the original and its fixups
+        report.record("original TLS directory", tls);
     }
+    let _ = cover_tls_directory(&mut restored, model);
 
-    match sections {
-        Some(sections) => {
+    match (sections, from_linker) {
+        (Some(sections), true)
+            if replace_first_section(&mut restored, model, &sections).is_some() =>
+        {
+            report.restored.push("section table");
+        }
+        (Some(sections), _) => {
             if replace_first_section(&mut restored, model, &sections).is_some() {
                 report.restored.push("code and data sections");
             }
             report.lost.push("section table");
         }
-        None => report.lost.push("section flags"), // the packer makes every section writable
+        (None, _) => report.lost.push("section flags"), // the packer makes every section writable
     }
 
     clear_directory(&mut restored, model, BOUND_IMPORT_DIRECTORY);
@@ -552,7 +574,7 @@ impl PackedFile {
             .filter(|block| block.flags & ENCODED != 0)
             .map(|block| block.destination)
             .min();
-        let mut starts = self
+        let starts = self
             .blocks
             .iter()
             .filter(|block| block.flags & MERGED != 0)
@@ -560,35 +582,17 @@ impl PackedFile {
             .chain(first)
             .filter(|start| *start < packed_end)
             .collect::<Vec<_>>();
-        starts.sort_unstable();
-        starts.dedup();
 
         let relocations = self.host_field(HOST_RELOCATIONS);
         let resources = lowest_moved_leaf(restored, model, self.original_end);
-        let pieces = starts
-            .iter()
-            .enumerate()
-            .map(|(index, start)| {
-                let end = starts.get(index + 1).copied().unwrap_or(packed_end);
-                let (name, characteristics) = if (*start..end).contains(&entry) {
-                    (*b".text\0\0\0", CODE_SECTION)
-                } else if relocations == Some(*start) {
-                    (*b".reloc\0\0", RELOCATION_SECTION)
-                } else if resources.is_some_and(|leaf| (*start..end).contains(&leaf)) {
-                    (*b".rsrc\0\0\0", RESOURCE_SECTION)
-                } else {
-                    (*b".data\0\0\0", DATA_SECTION)
-                };
-
-                SectionPiece {
-                    name,
-                    start: *start,
-                    end,
-                    characteristics,
-                }
-            })
-            .collect();
-        Some(pieces)
+        let hints = SectionHints {
+            code: Some(entry),
+            code_end: None,
+            constants: None,
+            relocations,
+            resources,
+        };
+        Some(name_sections(starts, packed_end, &hints))
     }
 }
 
@@ -818,7 +822,6 @@ fn restore_relocations(
         .ok()
         .flatten()
         .map(|directory| directory.rva().as_usize());
-    let kept = tls_fixups(restored, model, packed.original_end).unwrap_or_default(); // the packer's tls directory replaces the original one and its fixups
 
     let start = packed
         .host_field(HOST_RELOCATIONS)
@@ -835,17 +838,10 @@ fn restore_relocations(
         Some(_) => start,
         None => packer_table,
     };
-    let mut table = original_table.unwrap_or_default();
-    let original_length = table.len();
-    table.extend_from_slice(&kept);
+    let table = original_table.unwrap_or_default();
 
     let written = location.filter(|_| !table.is_empty()).and_then(|start| {
         let end = start.checked_add(table.len())?;
-        restored
-            .get(start.checked_add(original_length)?..end)?
-            .iter()
-            .all(|byte| *byte == 0)
-            .then_some(())?; // only into the padding after the original table
         restored.get_mut(start..end)?.copy_from_slice(&table);
         set_directory(restored, model, BASERELOC_DIRECTORY, start, table.len())
     });
@@ -856,21 +852,37 @@ fn restore_relocations(
     state
 }
 
-fn tls_fixups(restored: &[u8], model: &PeModel, end: usize) -> Option<Vec<u8>> {
-    let directory = model
+fn cover_tls_directory(restored: &mut [u8], model: &PeModel) -> Option<()> {
+    let tls = model
         .directory(restored, TLS_DIRECTORY)
         .ok()??
         .rva()
         .as_usize();
-    (directory >= end).then_some(())?;
-
-    let entries = (0..TLS_POINTER_FIELDS)
-        .map(|field| {
-            let rva = directory.checked_add(field * THUNK_SIZE)?;
-            Some((u32::try_from(rva).ok()?, RELOCATION_HIGHLOW))
-        })
+    let table = model.directory(restored, BASERELOC_DIRECTORY).ok()??;
+    let covered = relocated_fields(restored, model)?;
+    let missing = (0..TLS_POINTER_FIELDS)
+        .map(|field| tls.checked_add(field * THUNK_SIZE))
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
+        .filter(|field| !covered.iter().any(|(at, _)| at == field))
+        .filter(|field| read_u32(restored, *field).is_ok_and(|value| value != 0)) // zero fields stay zero
+        .map(|field| Some((u32::try_from(field).ok()?, RELOCATION_HIGHLOW)))
         .collect::<Option<Vec<_>>>()?;
-    relocation_blocks(&entries)
+    if missing.is_empty() {
+        return Some(());
+    }
+
+    let blocks = relocation_blocks(&missing)?;
+    let start = table.rva().as_usize();
+    let end = start.checked_add(table.size() as usize)?;
+    place(restored, end, &blocks)?;
+    set_directory(
+        restored,
+        model,
+        BASERELOC_DIRECTORY,
+        start,
+        table.size() as usize + blocks.len(),
+    )
 }
 
 fn dynamic_base(restored: &[u8], model: &PeModel) -> bool {
@@ -919,49 +931,6 @@ fn standard_relocations(bytes: &[u8], start: usize) -> Option<Vec<u8>> {
     (!table.is_empty()).then_some(table)
 }
 
-fn lowest_moved_leaf(restored: &[u8], model: &PeModel, end: usize) -> Option<usize> {
-    let root = model
-        .directory(restored, RESOURCE_DIRECTORY)
-        .ok()??
-        .rva()
-        .as_usize();
-    let tree = walk_resources(restored, root)?;
-    tree.data_entries
-        .iter()
-        .filter_map(|entry| Some(read_u32(restored, root.checked_add(*entry)?).ok()? as usize))
-        .filter(|rva| *rva < end)
-        .min()
-}
-
-fn restore_resources(
-    restored: &mut [u8],
-    model: &PeModel,
-    sections: &[Range<usize>],
-    end: usize,
-) -> Restoration {
-    let Ok(Some(directory)) = model.directory(restored, RESOURCE_DIRECTORY) else {
-        return Restoration::Absent;
-    };
-
-    let root = directory.rva().as_usize();
-    if root < end {
-        return Restoration::Absent;
-    }
-
-    let Some(leaf) = lowest_moved_leaf(restored, model, end) else {
-        return Restoration::Absent; // every resource stayed in the packer's section
-    };
-
-    let laid_out = sections
-        .iter()
-        .find(|section| section.contains(&leaf))
-        .and_then(|section| lay_out_resources(restored, model, root, section.clone()));
-    match laid_out {
-        Some(()) => Restoration::Restored,
-        None => Restoration::Failed,
-    }
-}
-
 fn restore_exports(restored: &mut [u8], model: &PeModel, end: usize) -> Restoration {
     let Ok(Some(directory)) = model.directory(restored, EXPORT_DIRECTORY) else {
         return Restoration::Absent;
@@ -996,6 +965,14 @@ fn restore_exports(restored: &mut [u8], model: &PeModel, end: usize) -> Restorat
         Some(()) => Restoration::Restored,
         None => Restoration::Failed,
     }
+}
+
+fn packed_section_end(model: &PeModel) -> Option<usize> {
+    let first = model.sections().first()?;
+    first
+        .virtual_address()
+        .as_usize()
+        .checked_add(first.span() as usize)
 }
 
 fn directory_moved(restored: &[u8], model: &PeModel, index: usize, end: usize) -> bool {

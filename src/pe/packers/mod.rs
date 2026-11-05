@@ -1,5 +1,6 @@
 mod aspack;
 mod codecs;
+mod fsg;
 mod mpress;
 mod pecompact;
 mod tables;
@@ -19,11 +20,12 @@ type Unpacker = fn(&PeImage<'_>, &Origin<'_>) -> Option<Unpacked>;
 
 const MAX_PACKED_FILE: u64 = 512 * 1024 * 1024;
 
-const UNPACKERS: [Unpacker; 4] = [
+const UNPACKERS: [Unpacker; 5] = [
     upx::unpack,
     aspack::unpack,
     mpress::unpack,
     pecompact::unpack,
+    fsg::unpack,
 ];
 
 #[derive(Clone, Copy)]

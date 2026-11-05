@@ -1,9 +1,9 @@
 use super::directories::write_directory;
 use super::headers::apply_checksum;
 use super::{MAX_OUTPUT_SIZE, RebuiltImage, align_up};
+use crate::pe::SECURITY_DIRECTORY;
 use crate::pe::image::{read_u16, read_u32};
 use crate::pe::parse::parse_disk_image;
-use crate::pe::{SECURITY_DIRECTORY, SectionModel};
 use crate::{AppError, AppResult};
 
 const CERTIFICATE_HEADER: usize = 8;
@@ -13,12 +13,15 @@ const CERTIFICATE_ALIGNMENT: usize = 8;
 
 pub(crate) fn overlay_offset(disk_headers: &[u8]) -> Option<u64> {
     let image = parse_disk_image(disk_headers).ok()?;
-    image
-        .model()
+    let model = image.model();
+    let alignment = u64::from(model.file_alignment.max(1));
+    model
         .sections()
         .iter()
-        .map(SectionModel::raw_end)
-        .max()
+        .map(|section| {
+            u64::from(section.raw_pointer) + u64::from(section.raw_size).next_multiple_of(alignment)
+        })
+        .max() // the loader maps raw data up to the file alignment
 }
 
 pub(crate) fn append_overlay(rebuilt: &mut RebuiltImage, overlay: &[u8]) -> AppResult<()> {

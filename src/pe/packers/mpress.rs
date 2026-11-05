@@ -1,10 +1,10 @@
 use super::codecs::{lzma, lzmat};
 use super::tables::{
-    CODE_SECTION, DATA_SECTION, FIRST_SECTION_RVA, LinkerTree, RELOCATION_SECTION,
-    RESOURCE_DATA_SIZE_OFFSET, RESOURCE_SIZE_ALIGNMENT, Restoration, SectionPiece, clear_directory,
-    export_functions, find_tls_by_template, fresh_image, iat_span, linker_export_layout,
-    linker_resource_layout, place, read_c_string, relocation_blocks, relocations_intact,
-    replace_first_section, return_moved_leaves, set_directory, set_tls_directory, walk_resources,
+    FIRST_SECTION_RVA, LinkerTree, RESOURCE_DATA_SIZE_OFFSET, RESOURCE_SIZE_ALIGNMENT, Restoration,
+    SectionHints, clear_directory, export_functions, fresh_image, iat_span, linker_export_layout,
+    linker_resource_layout, place, pogo_parts, pogo_sections, pogo_tls_directory, read_c_string,
+    relocation_blocks, relocations_intact, replace_first_section, restore_tls, return_moved_leaves,
+    set_directory, split_merged_section, walk_resources,
 };
 use super::{
     ImportedFunction, ModuleImports, Origin, PackerFindings, PackerImports, PackerReport, Unpacked,
@@ -15,7 +15,7 @@ use crate::pe::parse::{parse_disk_image, parse_memory_image};
 use crate::pe::{
     BASERELOC_DIRECTORY, BOUND_IMPORT_DIRECTORY, DYNAMIC_BASE, EXCEPTION_DIRECTORY,
     EXPORT_DIRECTORY, IAT_DIRECTORY, IMPORT_DIRECTORY, PeImage, PeKind, PeModel, RELOCATION_DIR64,
-    RELOCATION_HIGHLOW, RESOURCE_DIRECTORY, RUNTIME_FUNCTION_SIZE, SectionModel, TLS_DIRECTORY,
+    RELOCATION_HIGHLOW, RESOURCE_DIRECTORY, RUNTIME_FUNCTION_SIZE, SectionModel,
 };
 
 type Decoder = fn(&[u8], usize) -> Option<Vec<u8>>;
@@ -273,17 +273,41 @@ fn restore(
     let forwarders = restore_forwarders(&mut restored, model, stub.stub_start);
     report.record("export forwarders", forwarders);
 
-    let tls = restore_tls(&mut restored, model, base, stub.stub_start);
+    let pogo = pogo_parts(&restored, model, stub.stub_start);
+    let tls = restore_tls(
+        &mut restored,
+        model,
+        base,
+        stub.stub_start,
+        pogo.as_deref().and_then(pogo_tls_directory),
+    );
     report.record("TLS", tls);
 
     if unwind_info_erased(&restored, model) {
         report.lost.push("unwind info");
     }
 
-    if split_sections(&mut restored, model, finished.entry, relocation_section).is_some() {
-        report.restored.push("code and data sections");
+    let linker_pieces = pogo
+        .as_deref()
+        .and_then(|parts| pogo_sections(parts, model, stub.stub_start, finished.entry));
+    match linker_pieces {
+        Some(pieces) if replace_first_section(&mut restored, model, &pieces).is_some() => {
+            report.restored.push("section table");
+        }
+        _ => {
+            let hints = SectionHints {
+                code: finished.entry,
+                code_end: None,
+                constants: None,
+                relocations: relocation_section,
+                resources: None,
+            };
+            if split_merged_section(&mut restored, model, &hints, None, None).is_some() {
+                report.restored.push("code and data sections");
+            }
+            report.lost.push("section table");
+        }
     }
-    report.lost.push("section table");
 
     clear_directory(&mut restored, model, BOUND_IMPORT_DIRECTORY);
     parse_memory_image(&restored).ok()?;
@@ -726,47 +750,6 @@ fn unwind_info_erased(bytes: &[u8], model: &PeModel) -> bool {
     })
 }
 
-fn split_sections(
-    restored: &mut [u8],
-    model: &PeModel,
-    entry: Option<usize>,
-    relocations: Option<usize>,
-) -> Option<()> {
-    let packed = model.sections().first()?;
-    let start = packed.virtual_address().as_usize();
-    let end = start.checked_add(packed.span() as usize)?;
-    let alignment = model.section_alignment as usize;
-    let code_start = read_u32(restored, model.base_of_code_offset).ok()? as usize; // mpress keeps these
-    let code_size = read_u32(restored, model.size_of_code_offset).ok()? as usize;
-    let code_end = code_start
-        .checked_add(code_size)?
-        .checked_next_multiple_of(alignment)?;
-    let fits = code_start == start
-        && code_end > start
-        && code_end < end
-        && entry.is_none_or(|entry| (start..code_end).contains(&entry));
-    fits.then_some(())?;
-
-    let piece = |name: &[u8; 8], start: usize, end: usize, characteristics: u32| SectionPiece {
-        name: *name,
-        start,
-        end,
-        characteristics,
-    };
-    let mut pieces = vec![piece(b".text\0\0\0", start, code_end, CODE_SECTION)];
-    match relocations
-        .filter(|rva| rva.is_multiple_of(alignment) && (code_end + 1..end).contains(rva))
-    {
-        Some(relocations) => {
-            pieces.push(piece(b".data\0\0\0", code_end, relocations, DATA_SECTION));
-            pieces.push(piece(b".reloc\0\0", relocations, end, RELOCATION_SECTION));
-        }
-        None => pieces.push(piece(b".data\0\0\0", code_end, end, DATA_SECTION)),
-    }
-
-    replace_first_section(restored, model, &pieces)
-}
-
 fn restore_forwarders(restored: &mut [u8], model: &PeModel, end: usize) -> Restoration {
     let Ok(Some(copy)) = model.directory(restored, EXPORT_DIRECTORY) else {
         return Restoration::Absent;
@@ -814,17 +797,4 @@ fn is_forwarder(bytes: &[u8], at: usize) -> bool {
                     && function.bytes().all(|byte| byte.is_ascii_graphic())
             })
         })
-}
-
-fn restore_tls(restored: &mut [u8], model: &PeModel, base: usize, end: usize) -> Restoration {
-    let Ok(Some(copy)) = model.directory(restored, TLS_DIRECTORY) else {
-        return Restoration::Absent;
-    };
-
-    let original = find_tls_by_template(restored, copy.rva().as_usize(), model.kind(), base, end);
-
-    match original.and_then(|rva| set_tls_directory(restored, model, rva)) {
-        Some(()) => Restoration::Restored,
-        None => Restoration::Failed,
-    }
 }
