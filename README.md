@@ -84,7 +84,7 @@ mempe snapshots the process, finds every module plus any PE hiding in non-image 
 
 ## Supported packers
 
-| Packer | Status | Versions |
+| Name | Status | Versions |
 |---|---|---|
 | UPX | Supported | Every release from 3.91 to 5.3.0 |
 | ASPack | Supported | 1.07b, 2.11, 2.12, 2.2, 2.24, 2.28, 2.29, 2.43 |
@@ -92,22 +92,12 @@ mempe snapshots the process, finds every module plus any PE hiding in non-image 
 | PECompact | Supported | 2.3, 2.67 and 3.11, plus five other 2.x builds from 2005 and 2006 |
 | FSG | Supported | 1.0, 1.1, 1.2, 1.3, 1.31, 1.33, 2.0 and modified stubs |
 | MEW | Supported | 5, 10, 11 SE 1.2 and modified stubs |
-| VMProtect | Planned | - |
+| Enigma Protector | Planned | - |
+| Enigma Virtual Box | Planned | - |
+| Obsidium | Planned | - |
 | Themida / WinLicense | Planned | - |
 | Code Virtualizer | Planned | - |
-| Enigma Protector | Planned | - |
-| Obsidium | Planned | - |
-| ASProtect | Planned | - |
-| Armadillo | Planned | - |
-| PELock | Planned | - |
-| Safengine Shielden | Planned | - |
-| EXECryptor | Planned | - |
-| Petite | Planned | - |
-| MEW | Planned | - |
-| nPack / NsPack | Planned | - |
-| kkrunchy | Planned | - |
-| WinUpack | Planned | - |
-| MoleBox | Planned | - |
+| VMProtect | Planned | - |
 | Anything else | Generic dump | Any |
 
 Anything missing? [Open an issue](https://github.com/techlinn/MemPE/issues) and I'll add it.
@@ -173,7 +163,7 @@ mempe is about getting clean files out of a process. If you want to sweep proces
 
 ## Issues and contributing
 
-Hit a bug, a dump that came out wrong, or a packer mempe should know about? [Open an issue](https://github.com/techlinn/MemPE/issues) and I'll take a look. If you're reporting a bad dump, the console output helps a lot, and so does the packer or protector the target was built with.
+Hit a bug, a dump that came out wrong, or a packer mempe should know about? [Open an issue](https://github.com/techlinn/MemPE/issues) and I'll take a look. If you're reporting a bad dump, the console output helps a lot, and so does the packer the target was built with.
 
 Pull requests are welcome too. A new packer is a good place to start, since each one lives in its own file under [`src/pe/packers/`](src/pe/packers).
 
