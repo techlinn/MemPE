@@ -1,4 +1,5 @@
-use crate::pe::image::read_u32;
+use super::bitstream::{Bits, WordTags};
+use super::{copy_match, output_buffer};
 
 const END_MARKER: u32 = u32::MAX;
 const REPEAT_OFFSET: u32 = 2;
@@ -7,67 +8,36 @@ const NRV2B_FAR: u32 = 0xD00; // matches further back than this are one byte lon
 const NRV2DE_FAR: u32 = 0x500;
 
 #[derive(Clone, Copy)]
-pub(super) enum Variant {
+pub(crate) enum Variant {
     B,
     D,
     E,
 }
 
-struct Bits<'a> {
-    data: &'a [u8],
-    next: usize,
-    buffer: u32,
-    left: u32,
-}
-
-impl Bits<'_> {
-    fn byte(&mut self) -> Option<u8> {
-        let byte = *self.data.get(self.next)?;
-        self.next += 1;
-        Some(byte)
-    }
-
-    fn bit(&mut self) -> Option<u32> {
-        if self.left == 0 {
-            self.buffer = read_u32(self.data, self.next).ok()?;
-            self.next += 4;
-            self.left = 32;
-        }
-
-        self.left -= 1;
-        Some((self.buffer >> self.left) & 1)
-    }
-
-    fn gamma(&mut self) -> Option<u32> {
-        let mut value = 1u32;
-        loop {
-            value = value.checked_mul(2)?.checked_add(self.bit()?)?;
-            if self.bit()? == 1 {
-                return Some(value);
-            }
-        }
-    }
-
-    fn paired_gamma(&mut self) -> Option<u32> {
-        let mut value = 1u32;
-        loop {
-            value = value.checked_mul(2)?.checked_add(self.bit()?)?;
-            if self.bit()? == 1 {
-                return Some(value);
-            }
-            value = (value - 1).checked_mul(2)?.checked_add(self.bit()?)?;
+fn gamma(bits: &mut WordTags<'_>) -> Option<u32> {
+    let mut value = 1u32;
+    loop {
+        value = value.checked_mul(2)?.checked_add(bits.bit()?)?;
+        if bits.bit()? == 1 {
+            return Some(value);
         }
     }
 }
 
-pub(super) fn decompress(source: &[u8], size: usize, variant: Variant) -> Option<Vec<u8>> {
-    let mut bits = Bits {
-        data: source,
-        next: 0,
-        buffer: 0,
-        left: 0,
-    };
-    let mut output = Vec::with_capacity(size);
+fn paired_gamma(bits: &mut WordTags<'_>) -> Option<u32> {
+    let mut value = 1u32;
+    loop {
+        value = value.checked_mul(2)?.checked_add(bits.bit()?)?;
+        if bits.bit()? == 1 {
+            return Some(value);
+        }
+        value = (value - 1).checked_mul(2)?.checked_add(bits.bit()?)?;
+    }
+}
+
+pub(crate) fn decompress(source: &[u8], size: usize, variant: Variant) -> Option<Vec<u8>> {
+    let mut bits = WordTags::new(source, 0);
+    let mut output = output_buffer(size)?;
     let mut last_offset = 1u32;
 
     loop {
@@ -77,8 +47,8 @@ pub(super) fn decompress(source: &[u8], size: usize, variant: Variant) -> Option
         }
 
         let high = match variant {
-            Variant::B => bits.gamma()?,
-            Variant::D | Variant::E => bits.paired_gamma()?,
+            Variant::B => gamma(&mut bits)?,
+            Variant::D | Variant::E => paired_gamma(&mut bits)?,
         };
 
         let (offset, length_bit) = if high == REPEAT_OFFSET {
@@ -113,14 +83,14 @@ pub(super) fn decompress(source: &[u8], size: usize, variant: Variant) -> Option
                     None => bits.bit()?,
                 };
                 match first * 2 + bits.bit()? {
-                    0 => bits.gamma()? + 2,
+                    0 => gamma(&mut bits)? + 2,
                     length => length,
                 }
             }
             Variant::E => match length_bit {
                 Some(1) => 1 + bits.bit()?,
                 _ if bits.bit()? == 1 => 3 + bits.bit()?,
-                _ => bits.gamma()? + 3,
+                _ => gamma(&mut bits)? + 3,
             },
         };
         let far = match variant {
@@ -128,11 +98,6 @@ pub(super) fn decompress(source: &[u8], size: usize, variant: Variant) -> Option
             Variant::D | Variant::E => NRV2DE_FAR,
         };
         let length = (length + u32::from(offset > far) + 1) as usize;
-
-        let from = output.len().checked_sub(offset as usize)?;
-        (output.len().checked_add(length)? <= size).then_some(())?;
-        for index in from..from + length {
-            output.push(output[index]);
-        }
+        copy_match(&mut output, offset as usize, length, size)?;
     }
 }

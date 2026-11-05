@@ -1,21 +1,21 @@
+use super::codecs::{lzma, lzmat};
 use super::tables::{
-    FIRST_SECTION_RVA, LinkerTree, RESOURCE_DATA_SIZE_OFFSET, Restoration,
-    SECTION_CHARACTERISTICS_OFFSET, SECTION_COUNT_OFFSET, SECTION_RVA_OFFSET, clear_directory,
+    CODE_SECTION, DATA_SECTION, FIRST_SECTION_RVA, LinkerTree, RELOCATION_SECTION,
+    RESOURCE_DATA_SIZE_OFFSET, RESOURCE_SIZE_ALIGNMENT, Restoration, SectionPiece, clear_directory,
     export_functions, find_tls_by_template, fresh_image, iat_span, linker_export_layout,
     linker_resource_layout, place, read_c_string, relocation_blocks, relocations_intact,
-    return_moved_leaves, set_directory, set_tls_directory, walk_resources,
+    replace_first_section, return_moved_leaves, set_directory, set_tls_directory, walk_resources,
 };
 use super::{
     ImportedFunction, ModuleImports, Origin, PackerFindings, PackerImports, PackerReport, Unpacked,
-    find_patterns, lzma, lzmat,
+    find_patterns,
 };
 use crate::pe::image::{read_pointer, read_u16, read_u32, write_u16, write_u32};
 use crate::pe::parse::{parse_disk_image, parse_memory_image};
 use crate::pe::{
     BASERELOC_DIRECTORY, BOUND_IMPORT_DIRECTORY, DYNAMIC_BASE, EXCEPTION_DIRECTORY,
     EXPORT_DIRECTORY, IAT_DIRECTORY, IMPORT_DIRECTORY, PeImage, PeKind, PeModel, RELOCATION_DIR64,
-    RELOCATION_HIGHLOW, RESOURCE_DIRECTORY, RUNTIME_FUNCTION_SIZE, SECTION_HEADER_SIZE,
-    SectionModel, TLS_DIRECTORY,
+    RELOCATION_HIGHLOW, RESOURCE_DIRECTORY, RUNTIME_FUNCTION_SIZE, SectionModel, TLS_DIRECTORY,
 };
 
 type Decoder = fn(&[u8], usize) -> Option<Vec<u8>>;
@@ -41,12 +41,6 @@ const RELOCATION_MORE: u8 = 1; // fixup distances are big endian, seven bits per
 const UNWIND_INFO_OFFSET: usize = 8;
 const UNWIND_CHAINED: u32 = 1; // points at another runtime function instead of unwind info
 const UNWIND_VERSION_MASK: u8 = 0x07; // mpress zeroes the headers of the unwind entries it drops
-const SECTION_VIRTUAL_SIZE_OFFSET: usize = 8;
-const SECTION_RAW_SIZE_OFFSET: usize = 16;
-const SECTION_RAW_POINTER_OFFSET: usize = 20;
-const CODE_SECTION: u32 = 0x6000_0020; // read, execute, code
-const DATA_SECTION: u32 = 0xC000_0040; // read, write, initialized data
-const RELOCATION_SECTION: u32 = 0x4200_0040; // read, discardable, initialized data
 const EXPORT_ALIGNMENT: usize = 2; // msvc pads its export data to an even size
 const PAYLOAD_HEADER: usize = 6; // size in pages, then the packed size
 const PAGE_SHIFT: u32 = 12;
@@ -61,7 +55,6 @@ const LOAD_ADDRESS: u8 = 0x8D;
 const RIP_ADDRESS_MASK: u8 = 0xC7; // lea reg, [rip + x]
 const RIP_ADDRESS: u8 = 0x05;
 const PAGE: usize = 0x1000;
-const RESOURCE_SIZE_ALIGNMENT: usize = 8; // msvc pads the resource section to 8 bytes
 
 struct Stub {
     stub_start: usize,
@@ -247,12 +240,14 @@ fn restore(
     let file = origin.read_file();
     let originals = original_images(file.as_deref(), restored.len(), kind);
     let file_base = originals.as_ref().map(|(file_base, _)| *file_base);
-    let from_file = originals.and_then(|(_, mut images)| {
-        images.find_map(|image| {
-            scan(&image)
-                .filter(|blocks| blocks.iter().all(|block| block.listed.is_some()))
-                .map(|blocks| (blocks, image))
-        })
+    let from_file = originals.and_then(|(_, images)| {
+        images
+            .filter(|image| matches_memory(image, &restored))
+            .find_map(|image| {
+                scan(&image)
+                    .filter(|blocks| blocks.iter().all(|block| block.listed.is_some()))
+                    .map(|blocks| (blocks, image))
+            })
     }); // the file still holds the names the stub zeroes once it has run
 
     let (blocks, original) = match from_file {
@@ -330,6 +325,15 @@ fn restore(
         findings: PackerFindings { report, imports },
         fresh,
     })
+}
+
+fn matches_memory(decoded: &[u8], memory: &[u8]) -> bool {
+    let same = decoded
+        .iter()
+        .zip(memory)
+        .filter(|(left, right)| left == right)
+        .count();
+    same.saturating_mul(4) >= decoded.len().saturating_mul(3) // pointers and runtime data differ, real decodes still match 96% or more
 }
 
 fn original_images(
@@ -743,74 +747,24 @@ fn split_sections(
         && entry.is_none_or(|entry| (start..code_end).contains(&entry));
     fits.then_some(())?;
 
-    let mut pieces = vec![(*b".text\0\0\0", start, code_end, CODE_SECTION)];
+    let piece = |name: &[u8; 8], start: usize, end: usize, characteristics: u32| SectionPiece {
+        name: *name,
+        start,
+        end,
+        characteristics,
+    };
+    let mut pieces = vec![piece(b".text\0\0\0", start, code_end, CODE_SECTION)];
     match relocations
         .filter(|rva| rva.is_multiple_of(alignment) && (code_end + 1..end).contains(rva))
     {
         Some(relocations) => {
-            pieces.push((*b".data\0\0\0", code_end, relocations, DATA_SECTION));
-            pieces.push((*b".reloc\0\0", relocations, end, RELOCATION_SECTION));
+            pieces.push(piece(b".data\0\0\0", code_end, relocations, DATA_SECTION));
+            pieces.push(piece(b".reloc\0\0", relocations, end, RELOCATION_SECTION));
         }
-        None => pieces.push((*b".data\0\0\0", code_end, end, DATA_SECTION)),
+        None => pieces.push(piece(b".data\0\0\0", code_end, end, DATA_SECTION)),
     }
 
-    let mut table = Vec::new();
-    for (name, piece_start, piece_end, characteristics) in pieces {
-        let mut header = [0u8; SECTION_HEADER_SIZE];
-        header[..name.len()].copy_from_slice(&name);
-
-        let size = u32::try_from(piece_end.checked_sub(piece_start)?).ok()?;
-        let rva = u32::try_from(piece_start).ok()?;
-        for (offset, value) in [
-            (SECTION_VIRTUAL_SIZE_OFFSET, size),
-            (SECTION_RVA_OFFSET, rva),
-            (SECTION_RAW_SIZE_OFFSET, size),
-            (SECTION_RAW_POINTER_OFFSET, rva),
-            (SECTION_CHARACTERISTICS_OFFSET, characteristics),
-        ] {
-            write_u32(&mut header, offset, value).ok()?;
-        }
-
-        table.extend_from_slice(&header);
-    }
-
-    let first = packed.header_offset;
-    let rest = model
-        .sections()
-        .len()
-        .checked_sub(1)?
-        .checked_mul(SECTION_HEADER_SIZE)?;
-    let old_end = first.checked_add(SECTION_HEADER_SIZE)?.checked_add(rest)?;
-    let new_end = first.checked_add(table.len())?.checked_add(rest)?;
-    let headers_end = read_u32(restored, model.size_of_headers_offset).ok()? as usize;
-    let grown = restored.get(headers_end.max(old_end)..new_end.max(headers_end));
-
-    (new_end <= start && grown.is_some_and(|tail| tail.iter().all(|byte| *byte == 0)))
-        .then_some(())?;
-
-    if new_end > headers_end {
-        let headers_end = new_end.checked_next_multiple_of(model.file_alignment as usize)?;
-        write_u32(
-            restored,
-            model.size_of_headers_offset,
-            u32::try_from(headers_end).ok()?,
-        )
-        .ok()?;
-    }
-
-    let others = restored
-        .get(first.checked_add(SECTION_HEADER_SIZE)?..old_end)?
-        .to_vec();
-    table.extend_from_slice(&others);
-    restored.get_mut(first..new_end)?.copy_from_slice(&table);
-
-    let count = u16::try_from(table.len() / SECTION_HEADER_SIZE).ok()?;
-    write_u16(
-        restored,
-        model.nt_offset.checked_add(SECTION_COUNT_OFFSET)?,
-        count,
-    )
-    .ok()
+    replace_first_section(restored, model, &pieces)
 }
 
 fn restore_forwarders(restored: &mut [u8], model: &PeModel, end: usize) -> Restoration {

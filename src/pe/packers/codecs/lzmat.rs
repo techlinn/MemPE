@@ -1,3 +1,5 @@
+use super::output_buffer;
+
 const FLAG_BITS: usize = 8;
 const FLAG_MATCH: u32 = 0x80;
 const SHORT_WINDOW: usize = 0x881; // before this much output, distances use the short encoding
@@ -57,8 +59,9 @@ impl Nibbles<'_> {
     }
 }
 
-pub(super) fn decompress(source: &[u8], size: usize) -> Option<Vec<u8>> {
-    let mut output = vec![0u8; size];
+pub(crate) fn decompress(source: &[u8], size: usize) -> Option<Vec<u8>> {
+    let mut output = output_buffer(size)?;
+    output.resize(size, 0); // written by position, not appended
     *output.first_mut()? = *source.first()?;
 
     let mut input = Nibbles {

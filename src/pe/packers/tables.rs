@@ -1,19 +1,28 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
-use super::FreshImage;
-use crate::pe::image::{read_pointer, read_u16, read_u32, write_u32, write_u64};
-use crate::pe::parse::parse_memory_image;
+use super::{FreshImage, ImportedFunction, ModuleImports, PackerImports};
+use crate::pe::image::{read_pointer, read_u16, read_u32, write_u16, write_u32, write_u64};
+use crate::pe::parse::{parse_disk_image, parse_memory_image};
 use crate::pe::{
-    BASERELOC_DIRECTORY, PeKind, PeModel, RELOCATION_DIR64, RELOCATION_HIGHLOW, Rva, TLS_DIRECTORY,
+    BASERELOC_DIRECTORY, IAT_DIRECTORY, IMPORT_DIRECTORY, PeKind, PeModel, RELOCATION_DIR64,
+    RELOCATION_HIGHLOW, RESOURCE_DIRECTORY, Rva, SECTION_HEADER_SIZE, TLS_DIRECTORY,
 };
 
 const PAGE_MASK: u32 = 0xFFF;
 pub(super) const RELOCATION_BLOCK_HEADER: usize = 8;
 pub(super) const RELOCATION_BLOCK_SIZE_OFFSET: usize = 4;
+pub(super) const MAX_RELOCATION_BLOCK: usize = 0x10000;
 pub(super) const SECTION_COUNT_OFFSET: usize = 6; // from the nt signature
 pub(super) const SECTION_RVA_OFFSET: usize = 12;
 pub(super) const SECTION_CHARACTERISTICS_OFFSET: usize = 36;
+const SECTION_VIRTUAL_SIZE_OFFSET: usize = 8;
+const SECTION_RAW_SIZE_OFFSET: usize = 16;
+const SECTION_RAW_POINTER_OFFSET: usize = 20;
+pub(super) const CODE_SECTION: u32 = 0x6000_0020; // read, execute, code
+pub(super) const DATA_SECTION: u32 = 0xC000_0040; // read, write, initialized data
+pub(super) const RESOURCE_SECTION: u32 = 0x4000_0040; // read, initialized data
+pub(super) const RELOCATION_SECTION: u32 = 0x4200_0040; // read, discardable, initialized data
 pub(super) const RESOURCE_DATA_SIZE_OFFSET: usize = 4;
 const TLS_DIRECTORY_PE32: usize = 24;
 const TLS_DIRECTORY_PE32_PLUS: usize = 40;
@@ -33,6 +42,7 @@ const EXPORT_RVA_OFFSETS: [usize; 4] = [
     EXPORT_ORDINALS_OFFSET,
 ];
 const EXPORT_TABLE_ENTRY_SIZE: usize = 4;
+const EXPORT_ORDINAL_SIZE: usize = 2;
 const RESOURCE_TABLE_SIZE: usize = 16;
 const RESOURCE_NAMED_COUNT_OFFSET: usize = 12;
 const RESOURCE_ID_COUNT_OFFSET: usize = 14;
@@ -42,7 +52,9 @@ const RESOURCE_DATA_ENTRY_SIZE: usize = 16;
 const RESOURCE_SUBDIRECTORY: u32 = 0x8000_0000;
 const MAX_RESOURCE_DEPTH: usize = 4;
 const MAX_RESOURCE_ENTRIES: usize = 65_536;
-const RESOURCE_LEAF_ALIGNMENTS: [usize; 2] = [8, 4]; // linkers put leaves on 8 bytes, windows only needs 4
+const LINKER_LEAF_ALIGNMENT: usize = 8;
+const RESOURCE_LEAF_ALIGNMENTS: [usize; 2] = [LINKER_LEAF_ALIGNMENT, 4]; // windows only needs 4
+pub(super) const RESOURCE_SIZE_ALIGNMENT: usize = 8; // msvc pads the resource section to 8 bytes
 pub(super) const DEBUG_ENTRY_SIZE: usize = 28;
 const DEBUG_TIMESTAMP_OFFSET: usize = 4;
 pub(super) const DEBUG_TYPE_OFFSET: usize = 12;
@@ -72,6 +84,14 @@ pub(super) const FIRST_SECTION_RVA: usize = 0x1000;
 const SCAN_STEP: usize = 4;
 const DIRECTORY_COUNT: usize = 16;
 const RELOCATION_OFFSET_MASK: u16 = 0xFFF;
+pub(super) const IMPORT_DESCRIPTOR_SIZE: usize = 20;
+const IMPORT_NAME_OFFSET: usize = 12;
+const IMPORT_IAT_OFFSET: usize = 16;
+pub(super) const MAX_IMPORT_DESCRIPTORS: usize = 4_096;
+const MAX_THUNKS: usize = 65_536;
+pub(super) const THUNK_SIZE: usize = 4; // only PE32 packers hand over an import list
+pub(super) const ORDINAL_FLAG: u32 = 0x8000_0000;
+pub(super) const HINT_SIZE: usize = 2; // a name entry starts with its export hint
 
 pub(super) enum Restoration {
     Restored,
@@ -294,6 +314,19 @@ pub(super) fn linker_export_layout(
     Some((start, block))
 }
 
+pub(super) fn linker_export_start(bytes: &[u8], copy: usize) -> Option<usize> {
+    let field = |offset: usize| Some(read_u32(bytes, copy.checked_add(offset)?).ok()? as usize);
+    let tables = field(EXPORT_FUNCTION_COUNT_OFFSET)?
+        .checked_mul(EXPORT_TABLE_ENTRY_SIZE)?
+        .checked_add(
+            field(EXPORT_NAME_COUNT_OFFSET)?
+                .checked_mul(EXPORT_TABLE_ENTRY_SIZE + EXPORT_ORDINAL_SIZE)?,
+        )?
+        .checked_add(EXPORT_DIRECTORY_SIZE)?;
+
+    field(EXPORT_NAME_OFFSET)?.checked_sub(tables) // the linker writes the module name right after them
+}
+
 pub(super) fn moved_export_directory(
     bytes: &[u8],
     packed: usize,
@@ -476,6 +509,50 @@ pub(super) fn return_moved_leaves(
     Restoration::Restored
 }
 
+pub(super) fn lay_out_resources(
+    restored: &mut [u8],
+    model: &PeModel,
+    packed_root: usize,
+    section: Range<usize>,
+) -> Option<()> {
+    let mut tree = linker_resource_layout(restored, packed_root)?;
+    let leaves = tree
+        .data_entries
+        .iter()
+        .map(|entry| {
+            let rva = read_u32(&tree.bytes, *entry).ok()? as usize;
+            let size = read_u32(&tree.bytes, entry.checked_add(RESOURCE_DATA_SIZE_OFFSET)?).ok()?;
+            restored
+                .get(rva..rva.checked_add(size as usize)?)
+                .map(<[u8]>::to_vec)
+        })
+        .collect::<Option<Vec<_>>>()?;
+
+    let mut cursor = section.start.checked_add(tree.bytes.len())?;
+    let mut placed = Vec::with_capacity(leaves.len());
+    for (entry, data) in tree.data_entries.iter().zip(&leaves) {
+        cursor = cursor.checked_next_multiple_of(LINKER_LEAF_ALIGNMENT)?;
+        write_u32(&mut tree.bytes, *entry, u32::try_from(cursor).ok()?).ok()?;
+        placed.push(cursor - section.start);
+        cursor = cursor.checked_add(data.len())?;
+    }
+    (cursor <= section.end).then_some(())?;
+
+    let region = restored.get_mut(section.clone())?;
+    region.fill(0);
+    region
+        .get_mut(..tree.bytes.len())?
+        .copy_from_slice(&tree.bytes);
+    for (offset, data) in placed.into_iter().zip(&leaves) {
+        region
+            .get_mut(offset..offset + data.len())?
+            .copy_from_slice(data);
+    }
+
+    let size = (cursor - section.start).checked_next_multiple_of(RESOURCE_SIZE_ALIGNMENT)?;
+    set_directory(restored, model, RESOURCE_DIRECTORY, section.start, size)
+}
+
 pub(super) struct LinkerTree {
     pub(super) bytes: Vec<u8>,
     pub(super) data_entries: Vec<usize>,
@@ -624,6 +701,195 @@ fn collect_leaves(
     }
 
     Some(())
+}
+
+pub(super) fn map_disk_image(file: &[u8], end: usize) -> Option<Vec<u8>> {
+    let disk = parse_disk_image(file).ok()?;
+    let mut image = vec![0u8; end];
+
+    for section in disk.model().sections() {
+        let rva = section.virtual_address().as_usize();
+        let start = section.raw_pointer as usize;
+        let length = (section.raw_size as usize).min(section.span() as usize);
+        let raw = file.get(start..start.checked_add(length)?)?;
+        if let Some(slot) = image.get_mut(rva..rva.saturating_add(raw.len())) {
+            slot.copy_from_slice(raw);
+        }
+    }
+
+    Some(image)
+}
+
+pub(super) trait OriginalImage {
+    fn original_u32(&mut self, rva: usize) -> Option<u32>;
+    fn original_string(&mut self, rva: usize) -> Option<String>;
+}
+
+impl OriginalImage for &[u8] {
+    fn original_u32(&mut self, rva: usize) -> Option<u32> {
+        read_u32(self, rva).ok()
+    }
+
+    fn original_string(&mut self, rva: usize) -> Option<String> {
+        read_c_string(self, rva).map(|(name, _)| name)
+    }
+}
+
+pub(super) fn imports_from_original(
+    restored: &mut [u8],
+    model: &PeModel,
+    import_rva: usize,
+    original: &mut impl OriginalImage,
+) -> Option<PackerImports> {
+    let modules = listed_imports(import_rva, original)?;
+    iat_filled(restored, &modules).then_some(())?;
+    apply_listed_imports(restored, model, modules)
+}
+
+pub(super) fn listed_imports(
+    import_rva: usize,
+    original: &mut impl OriginalImage,
+) -> Option<Vec<ModuleImports>> {
+    let mut modules = Vec::new();
+    for index in 0..MAX_IMPORT_DESCRIPTORS {
+        let descriptor = import_rva.checked_add(index.checked_mul(IMPORT_DESCRIPTOR_SIZE)?)?;
+        let lookup = original.original_u32(descriptor)? as usize;
+        let name = original.original_u32(descriptor.checked_add(IMPORT_NAME_OFFSET)?)? as usize;
+        let iat = original.original_u32(descriptor.checked_add(IMPORT_IAT_OFFSET)?)? as usize;
+
+        if name == 0 && iat == 0 {
+            break;
+        }
+
+        let module = original.original_string(name)?;
+        let source = match lookup {
+            0 => iat, // borland linkers leave the names in the iat itself
+            _ => lookup,
+        };
+
+        let mut functions = Vec::new();
+        for slot in 0..MAX_THUNKS {
+            let entry =
+                original.original_u32(source.checked_add(slot.checked_mul(THUNK_SIZE)?)?)?;
+
+            if entry == 0 {
+                break;
+            }
+
+            functions.push(match entry & ORDINAL_FLAG {
+                0 => ImportedFunction::Name(
+                    original.original_string((entry as usize).checked_add(HINT_SIZE)?)?,
+                ),
+                _ => ImportedFunction::Ordinal(entry as u16),
+            });
+        }
+
+        modules.push(ModuleImports {
+            module,
+            first_thunk: u32::try_from(iat).ok()?,
+            functions,
+        });
+    }
+
+    Some(modules)
+}
+
+pub(super) fn iat_filled(restored: &[u8], modules: &[ModuleImports]) -> bool {
+    modules.iter().all(|module| {
+        let iat = module.first_thunk as usize;
+        let filled = |slot: usize| {
+            read_u32(restored, iat.saturating_add(slot * THUNK_SIZE)).is_ok_and(|value| value != 0)
+        };
+        (0..module.functions.len()).all(filled) && !filled(module.functions.len())
+    })
+}
+
+pub(super) fn apply_listed_imports(
+    restored: &mut [u8],
+    model: &PeModel,
+    modules: Vec<ModuleImports>,
+) -> Option<PackerImports> {
+    let tables = modules
+        .iter()
+        .map(|module| (module.first_thunk as usize, module.functions.len()));
+    let (first, span) = iat_span(tables, THUNK_SIZE)?;
+    clear_directory(restored, model, IMPORT_DIRECTORY);
+    set_directory(restored, model, IAT_DIRECTORY, first, span)?;
+
+    Some(PackerImports::Listed(modules))
+}
+
+pub(super) struct SectionPiece {
+    pub(super) name: [u8; 8],
+    pub(super) start: usize,
+    pub(super) end: usize,
+    pub(super) characteristics: u32,
+}
+
+pub(super) fn replace_first_section(
+    restored: &mut [u8],
+    model: &PeModel,
+    pieces: &[SectionPiece],
+) -> Option<()> {
+    let mut table = Vec::new();
+    for piece in pieces {
+        let mut header = [0u8; SECTION_HEADER_SIZE];
+        header[..piece.name.len()].copy_from_slice(&piece.name);
+
+        let size = u32::try_from(piece.end.checked_sub(piece.start)?).ok()?;
+        let rva = u32::try_from(piece.start).ok()?;
+        for (offset, value) in [
+            (SECTION_VIRTUAL_SIZE_OFFSET, size),
+            (SECTION_RVA_OFFSET, rva),
+            (SECTION_RAW_SIZE_OFFSET, size),
+            (SECTION_RAW_POINTER_OFFSET, rva),
+            (SECTION_CHARACTERISTICS_OFFSET, piece.characteristics),
+        ] {
+            write_u32(&mut header, offset, value).ok()?;
+        }
+
+        table.extend_from_slice(&header);
+    }
+
+    let packed = model.sections().first()?;
+    let start = packed.virtual_address().as_usize();
+    let first = packed.header_offset;
+    let rest = model
+        .sections()
+        .len()
+        .checked_sub(1)?
+        .checked_mul(SECTION_HEADER_SIZE)?;
+    let old_end = first.checked_add(SECTION_HEADER_SIZE)?.checked_add(rest)?;
+    let new_end = first.checked_add(table.len())?.checked_add(rest)?;
+    let headers_end = read_u32(restored, model.size_of_headers_offset).ok()? as usize;
+    let grown = restored.get(headers_end.max(old_end)..new_end.max(headers_end));
+
+    (new_end <= start && grown.is_some_and(|tail| tail.iter().all(|byte| *byte == 0)))
+        .then_some(())?;
+
+    if new_end > headers_end {
+        let headers_end = new_end.checked_next_multiple_of(model.file_alignment as usize)?;
+        write_u32(
+            restored,
+            model.size_of_headers_offset,
+            u32::try_from(headers_end).ok()?,
+        )
+        .ok()?;
+    }
+
+    let others = restored
+        .get(first.checked_add(SECTION_HEADER_SIZE)?..old_end)?
+        .to_vec();
+    table.extend_from_slice(&others);
+    restored.get_mut(first..new_end)?.copy_from_slice(&table);
+
+    let count = u16::try_from(table.len() / SECTION_HEADER_SIZE).ok()?;
+    write_u16(
+        restored,
+        model.nt_offset.checked_add(SECTION_COUNT_OFFSET)?,
+        count,
+    )
+    .ok()
 }
 
 pub(super) fn fresh_image(

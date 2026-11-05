@@ -1,10 +1,7 @@
-mod aplib;
 mod aspack;
-mod lzma;
-mod lzmat;
-mod lzx;
+mod codecs;
 mod mpress;
-mod nrv;
+mod pecompact;
 mod tables;
 mod upx;
 
@@ -20,7 +17,12 @@ type Unpacker = fn(&PeImage<'_>, &Origin<'_>) -> Option<Unpacked>;
 
 const MAX_PACKED_FILE: u64 = 512 * 1024 * 1024;
 
-const UNPACKERS: [Unpacker; 3] = [upx::unpack, aspack::unpack, mpress::unpack];
+const UNPACKERS: [Unpacker; 4] = [
+    upx::unpack,
+    aspack::unpack,
+    mpress::unpack,
+    pecompact::unpack,
+];
 
 #[derive(Clone, Copy)]
 pub(super) enum HeaderSource {

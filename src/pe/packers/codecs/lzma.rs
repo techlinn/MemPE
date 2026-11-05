@@ -1,3 +1,5 @@
+use super::output_buffer;
+
 const PROBABILITY_BITS: u32 = 11;
 const PROBABILITY_START: u16 = 1 << (PROBABILITY_BITS - 1);
 const MOVE_BITS: u32 = 5;
@@ -21,11 +23,25 @@ const ALIGN_BITS: u32 = 4;
 const SPECIAL_POSITIONS: usize = 115; // 114 models plus one below, where the first reverse tree starts
 const MIN_MATCH: usize = 2;
 const END_MARKER: u32 = u32::MAX;
+const LITERAL_CONTEXTS: u8 = 9; // the standard properties byte packs (pb * 5 + lp) * 9 + lc
+const LITERAL_POSITIONS: u8 = 5;
+const PACKED_PROPERTY_LIMIT: u8 = 9 * 5 * 5;
 
-pub(super) struct Properties {
-    pub(super) literal_context: u8,
-    pub(super) literal_position: u8,
-    pub(super) position: u8,
+pub(crate) struct Properties {
+    pub(crate) literal_context: u8,
+    pub(crate) literal_position: u8,
+    pub(crate) position: u8,
+}
+
+impl Properties {
+    pub(crate) fn from_packed(packed: u8) -> Option<Self> {
+        (packed < PACKED_PROPERTY_LIMIT).then_some(())?;
+        Some(Self {
+            literal_context: packed % LITERAL_CONTEXTS,
+            literal_position: packed / LITERAL_CONTEXTS % LITERAL_POSITIONS,
+            position: packed / (LITERAL_CONTEXTS * LITERAL_POSITIONS),
+        })
+    }
 }
 
 struct RangeDecoder<'a> {
@@ -149,7 +165,7 @@ impl LengthDecoder {
     }
 }
 
-pub(super) fn decompress(source: &[u8], properties: &Properties, size: usize) -> Option<Vec<u8>> {
+pub(crate) fn decompress(source: &[u8], properties: &Properties, size: usize) -> Option<Vec<u8>> {
     let Properties {
         literal_context,
         literal_position,
@@ -178,7 +194,7 @@ pub(super) fn decompress(source: &[u8], properties: &Properties, size: usize) ->
     let mut lengths = LengthDecoder::new();
     let mut repeat_lengths = LengthDecoder::new();
 
-    let mut output = Vec::with_capacity(size);
+    let mut output = output_buffer(size)?;
     let mut state = 0usize;
     let mut repeats = [0usize; 4];
 

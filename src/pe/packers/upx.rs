@@ -1,4 +1,5 @@
-use super::nrv::{self, Variant};
+use super::codecs::lzma;
+use super::codecs::nrv::{self, Variant};
 use super::tables::{
     DEBUG_ENTRY_SIZE, DEBUG_TYPE_CODEVIEW, DEBUG_TYPE_OFFSET, RESOURCE_DATA_SIZE_OFFSET,
     Restoration, SECTION_COUNT_OFFSET, SECTION_RVA_OFFSET, clear_directory, codeview_entry,
@@ -8,10 +9,10 @@ use super::tables::{
 };
 use super::{
     FreshImage, HeaderSource, ImportedFunction, ModuleImports, Origin, PackerFindings,
-    PackerImports, PackerReport, Unpacked, find_pattern, lzma,
+    PackerImports, PackerReport, Unpacked, find_pattern,
 };
 use crate::pe::image::{read_pointer, read_u16, read_u32, write_u32};
-use crate::pe::parse::{parse_disk_image, parse_memory_image};
+use crate::pe::parse::{MACHINE_AMD64, MACHINE_I386, parse_disk_image, parse_memory_image};
 use crate::pe::{
     BASERELOC_DIRECTORY, BOUND_IMPORT_DIRECTORY, DEBUG_DIRECTORY, EXPORT_DIRECTORY,
     IMAGE_SCN_MEM_WRITE, IMPORT_DIRECTORY, LOAD_CONFIG_DIRECTORY, PeImage, PeKind, PeModel,
@@ -27,6 +28,8 @@ const PE_SIGNATURE: &[u8; 4] = b"PE\0\0";
 const FILE_HEADER_END: usize = 24; // signature plus file header
 const TIMESTAMP_OFFSET: usize = 8;
 const OPTIONAL_SIZE_OFFSET: usize = 20;
+const MACHINE_OFFSET: usize = 4;
+const SECTION_ALIGNMENT_OFFSET: usize = FILE_HEADER_END + 32;
 const FILE_FLAGS_OFFSET: usize = 22;
 const RELOCS_STRIPPED: u16 = 0x0001;
 const EXTRA_INFO_SCAN: usize = 0x1000;
@@ -61,7 +64,11 @@ const REL_BASED_DIR64: u16 = 10;
 const EMPTY_RELOCATION_BLOCK: [u8; 8] = [0, 0, 0, 0, 8, 0, 0, 0];
 const ORIGINAL_RVA_PREFIX: usize = 4; // upx stores each kept leaf after its original rva
 const PACK_HEADER_SIZE: usize = 32;
+const FORMAT_OFFSET: usize = 5;
 const METHOD_OFFSET: usize = 6;
+const PE_FORMATS: [u8; 2] = [9, 36]; // win32/pe and win64/pe
+const CHECKSUM_START: usize = 4; // the checksum skips the magic
+const CHECKSUM_MODULO: u32 = 251;
 const UNCOMPRESSED_ADLER_OFFSET: usize = 8;
 const COMPRESSED_ADLER_OFFSET: usize = 12;
 const COMPRESSED_LENGTH_OFFSET: usize = 20;
@@ -159,7 +166,8 @@ pub(super) fn unpack(image: &PeImage<'_>, origin: &Origin<'_>) -> Option<Unpacke
 
     let expects_completion_mark = stub.as_ref().is_some_and(|stub| stub.marks_completion)
         && matches!(origin.headers, HeaderSource::Memory);
-    let ready = stub_finished(model) || !expects_completion_mark;
+    let ready =
+        stub_finished(model) || (!expects_completion_mark && first_section_filled(bytes, model));
 
     if ready {
         let restored = restore(
@@ -204,6 +212,18 @@ fn stub_finished(model: &PeModel) -> bool {
         .is_some_and(|section| section.characteristics() & IMAGE_SCN_MEM_WRITE == 0)
 }
 
+fn first_section_filled(bytes: &[u8], model: &PeModel) -> bool {
+    model.sections().first().is_some_and(|section| {
+        let start = section.virtual_address().as_usize();
+        let end = start
+            .saturating_add(section.mapped_size() as usize)
+            .min(bytes.len());
+        bytes
+            .get(start..end)
+            .is_some_and(|data| data.iter().any(|&byte| byte != 0)) // UPX0 is empty until the stub runs
+    })
+}
+
 fn restore(
     image: &PeImage<'_>,
     stub: Option<&Stub>,
@@ -227,6 +247,7 @@ fn restore(
         .into_iter()
         .chain(after_import_list)
         .chain(scanned)
+        .filter(|stored| matches_running_image(bytes, stored.offset, image.model()))
         .find_map(|stored| restore_from(image, stub, &stored, image_start, version.clone()))
 }
 
@@ -469,6 +490,25 @@ fn find_pack_header(bytes: &[u8]) -> Option<PackHeader> {
     let magic = window
         .windows(PACK_HEADER_MAGIC.len())
         .position(|candidate| candidate == PACK_HEADER_MAGIC)?;
+    pack_header_at(bytes, magic)
+}
+
+fn find_wiped_pack_header(bytes: &[u8]) -> Option<PackHeader> {
+    let window = bytes.get(..PACK_HEADER_WINDOW.min(bytes.len()))?;
+    let at = window.windows(PACK_HEADER_SIZE).position(|header| {
+        let sum = header[CHECKSUM_START..PACK_HEADER_SIZE - 1]
+            .iter()
+            .map(|&byte| u32::from(byte))
+            .sum::<u32>();
+        PE_FORMATS.contains(&header[FORMAT_OFFSET])
+            && [METHOD_NRV2B, METHOD_NRV2D, METHOD_NRV2E, METHOD_LZMA]
+                .contains(&header[METHOD_OFFSET])
+            && sum % CHECKSUM_MODULO == u32::from(header[PACK_HEADER_SIZE - 1])
+    })?;
+    pack_header_at(bytes, at)
+}
+
+fn pack_header_at(bytes: &[u8], magic: usize) -> Option<PackHeader> {
     let uncompressed_length =
         read_u32(bytes, magic.checked_add(UNCOMPRESSED_LENGTH_OFFSET)?).ok()? as usize;
     let version = magic
@@ -495,7 +535,7 @@ fn fresh(
     base: usize,
     image_start: usize,
 ) -> Option<FreshImage> {
-    let header = find_pack_header(file)?;
+    let header = find_pack_header(file).or_else(|| find_wiped_pack_header(file))?; // the stream's adler32 still has to match
     let field = |offset| read_u32(file, header.offset + offset).ok();
     let packed_length = field(COMPRESSED_LENGTH_OFFSET)? as usize;
     let packed_adler = field(COMPRESSED_ADLER_OFFSET)?;
@@ -512,6 +552,7 @@ fn fresh(
         .find(|stream| adler32(stream) == packed_adler)?;
 
     let size = header.uncompressed_length;
+    (image_start.checked_add(size)? <= memory.len()).then_some(())?; // the stub unpacks in place, so it has to fit
     let data = match *file.get(header.offset + METHOD_OFFSET)? {
         METHOD_NRV2B => nrv::decompress(stream, size, Variant::B),
         METHOD_NRV2D => nrv::decompress(stream, size, Variant::D),
@@ -638,6 +679,18 @@ fn stored_headers_at(bytes: &[u8], offset: usize, image_start: usize) -> Option<
     bytes.get(offset..offset.checked_add(length)?)?;
 
     Some(StoredHeaders { offset, length })
+}
+
+fn matches_running_image(bytes: &[u8], offset: usize, model: &PeModel) -> bool {
+    let machine = match model.kind() {
+        PeKind::Pe32 => MACHINE_I386,
+        PeKind::Pe32Plus => MACHINE_AMD64,
+    };
+    let field = |at: usize| offset.checked_add(at);
+
+    field(MACHINE_OFFSET).and_then(|at| read_u16(bytes, at).ok()) == Some(machine)
+        && field(SECTION_ALIGNMENT_OFFSET).and_then(|at| read_u32(bytes, at).ok())
+            == Some(model.section_alignment)
 }
 
 fn write_stored_headers(

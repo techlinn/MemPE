@@ -1,3 +1,5 @@
+use super::output_buffer;
+
 const MAIN_SYMBOLS: usize = 721;
 const LENGTH_SYMBOLS: usize = 28;
 const ALIGNED_SYMBOLS: usize = 8;
@@ -24,16 +26,16 @@ const FILTER_SPAN: usize = 5;
 const FILTER_CALL: u8 = 0xE8;
 const FILTER_JUMP: u8 = 0xE9;
 
-pub(super) struct Tables<'a> {
+pub(crate) struct Tables<'a> {
     length_base: &'a [u8],
     length_bits: &'a [u8],
     offset_bits: &'a [u8],
 }
 
 impl<'a> Tables<'a> {
-    pub(super) const SIZE: usize = LENGTH_SYMBOLS * 2 + OFFSET_SLOTS; // length bases, length bits, offset bits
+    pub(crate) const SIZE: usize = LENGTH_SYMBOLS * 2 + OFFSET_SLOTS; // length bases, length bits, offset bits
 
-    pub(super) fn new(bytes: &'a [u8]) -> Option<Self> {
+    pub(crate) fn new(bytes: &'a [u8]) -> Option<Self> {
         let bytes = bytes.get(..Self::SIZE)?;
         let (lengths, offset_bits) = bytes.split_at(LENGTH_SYMBOLS * 2);
         let (length_base, length_bits) = lengths.split_at(LENGTH_SYMBOLS);
@@ -196,7 +198,7 @@ fn read_trees(bits: &mut Bits<'_>, previous: &mut [u8; ALL_SYMBOLS]) -> Option<T
     })
 }
 
-pub(super) fn decompress(source: &[u8], size: usize, tables: &Tables<'_>) -> Option<Vec<u8>> {
+pub(crate) fn decompress(source: &[u8], size: usize, tables: &Tables<'_>) -> Option<Vec<u8>> {
     let offset_base = tables
         .offset_bits
         .iter()
@@ -211,7 +213,7 @@ pub(super) fn decompress(source: &[u8], size: usize, tables: &Tables<'_>) -> Opt
     let mut bits = Bits::new(source);
     let mut previous = [0u8; ALL_SYMBOLS];
     let mut trees = read_trees(&mut bits, &mut previous)?;
-    let mut output = Vec::with_capacity(size);
+    let mut output = output_buffer(size)?;
     let mut repeats = [0usize; REPEATED_OFFSETS];
 
     while output.len() < size {
@@ -272,7 +274,7 @@ pub(super) fn decompress(source: &[u8], size: usize, tables: &Tables<'_>) -> Opt
     Some(output)
 }
 
-pub(super) fn unfilter_calls(bytes: &mut [u8], marker: u8) {
+pub(crate) fn unfilter_calls(bytes: &mut [u8], marker: u8) {
     let mut at = 0;
     while at + FILTER_SPAN < bytes.len() {
         if matches!(bytes[at], FILTER_CALL | FILTER_JUMP) && bytes[at + 1] == marker {

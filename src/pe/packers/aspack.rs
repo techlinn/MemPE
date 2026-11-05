@@ -1,12 +1,15 @@
 use std::collections::HashMap;
 
-use super::aplib;
-use super::lzx::{Tables, decompress, unfilter_calls};
+use super::codecs::aplib;
+use super::codecs::bitstream::ByteTags;
+use super::codecs::lzx::{Tables, decompress, unfilter_calls};
 use super::tables::{
-    FIRST_SECTION_RVA, RELOCATION_BLOCK_HEADER, RELOCATION_BLOCK_SIZE_OFFSET, Restoration,
-    SECTION_CHARACTERISTICS_OFFSET, SECTION_COUNT_OFFSET, clear_directory, find_delay_directory,
-    find_load_config, find_original_tls, fresh_image, iat_span, read_c_string, return_moved_leaves,
-    set_directory, set_tls_directory,
+    FIRST_SECTION_RVA, HINT_SIZE, IMPORT_DESCRIPTOR_SIZE, MAX_IMPORT_DESCRIPTORS,
+    MAX_RELOCATION_BLOCK, ORDINAL_FLAG, OriginalImage, RELOCATION_BLOCK_HEADER,
+    RELOCATION_BLOCK_SIZE_OFFSET, Restoration, SECTION_CHARACTERISTICS_OFFSET,
+    SECTION_COUNT_OFFSET, THUNK_SIZE, clear_directory, find_delay_directory, find_load_config,
+    find_original_tls, fresh_image, iat_span, imports_from_original, map_disk_image, read_c_string,
+    return_moved_leaves, set_directory, set_tls_directory,
 };
 use super::{
     ImportedFunction, ModuleImports, Origin, PackerFindings, PackerImports, PackerReport, Unpacked,
@@ -77,16 +80,7 @@ const CALL: u8 = 0xE8;
 const JUMP: u8 = 0xE9;
 const CALL_SIZE: usize = 5;
 const POSITION_FILTER_TAIL: usize = 6; // the 1.x filter stops this far from the end
-const IMPORT_DESCRIPTOR_SIZE: usize = 20;
-const IMPORT_NAME_OFFSET: usize = 12;
-const IMPORT_IAT_OFFSET: usize = 16;
-const MAX_IMPORT_DESCRIPTORS: usize = 4_096;
-const MAX_THUNKS: usize = 65_536;
-const THUNK_SIZE: usize = 4; // aspack only packs PE32 files
-const ORDINAL_FLAG: u32 = 0x8000_0000;
-const HINT_SIZE: usize = 2; // a name entry starts with its export hint
 const MAX_NAME: usize = 4_096;
-const MAX_RELOCATION_BLOCK: usize = 0x10000;
 const WIPED_RELOCATION: u16 = 0xFFFF; // the stub overwrites each entry after applying it
 const LOAD_CONFIG_DIRECTORY_SIZE: usize = 0x40; // msvc PE32 value, the loader reads the struct's own size
 const RESERVED_DIRECTORY: usize = 15;
@@ -348,7 +342,7 @@ fn restore(image: &PeImage<'_>, stub: &Stub, origin: &Origin<'_>) -> Option<Unpa
 
     let imports = packed
         .as_mut()
-        .and_then(|packed| imports_from_file(&mut restored, model, stub, packed))
+        .and_then(|packed| imports_from_original(&mut restored, model, stub.import_rva, packed))
         .or_else(|| restore_imports(&mut restored, model, stub, original_end, origin.base));
     match &imports {
         Some(PackerImports::Listed(_)) => report.restored.push("imports"),
@@ -460,6 +454,7 @@ impl<'a> PackedFile<'a> {
 
             let size = field(BLOCK_SIZE_OFFSET)?;
             let size = (!flagged || size != STORED_BLOCK).then_some(size as usize);
+            size.is_none_or(|size| size <= memory.len()).then_some(())?; // the file's sizes must fit the image
             packed.blocks.push(Block {
                 rva,
                 size,
@@ -522,7 +517,8 @@ impl<'a> PackedFile<'a> {
             }
             Codec::Aplib => {
                 let source = self.raw(block.rva, usize::MAX)?; // the stream ends at its own marker
-                let mut decoded = aplib::decompress(source, size)?;
+                let mut decoded =
+                    aplib::decompress(ByteTags::new(source), size, aplib::Variant::Original)?;
                 (decoded.len() == size).then_some(())?;
                 if block.filtered {
                     unfilter_positions(&mut decoded);
@@ -534,17 +530,7 @@ impl<'a> PackedFile<'a> {
     }
 
     fn original_image(&mut self, end: usize) -> Option<Vec<u8>> {
-        let mut image = vec![0u8; end];
-
-        for section in &self.sections {
-            let length = section.size.min(section.span);
-            let raw = self
-                .file
-                .get(section.offset..section.offset.checked_add(length)?)?;
-            if let Some(slot) = image.get_mut(section.rva..section.rva.saturating_add(raw.len())) {
-                slot.copy_from_slice(raw);
-            }
-        }
+        let mut image = map_disk_image(&self.file, end)?;
 
         for index in 0..self.blocks.len() {
             let Some(size) = self.blocks[index].size else {
@@ -560,12 +546,14 @@ impl<'a> PackedFile<'a> {
 
         Some(image)
     }
+}
 
-    fn read_u32(&mut self, rva: usize) -> Option<u32> {
+impl OriginalImage for PackedFile<'_> {
+    fn original_u32(&mut self, rva: usize) -> Option<u32> {
         Some(u32::from_le_bytes(self.original(rva, 4)?.try_into().ok()?))
     }
 
-    fn read_string(&mut self, rva: usize) -> Option<String> {
+    fn original_string(&mut self, rva: usize) -> Option<String> {
         let text = self.original(rva, MAX_NAME)?;
         let mut terminated = text.to_vec();
         terminated.push(0);
@@ -602,69 +590,6 @@ fn unfilter_positions(bytes: &mut [u8]) {
     }
 }
 
-fn imports_from_file(
-    restored: &mut [u8],
-    model: &PeModel,
-    stub: &Stub,
-    packed: &mut PackedFile<'_>,
-) -> Option<PackerImports> {
-    let mut modules = Vec::new();
-    for index in 0..MAX_IMPORT_DESCRIPTORS {
-        let descriptor = stub
-            .import_rva
-            .checked_add(index.checked_mul(IMPORT_DESCRIPTOR_SIZE)?)?;
-        let lookup = packed.read_u32(descriptor)? as usize;
-        let name = packed.read_u32(descriptor.checked_add(IMPORT_NAME_OFFSET)?)? as usize;
-        let iat = packed.read_u32(descriptor.checked_add(IMPORT_IAT_OFFSET)?)? as usize;
-
-        if name == 0 && iat == 0 {
-            break;
-        }
-
-        let module = packed.read_string(name)?;
-        let source = match lookup {
-            0 => iat, // borland linkers leave the names in the iat itself
-            _ => lookup,
-        };
-
-        let mut functions = Vec::new();
-        for slot in 0..MAX_THUNKS {
-            let entry = packed.read_u32(source.checked_add(slot.checked_mul(THUNK_SIZE)?)?)?;
-
-            if entry == 0 {
-                break;
-            }
-
-            functions.push(match entry & ORDINAL_FLAG {
-                0 => ImportedFunction::Name(
-                    packed.read_string((entry as usize).checked_add(HINT_SIZE)?)?,
-                ),
-                _ => ImportedFunction::Ordinal(entry as u16),
-            });
-        }
-
-        let filled = |slot: usize| {
-            read_u32(restored, iat.saturating_add(slot * THUNK_SIZE)).is_ok_and(|value| value != 0)
-        };
-        let matches_memory = (0..functions.len()).all(filled) && !filled(functions.len());
-        matches_memory.then_some(())?;
-        modules.push(ModuleImports {
-            module,
-            first_thunk: u32::try_from(iat).ok()?,
-            functions,
-        });
-    }
-
-    let tables = modules
-        .iter()
-        .map(|module| (module.first_thunk as usize, module.functions.len()));
-    let (first, span) = iat_span(tables, THUNK_SIZE)?;
-    clear_directory(restored, model, IMPORT_DIRECTORY);
-    set_directory(restored, model, IAT_DIRECTORY, first, span)?;
-
-    Some(PackerImports::Listed(modules))
-}
-
 fn relocations_from_file(
     restored: &mut [u8],
     model: &PeModel,
@@ -679,8 +604,8 @@ fn relocations_from_file(
     let mut table = Vec::new();
     let mut at = start;
     while let (Some(page), Some(size)) = (
-        packed.read_u32(at),
-        packed.read_u32(at.saturating_add(RELOCATION_BLOCK_SIZE_OFFSET)),
+        packed.original_u32(at),
+        packed.original_u32(at.saturating_add(RELOCATION_BLOCK_SIZE_OFFSET)),
     ) {
         let size = size as usize;
 
