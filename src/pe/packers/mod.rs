@@ -5,10 +5,12 @@ mod pecompact;
 mod tables;
 mod upx;
 
+use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::pe::PeImage;
 use tables::Restoration;
@@ -140,6 +142,7 @@ pub(super) enum ImportedFunction {
     Ordinal(u16),
     OrdinalFromAddress,
     NameFromAddress,
+    NameFromAddressAmong(Arc<HashSet<String>>), // names left in memory pick between aliases and tell names from ordinals
 }
 
 pub(super) fn unpack(image: &PeImage<'_>, origin: &Origin<'_>) -> Option<Unpacked> {

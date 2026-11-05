@@ -355,6 +355,28 @@ fn packed_entry(
                 })
                 .or_else(|| exported_entry(image, observed_base, exports, value))
         }
+        ImportedFunction::NameFromAddressAmong(listed) => {
+            let value = slot_value(image, slot)?;
+            let listed_name = exports
+                .names_in(value, module)
+                .find(|name| listed.contains(*name))
+                .or_else(|| exports.names_at(value).find(|name| listed.contains(*name))); // api set names only match their host
+            match listed_name {
+                Some(name) => Some(ImportEntry {
+                    name: Some(name.to_owned()),
+                    ordinal: 0,
+                    aliased: false,
+                }),
+                None => exports
+                    .ordinal_in(value, module)
+                    .map(|ordinal| ImportEntry {
+                        name: None,
+                        ordinal,
+                        aliased: false,
+                    }) // imported by ordinal, so no name was ever stored
+                    .or_else(|| exported_entry(image, observed_base, exports, value)),
+            }
+        }
         ImportedFunction::OrdinalFromAddress => {
             let value = slot_value(image, slot)?;
             exports

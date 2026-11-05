@@ -144,11 +144,22 @@ impl ExportIndex {
     }
 
     pub(crate) fn name_in(&self, address: usize, module: &str) -> Option<String> {
-        self.addresses
-            .get(&address)?
-            .iter()
-            .filter(|symbol| symbol.module.eq_ignore_ascii_case(module))
-            .find_map(|symbol| symbol.name.clone())
+        self.names_in(address, module).next().map(str::to_owned)
+    }
+
+    pub(crate) fn names_in(&self, address: usize, module: &str) -> impl Iterator<Item = &str> {
+        self.symbols_at(address)
+            .filter(move |symbol| symbol.module.eq_ignore_ascii_case(module))
+            .filter_map(|symbol| symbol.name.as_deref())
+    }
+
+    pub(crate) fn names_at(&self, address: usize) -> impl Iterator<Item = &str> {
+        self.symbols_at(address)
+            .filter_map(|symbol| symbol.name.as_deref())
+    }
+
+    fn symbols_at(&self, address: usize) -> impl Iterator<Item = &ResolvedExport> {
+        self.addresses.get(&address).into_iter().flatten()
     }
 
     pub(crate) fn modules_at(&self, address: usize) -> impl Iterator<Item = (&str, bool)> {

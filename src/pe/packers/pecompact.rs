@@ -1,16 +1,22 @@
+use std::collections::HashSet;
 use std::ops::Range;
+use std::sync::Arc;
 
 use super::codecs::bitstream::{ByteTags, WordTags};
 use super::codecs::{aplib, brieflz, ffce, jcalg1, lzma};
 use super::tables::{
-    CODE_SECTION, DATA_SECTION, MAX_RELOCATION_BLOCK, RELOCATION_BLOCK_HEADER,
-    RELOCATION_BLOCK_SIZE_OFFSET, RELOCATION_SECTION, RESOURCE_SECTION, Restoration, SectionPiece,
-    THUNK_SIZE, apply_listed_imports, clear_directory, export_functions, fresh_image, iat_filled,
-    lay_out_resources, linker_export_layout, linker_export_start, listed_imports, map_disk_image,
-    read_c_string, relocate, relocation_blocks, replace_first_section, set_directory,
-    walk_resources,
+    CODE_SECTION, DATA_SECTION, HINT_SIZE, IMPORT_DESCRIPTOR_SIZE, IMPORT_IAT_OFFSET,
+    IMPORT_NAME_OFFSET, MAX_IMPORT_DESCRIPTORS, MAX_RELOCATION_BLOCK, MAX_THUNKS,
+    RELOCATION_BLOCK_HEADER, RELOCATION_BLOCK_SIZE_OFFSET, RELOCATION_SECTION, RESOURCE_SECTION,
+    Restoration, SectionPiece, THUNK_SIZE, apply_listed_imports, clear_directory, export_functions,
+    fresh_image, iat_filled, lay_out_resources, linker_export_layout, linker_export_start,
+    listed_imports, map_disk_image, read_c_string, relocate, relocation_blocks,
+    replace_first_section, set_directory, walk_resources,
 };
-use super::{Origin, PackerFindings, PackerImports, PackerReport, Unpacked, find_pattern};
+use super::{
+    ImportedFunction, ModuleImports, Origin, PackerFindings, PackerImports, PackerReport, Unpacked,
+    find_pattern,
+};
 use crate::pe::image::{read_u16, read_u32, write_u32};
 use crate::pe::parse::{parse_disk_image, parse_memory_image};
 use crate::pe::{
@@ -81,6 +87,7 @@ const LEGACY_LZMA_STREAM: usize = 15;
 const RELOCATION_KIND_MASK: u16 = 0xF000;
 const RELOCATION_OFFSET_MASK: u16 = 0x0FFF;
 const TLS_POINTER_FIELDS: usize = 4; // raw data start and end, index and callback list
+const NAME_WINDOW: usize = 0x10000; // the linker puts hint and name strings right around the dll names
 
 #[derive(Clone, Copy)]
 enum Codec {
@@ -204,11 +211,15 @@ fn restore(
     .ok()?;
     report.restored.push("entry point");
 
-    let imports = original.as_deref().and_then(|original| {
-        let modules = listed_imports(packed.host_field(HOST_IMPORTS)?, &mut &original[..])?;
-        (from_packed || iat_filled(&restored, &modules)).then_some(())?;
-        apply_listed_imports(&mut restored, model, modules)
-    });
+    let import_list = packed.host_field(HOST_IMPORTS);
+    let modules = match original.as_deref() {
+        Some(original) => import_list.and_then(|start| {
+            let modules = listed_imports(start, &mut &original[..])?;
+            (from_packed || iat_filled(&restored, &modules)).then_some(modules)
+        }),
+        None => import_list.and_then(|start| imports_left_in_memory(&restored, start)),
+    };
+    let imports = modules.and_then(|modules| apply_listed_imports(&mut restored, model, modules));
     match imports {
         Some(_) => report.restored.push("imports"),
         None => report.unrestored.push("imports"),
@@ -647,6 +658,66 @@ fn find_handler(bytes: &[u8], model: &PeModel) -> Option<usize> {
             let body = find_pattern(bytes.get(start..end)?, HANDLER_BODY)?;
             (start + body).checked_sub(HANDLER_PREFIX)
         })
+}
+
+fn imports_left_in_memory(memory: &[u8], start: usize) -> Option<Vec<ModuleImports>> {
+    let mut found = Vec::new();
+    for index in 0..MAX_IMPORT_DESCRIPTORS {
+        let descriptor = start.checked_add(index.checked_mul(IMPORT_DESCRIPTOR_SIZE)?)?;
+        let field =
+            |offset: usize| Some(read_u32(memory, descriptor.checked_add(offset)?).ok()? as usize);
+        let (name, iat) = (field(IMPORT_NAME_OFFSET)?, field(IMPORT_IAT_OFFSET)?);
+        if name == 0 && iat == 0 {
+            break;
+        }
+
+        let module = read_c_string(memory, name)?.0;
+        let slots = (0..MAX_THUNKS)
+            .take_while(|slot| {
+                read_u32(memory, iat.saturating_add(slot * THUNK_SIZE))
+                    .is_ok_and(|value| value != 0)
+            })
+            .count(); // the loader filled every slot with its address
+        found.push((name, module, iat, slots));
+    }
+
+    let listed = Arc::new(leftover_names(
+        memory,
+        found.iter().map(|(name, ..)| *name),
+    )?);
+    let modules = found
+        .into_iter()
+        .map(|(_, module, iat, slots)| {
+            Some(ModuleImports {
+                module,
+                first_thunk: u32::try_from(iat).ok()?,
+                functions: vec![ImportedFunction::NameFromAddressAmong(Arc::clone(&listed)); slots],
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    (!modules.is_empty()).then_some(modules)
+}
+
+fn leftover_names(
+    memory: &[u8],
+    module_names: impl Iterator<Item = usize>,
+) -> Option<HashSet<String>> {
+    let (low, high) = module_names.fold((usize::MAX, 0), |(low, high), at| {
+        (low.min(at), high.max(at))
+    });
+    let window = memory
+        .get(low.saturating_sub(NAME_WINDOW)..high.saturating_add(NAME_WINDOW).min(memory.len()))?;
+    let identifier =
+        |byte: &u8| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'@' | b'?' | b'$');
+
+    let names = window
+        .split(|byte| !identifier(byte))
+        .filter(|run| run.len() > HINT_SIZE)
+        .flat_map(|run| (0..=HINT_SIZE).map(move |skip| &run[skip..])) // a hint can read as letters too
+        .filter_map(|run| std::str::from_utf8(run).ok())
+        .map(str::to_owned)
+        .collect::<HashSet<_>>();
+    (!names.is_empty()).then_some(names)
 }
 
 fn stored_bytes(stream: &[u8], size: usize) -> Option<&[u8]> {
