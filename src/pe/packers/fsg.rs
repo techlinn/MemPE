@@ -6,11 +6,11 @@ use super::tables::{
     DEBUG_ADDRESS_OFFSET, DEBUG_ENTRY_SIZE, DEBUG_SIZE_OFFSET, LinkerBounds,
     MAX_IMPORT_DESCRIPTORS, MAX_THUNKS, RESOURCE_DATA_SIZE_OFFSET, ResourceLayout, Restoration,
     SectionHints, SectionPiece, THUNK_SIZE, apply_listed_imports, clear_directory, debug_timestamp,
-    fresh_image, iat_span, lay_out_resources, linker_bounds, lowest_moved_leaf, map_disk_image,
-    name_sections, pogo_parts, pogo_sections, pogo_tls_directory, read_c_string,
-    recover_directories, relocations_intact, repair_icon_groups, replace_first_section,
-    resource_layout, restore_moved_resources, restore_tls, security_cookie, split_merged_section,
-    walk_resources,
+    first_section_range, fresh_image, iat_span, lay_out_resources, linker_bounds,
+    lowest_moved_leaf, map_disk_image, name_sections, pogo_parts, pogo_sections,
+    pogo_tls_directory, read_c_string, recover_directories, relocations_intact, repair_icon_groups,
+    replace_first_section, resource_layout, restore_moved_resources, restore_tls, security_cookie,
+    split_merged_section, walk_resources,
 };
 use super::{
     ImportedFunction, ModuleImports, Origin, PackerFindings, PackerImports, PackerReport, Unpacked,
@@ -150,8 +150,9 @@ pub(super) fn unpack(image: &PeImage<'_>, origin: &Origin<'_>) -> Option<Unpacke
     (model.kind() == PeKind::Pe32).then_some(())?;
     let first = model.sections().first()?;
     (first.raw_size == 0).then_some(())?;
-    let start = first.virtual_address().as_usize();
-    let end = start.checked_add(first.span() as usize)?;
+
+    let Range { start, end } = first_section_range(model)?;
+
     let stubs = find_stubs(image.bytes(), origin.base, &(start..end));
     let first_version = stubs.first()?.version;
 
@@ -199,6 +200,7 @@ fn restore(
             .flat_map(|listed| &listed.modules)
             .map(|module| module.module.as_str()),
     );
+
     let finished = listed
         .as_ref()
         .is_some_and(|listed| stub_finished(image.bytes(), original, &listed.modules));
@@ -208,6 +210,7 @@ fn restore(
             .copy_from_slice(original.get(image_range.clone())?);
         report.restored.push("code and data from the packed data");
     }
+
     let iat = listed.as_ref().and_then(|listed| {
         iat_span(
             listed
@@ -257,6 +260,7 @@ fn restore(
         Some(_) => report.restored.push("imports"),
         None => report.unrestored.push("imports"),
     }
+
     if let Some((at, beneath)) = &decoded.beneath_imports {
         restored
             .get_mut(*at..at.checked_add(beneath.len())?)?
@@ -273,6 +277,7 @@ fn restore(
         None => resources_at_image_end(&mut restored, model, image_end, layout, original),
     };
     let resources = moved.or(kept_in_packer);
+
     let pogo = pogo_parts(&restored, model, end);
     let linker_pieces = pogo
         .as_deref()
@@ -280,6 +285,7 @@ fn restore(
     let from_linker = linker_pieces.is_some();
     let bounds = linker_bounds(&restored, model, stub.entry);
     let pieces = linker_pieces.or_else(|| stream_sections(stub, &evidence, bounds, resources, end));
+
     let ranges: Vec<Range<usize>> = match &pieces {
         Some(pieces) => pieces.iter().map(|piece| piece.start..piece.end).collect(),
         None => resources.into_iter().map(|leaf| leaf..image_end).collect(), // 2.0 packs the leaves from where .rsrc began
@@ -289,9 +295,11 @@ fn restore(
         None => restore_moved_resources(&mut restored, model, &ranges, end, layout, Some(original)),
     };
     report.record("resources", resources_restored);
+
     if has_blank_leaf(&restored, model) {
         report.lost.push("resource data the packer blanked"); // 2.0 zeroes delphi's DVCLAL and PACKAGEINFO
     }
+
     let icons = repair_icon_groups(&mut restored, model);
     report.record("icon groups the packer overwrote", icons); // 1.x writes the next leaf into a group's tail
 
@@ -303,7 +311,9 @@ fn restore(
         pogo.as_deref().and_then(pogo_tls_directory),
     );
     report.record("original TLS directory", tls);
+
     recover_directories(&mut restored, model, origin.base, end, &mut report);
+
     if let Some(timestamp) = debug_timestamp(&restored, model) {
         let at = model.nt_offset.checked_add(TIMESTAMP_OFFSET)?;
         if read_u32(&restored, at).ok() != Some(timestamp) {
@@ -311,6 +321,7 @@ fn restore(
             report.restored.push("build timestamp");
         }
     }
+
     let relocations = check_relocations(&mut restored, model, end);
     report.record("relocations", relocations);
 
@@ -373,12 +384,14 @@ fn resources_at_image_end(
         || read_u16(restored, model.dll_characteristics_offset)
             .is_ok_and(|flags| flags & DYNAMIC_BASE != 0);
     (!relocatable).then_some(())?; // its .reloc would follow .rsrc
+
     let root = model
         .directory(restored, RESOURCE_DIRECTORY)
         .ok()??
         .rva()
         .as_usize();
     (root >= image_end).then_some(())?;
+
     let first = model.sections().first()?.virtual_address().as_usize();
     let page = model.section_alignment as usize;
     let mut start = image_end;
@@ -403,6 +416,7 @@ fn resources_at_image_end(
             return Some(start);
         }
     }
+
     None
 }
 
@@ -415,6 +429,7 @@ fn has_blank_leaf(restored: &[u8], model: &PeModel) -> bool {
     else {
         return false;
     };
+
     walk_resources(restored, root).is_some_and(|tree| {
         tree.data_entries.iter().any(|entry| {
             let leaf = |offset: usize| {
@@ -422,6 +437,7 @@ fn has_blank_leaf(restored: &[u8], model: &PeModel) -> bool {
                     .ok()
                     .map(|value| value as usize)
             };
+
             let data = leaf(0)
                 .zip(leaf(RESOURCE_DATA_SIZE_OFFSET))
                 .and_then(|(rva, size)| restored.get(rva..rva.checked_add(size)?));
@@ -440,6 +456,7 @@ fn stream_sections(
     let ImportData::Blob { at, .. } = stub.imports else {
         return None;
     };
+
     let starts: Vec<usize> = stub
         .streams
         .iter()
@@ -452,6 +469,7 @@ fn stream_sections(
                 .flatten(),
         )
         .collect(); // one stream covers sections whose raw data ran on without a gap
+
     let constants = evidence.constants_start.filter(|iat| {
         let piece_start = starts.iter().copied().filter(|start| start <= iat).max();
         let piece_end = starts
@@ -462,6 +480,7 @@ fn stream_sections(
             .unwrap_or(end);
         piece_start.is_some_and(|piece_start| evidence.untouched(piece_start..piece_end))
     });
+
     let hints = SectionHints {
         code: Some(stub.entry),
         code_end: bounds.map(|bounds| bounds.code_end),
@@ -469,6 +488,7 @@ fn stream_sections(
         relocations: None,
         resources,
     };
+
     Some(name_sections(starts, end, &hints))
 }
 
@@ -488,10 +508,12 @@ fn split_merged(
         Some(cookie) => constants_page.map(|constants| constants.min(cookie / page * page)), // msvc puts it on the first page of .data
         None => constants_page,
     };
+
     let split = evidence
         .constants_start
         .zip(data)
         .filter(|(constants, data)| constants < data && evidence.untouched(*constants..*data));
+
     let hints = SectionHints {
         code: Some(stub.entry),
         code_end: None,
@@ -499,6 +521,7 @@ fn split_merged(
         relocations: None,
         resources,
     };
+
     split_merged_section(
         restored,
         model,
@@ -568,6 +591,7 @@ fn find_stubs(bytes: &[u8], base: usize, image: &Range<usize>) -> Vec<Stub> {
         );
         stubs.extend(word_stubs(&scan, &loads));
     }
+
     stubs.truncate(MAX_CANDIDATES);
     stubs
 }
@@ -575,6 +599,7 @@ fn find_stubs(bytes: &[u8], base: usize, image: &Range<usize>) -> Vec<Stub> {
 fn register_load(bytes: &[u8], at: usize) -> Option<Load> {
     let code = bytes.get(at..)?;
     let immediate = |offset: usize| read_u32(code, offset).ok().map(|value| value as usize);
+
     let (register, value) = match *code.first()? {
         opcode @ 0xB8..=0xBF => (opcode - 0xB8, immediate(1)?),
         0x68 => match *code.get(5)? {
@@ -591,6 +616,7 @@ fn register_load(bytes: &[u8], at: usize) -> Option<Load> {
         }
         _ => return None,
     };
+
     Some(Load {
         at,
         register,
@@ -606,12 +632,15 @@ fn stub_2_0(scan: &Scan<'_>, at: usize) -> Option<Stub> {
         source: Some(scan.address(frame.checked_add(FRAME_SOURCE)?)?),
         imports: false,
     };
+
     let list = scan.address(frame.checked_add(FRAME_IMPORTS)?)?;
     let entry = scan.address(slot.checked_add(TABLE_ENTRY)?)?;
+
     let version = match stock_at(scan.bytes, at, STUB_2_0) {
         true => "2.0",
         false => MODIFIED_2_0,
     };
+
     checked(
         Stub {
             version,
@@ -626,6 +655,7 @@ fn stub_2_0(scan: &Scan<'_>, at: usize) -> Option<Stub> {
 fn stub_1_33(scan: &Scan<'_>, load: &Load) -> Option<Stub> {
     let support = load.value.checked_sub(scan.base)?;
     (scan.address(support.checked_add(SUPPORT_FIRST)?)? == scan.image.start).then_some(())?;
+
     let mut streams = vec![Stream {
         destination: scan.image.start,
         source: Some(scan.address(support.checked_add(SUPPORT_SOURCE)?)?),
@@ -647,6 +677,7 @@ fn stub_1_33(scan: &Scan<'_>, load: &Load) -> Option<Stub> {
             }
             next => (next as usize).checked_sub(1)?.checked_sub(scan.base)?, // stored plus one so 0 and 1 stay free
         };
+
         streams.push(Stream {
             destination,
             source: None,
@@ -658,6 +689,7 @@ fn stub_1_33(scan: &Scan<'_>, load: &Load) -> Option<Stub> {
         true => "1.33",
         false => MODIFIED_1_33,
     };
+
     checked(
         Stub {
             version,
@@ -691,12 +723,14 @@ fn word_stubs(scan: &Scan<'_>, loads: &[Load]) -> Vec<Stub> {
             }
         }
     }
+
     stubs
 }
 
 fn near<'a>(loads: &'a [Load], register: u8, anchor: &Load) -> impl Iterator<Item = &'a Load> {
     let start = loads.partition_point(|load| load.at.saturating_add(LOAD_WINDOW) < anchor.at);
     let stop = loads.partition_point(|load| load.at <= anchor.at.saturating_add(LOAD_WINDOW));
+
     loads
         .get(start..stop)
         .unwrap_or_default()
@@ -729,6 +763,7 @@ fn word_stub(scan: &Scan<'_>, [support, first, source]: [&Load; 3]) -> Option<St
                     .checked_sub(scan.base)?
             }
         };
+
         streams.push(Stream {
             destination,
             source: None,
@@ -758,6 +793,7 @@ fn word_version(bytes: &[u8], start: usize) -> &'static str {
     if !stock_at(bytes, start, STUB_1_0) {
         return MODIFIED_1_X;
     }
+
     let tail = bytes
         .get(start.saturating_add(STUB_1_0_LENGTH)..)
         .unwrap_or_default();
@@ -784,6 +820,7 @@ fn checked(stub: Stub, image: &Range<usize>) -> Option<Stub> {
             ImportData::Blob { at, .. } => inside(at),
             ImportData::Pairs { list } => inside(list),
         };
+
     fits.then_some(stub)
 }
 
@@ -795,6 +832,7 @@ fn distant_entry(bytes: &[u8], outside: &[Range<usize>; 2], image: &Range<usize>
         .collect(); // a modified stub may load its registers far from the rest of its code
     targets.sort_unstable();
     targets.dedup();
+
     match targets.as_slice() {
         [target] => Some(*target),
         _ => None,
@@ -820,6 +858,7 @@ fn mapped_file(file: &[u8], image: &PeImage<'_>) -> Option<Vec<u8>> {
     let disk = parse_disk_image(file).ok()?;
     let model = disk.model();
     let memory = image.model();
+
     let same_image = model.image_size == memory.image_size
         && read_u32(file, model.entry_point_offset).ok()
             == read_u32(image.bytes(), memory.entry_point_offset).ok();
@@ -838,6 +877,7 @@ fn original_image(stub: &Stub, packed: &[u8], target: Range<usize>) -> Option<De
         let mut tags = ByteTags::new(packed.get(source..)?);
         let limit = target.end.checked_sub(stream.destination)?;
         let decoded = aplib::decompress(&mut tags, limit, aplib::Variant::Classic)?;
+
         let written =
             image.get_mut(stream.destination..stream.destination.checked_add(decoded.len())?)?;
         if stream.imports {
@@ -968,6 +1008,7 @@ fn paired_imports(
                     ImportedFunction::Name(name)
                 }
             });
+
             slot = slot.checked_add(THUNK_SIZE)?;
             budget = budget.checked_sub(1)?;
         };
@@ -977,6 +1018,7 @@ fn paired_imports(
             first_thunk: u32::try_from(iat).ok()?,
             functions,
         });
+
         if last {
             return Some((modules, end_markers, names_end));
         }
@@ -993,6 +1035,7 @@ fn read_only_end(restored: &[u8], model: &PeModel) -> usize {
             .as_usize()
             .checked_add(directory.size() as usize)
     };
+
     let debug_data_end = model
         .directory(restored, DEBUG_DIRECTORY)
         .ok()
@@ -1009,6 +1052,7 @@ fn read_only_end(restored: &[u8], model: &PeModel) -> usize {
                 .max()
                 .unwrap_or(0)
         });
+
     [
         LOAD_CONFIG_DIRECTORY,
         DEBUG_DIRECTORY,
@@ -1038,6 +1082,7 @@ fn check_relocations(restored: &mut [u8], model: &PeModel, end: usize) -> Restor
         .directory(restored, BASERELOC_DIRECTORY)
         .ok()
         .flatten();
+
     let intact = directory.is_some_and(|directory| {
         let start = directory.rva().as_usize();
         start < end && relocations_intact(restored, start, directory.size() as usize)
@@ -1047,6 +1092,7 @@ fn check_relocations(restored: &mut [u8], model: &PeModel, end: usize) -> Restor
     }
 
     clear_directory(restored, model, BASERELOC_DIRECTORY);
+
     let dynamic = read_u16(restored, model.dll_characteristics_offset)
         .is_ok_and(|flags| flags & DYNAMIC_BASE != 0);
     match dynamic {

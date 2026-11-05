@@ -237,6 +237,7 @@ fn restore(
             stub.stub_start,
         )
     };
+
     let file = origin.read_file();
     let originals = original_images(file.as_deref(), restored.len(), kind);
     let file_base = originals.as_ref().map(|(file_base, _)| *file_base);
@@ -332,6 +333,7 @@ fn restore(
         })
         .collect::<Option<Vec<_>>>()?;
     let imports = PackerImports::Listed(modules);
+
     let fresh = original.zip(file_base).and_then(|(original, file_base)| {
         fresh_image(
             image.bytes(),

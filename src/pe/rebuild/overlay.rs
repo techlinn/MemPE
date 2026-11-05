@@ -15,6 +15,7 @@ pub(crate) fn overlay_offset(disk_headers: &[u8]) -> Option<u64> {
     let image = parse_disk_image(disk_headers).ok()?;
     let model = image.model();
     let alignment = u64::from(model.file_alignment.max(1));
+
     model
         .sections()
         .iter()

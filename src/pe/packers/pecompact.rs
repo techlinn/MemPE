@@ -8,11 +8,11 @@ use super::tables::{
     HINT_SIZE, IMPORT_DESCRIPTOR_SIZE, IMPORT_IAT_OFFSET, IMPORT_NAME_OFFSET,
     MAX_IMPORT_DESCRIPTORS, MAX_RELOCATION_BLOCK, MAX_THUNKS, RELOCATION_BLOCK_HEADER,
     RELOCATION_BLOCK_SIZE_OFFSET, Restoration, SectionHints, SectionPiece, THUNK_SIZE,
-    apply_listed_imports, clear_directory, export_functions, fresh_image, iat_filled,
-    linker_export_layout, linker_export_start, listed_imports, lowest_moved_leaf, map_disk_image,
-    name_sections, place, pogo_parts, pogo_sections, pogo_tls_directory, read_c_string, relocate,
-    relocated_fields, relocation_blocks, replace_first_section, resource_layout,
-    restore_moved_resources, restore_tls, set_directory,
+    apply_listed_imports, clear_directory, export_functions, first_section_range, fresh_image,
+    iat_filled, linker_export_layout, linker_export_start, listed_imports, lowest_moved_leaf,
+    map_disk_image, name_sections, place, pogo_parts, pogo_sections, pogo_tls_directory,
+    read_c_string, relocate, relocated_fields, relocation_blocks, replace_first_section,
+    resource_layout, restore_moved_resources, restore_tls, set_directory,
 };
 use super::{
     ImportedFunction, ModuleImports, Origin, PackerFindings, PackerImports, PackerReport, Unpacked,
@@ -173,12 +173,14 @@ fn restore(
 
     let entry = packed.host_field(HOST_ENTRY)?;
     (entry < end).then_some(())?;
+
     let stub = packed.host_field(HOST_STUB)?;
     let stub_code = stub.checked_add(STUB_REBASED)?..stub.checked_add(STUB_CODE)?;
     let unpacked = match packed.in_memory {
         true => original.is_none(), // the packed data only decodes until the loader unpacks over it
         false => restored.get(stub_code.clone()) != packed.mapped.get(stub_code), // the loader writes over the stub last
     };
+
     let image_start = model.sections().first()?.virtual_address().as_usize();
     let from_packed = match (unpacked, &original) {
         (true, _) => false,
@@ -204,6 +206,7 @@ fn restore(
             false => "code and data from the packed file",
         }); // dumped before the stub ran
     }
+
     write_u32(
         &mut restored,
         model.entry_point_offset,
@@ -220,6 +223,7 @@ fn restore(
         }),
         None => import_list.and_then(|start| imports_left_in_memory(&restored, start)),
     };
+
     let imports = modules.and_then(|modules| apply_listed_imports(&mut restored, model, modules));
     match imports {
         Some(_) => report.restored.push("imports"),
@@ -233,6 +237,7 @@ fn restore(
         original.as_deref().unwrap_or(image.bytes()), // the loader reads its delta list in place and leaves it
     );
     report.record("relocations", relocations);
+
     if from_packed {
         let delta = origin.base.wrapping_sub(packed.base);
         let mut moved = restored.clone();
@@ -246,12 +251,12 @@ fn restore(
 
     let pogo = pogo_parts(&restored, model, end);
     let merged = packed.original_sections(&restored, model, entry);
-    let linker_pieces = merged
-        .as_ref()
-        .and(pogo.as_deref())
-        .and_then(|parts| pogo_sections(parts, model, packed_section_end(model)?, Some(entry))); // only where the packer merged sections
+    let linker_pieces = merged.as_ref().and(pogo.as_deref()).and_then(|parts| {
+        pogo_sections(parts, model, first_section_range(model)?.end, Some(entry))
+    }); // only where the packer merged sections
     let from_linker = linker_pieces.is_some();
     let sections = linker_pieces.or(merged);
+
     let ranges = match &sections {
         Some(sections) => sections
             .iter()
@@ -259,6 +264,7 @@ fn restore(
             .collect(),
         None => packed.stored.clone(), // without merging the packer keeps the section table
     };
+
     let layout = resource_layout(&restored, model, std::iter::empty());
     let resources = restore_moved_resources(&mut restored, model, &ranges, end, layout, None);
     report.record("resources", resources);
@@ -276,6 +282,7 @@ fn restore(
         ); // the packer wipes the original and its fixups
         report.record("original TLS directory", tls);
     }
+
     let _ = cover_tls_directory(&mut restored, model);
 
     match (sections, from_linker) {
@@ -563,11 +570,9 @@ impl PackedFile {
             .iter()
             .any(|block| block.flags & MERGED != 0)
             .then_some(())?;
-        let packed_section = model.sections().first()?;
-        let packed_end = packed_section
-            .virtual_address()
-            .as_usize()
-            .checked_add(packed_section.span() as usize)?;
+
+        let packed_end = first_section_range(model)?.end;
+
         let first = self
             .blocks
             .iter()
@@ -858,6 +863,7 @@ fn cover_tls_directory(restored: &mut [u8], model: &PeModel) -> Option<()> {
         .ok()??
         .rva()
         .as_usize();
+
     let table = model.directory(restored, BASERELOC_DIRECTORY).ok()??;
     let covered = relocated_fields(restored, model)?;
     let missing = (0..TLS_POINTER_FIELDS)
@@ -875,6 +881,7 @@ fn cover_tls_directory(restored: &mut [u8], model: &PeModel) -> Option<()> {
     let blocks = relocation_blocks(&missing)?;
     let start = table.rva().as_usize();
     let end = start.checked_add(table.size() as usize)?;
+
     place(restored, end, &blocks)?;
     set_directory(
         restored,
@@ -965,14 +972,6 @@ fn restore_exports(restored: &mut [u8], model: &PeModel, end: usize) -> Restorat
         Some(()) => Restoration::Restored,
         None => Restoration::Failed,
     }
-}
-
-fn packed_section_end(model: &PeModel) -> Option<usize> {
-    let first = model.sections().first()?;
-    first
-        .virtual_address()
-        .as_usize()
-        .checked_add(first.span() as usize)
 }
 
 fn directory_moved(restored: &[u8], model: &PeModel, index: usize, end: usize) -> bool {
