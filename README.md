@@ -84,30 +84,30 @@ mempe snapshots the process, finds every module plus any PE hiding in non-image 
 
 ## Supported packers
 
-| Packer | Status | Notes |
+| Packer | Status | Versions |
 |---|---|---|
-| UPX | Supported | 3.91 to 5.3.0, x86 and x64, EXEs and DLLs, tampered and modified copies too |
-| ASPack | Supported | 1.07b and 2.11 to 2.43, x86 EXEs and DLLs, with imports and relocations decompressed straight from the packed file |
-| MPRESS | Supported | 1.05 to 2.19, x86 and x64, EXEs and DLLs, merged sections split back into code and data |
-| PECompact | Supported | 2.3 to 3.11, x86 EXEs and DLLs, FFCE, LZMA, aPLib, JCALG1 and BriefLZ codecs, tampered copies too, and from memory alone when the packed file is gone |
-| VMProtect | Planned | Protector with code virtualization |
-| Themida / WinLicense | Planned | Protector with code virtualization |
-| Code Virtualizer | Planned | Virtualizer from the makers of Themida |
-| Enigma Protector | Planned | Protector |
-| Obsidium | Planned | Protector |
-| ASProtect | Planned | Protector |
-| Armadillo | Planned | Protector, including its debug-blocker child process |
-| PELock | Planned | Protector |
-| Safengine Shielden | Planned | Protector with code virtualization |
-| EXECryptor | Planned | Protector with code morphing |
-| Petite | Planned | Compressor |
-| FSG | Planned | Compressor |
-| MEW | Planned | Compressor |
-| nPack / NsPack | Planned | Compressors |
-| kkrunchy | Planned | Compressor from the demoscene |
-| WinUpack | Planned | Compressor |
-| MoleBox | Planned | Virtual file system packer |
-| Anything else | Generic dump | Still dumped and rebuilt with imports recovered, just without packer-specific cleanup |
+| UPX | Supported | Every release from 3.91 to 5.3.0 |
+| ASPack | Supported | 1.07b, 2.11, 2.12, 2.2, 2.24, 2.28, 2.29, 2.43 |
+| MPRESS | Supported | 1.05, 1.27, 2.05, 2.19 |
+| PECompact | Supported | 2.3, 2.67 and 3.11, plus five other 2.x builds from 2005 and 2006 |
+| VMProtect | Planned | - |
+| Themida / WinLicense | Planned | - |
+| Code Virtualizer | Planned | - |
+| Enigma Protector | Planned | - |
+| Obsidium | Planned | - |
+| ASProtect | Planned | - |
+| Armadillo | Planned | - |
+| PELock | Planned | - |
+| Safengine Shielden | Planned | - |
+| EXECryptor | Planned | - |
+| Petite | Planned | - |
+| FSG | Planned | - |
+| MEW | Planned | - |
+| nPack / NsPack | Planned | - |
+| kkrunchy | Planned | - |
+| WinUpack | Planned | - |
+| MoleBox | Planned | - |
+| Anything else | Generic dump | Any |
 
 Anything missing? [Open an issue](https://github.com/techlinn/MemPE/issues) and I'll add it.
 
