@@ -1,8 +1,10 @@
 mod aspack;
 mod codecs;
 mod fsg;
+mod mew;
 mod mpress;
 mod pecompact;
+mod streamed;
 mod tables;
 mod upx;
 
@@ -20,12 +22,13 @@ type Unpacker = fn(&PeImage<'_>, &Origin<'_>) -> Option<Unpacked>;
 
 const MAX_PACKED_FILE: u64 = 512 * 1024 * 1024;
 
-const UNPACKERS: [Unpacker; 5] = [
+const UNPACKERS: [Unpacker; 6] = [
     upx::unpack,
     aspack::unpack,
     mpress::unpack,
     pecompact::unpack,
     fsg::unpack,
+    mew::unpack,
 ];
 
 #[derive(Clone, Copy)]
@@ -153,6 +156,13 @@ pub(super) fn unpack(image: &PeImage<'_>, origin: &Origin<'_>) -> Option<Unpacke
 
 pub(super) fn find_pattern(haystack: &[u8], pattern: &str) -> Option<usize> {
     find_patterns(haystack, pattern).next()
+}
+
+pub(super) fn pattern_at(bytes: &[u8], at: usize, pattern: &str) -> bool {
+    let length = pattern.split_whitespace().count();
+    bytes
+        .get(at..at.saturating_add(length))
+        .is_some_and(|code| find_pattern(code, pattern) == Some(0))
 }
 
 pub(super) fn find_patterns<'a>(

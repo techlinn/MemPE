@@ -54,7 +54,7 @@ DONE  Analysis-ready memory images
 - Imports put back together, even when the packer trashed the import table
 - PEs that were mapped by hand or stashed in random memory, the kind the module list never shows you
 - Packers undone when mempe knows them (see [the table](#supported-packers))
-- For UPX, ASPack, MPRESS, PECompact and FSG, a second copy that starts on its own, built with the data the program began with
+- For UPX, ASPack, MPRESS, PECompact, FSG and MEW, a second copy that starts on its own, built with the data the program began with
 - A report that tells you what it couldn't recover, so a broken dump never passes itself off as a good one
 
 ## How it works
@@ -91,6 +91,7 @@ mempe snapshots the process, finds every module plus any PE hiding in non-image 
 | MPRESS | Supported | 1.05, 1.27, 2.05, 2.19 |
 | PECompact | Supported | 2.3, 2.67 and 3.11, plus five other 2.x builds from 2005 and 2006 |
 | FSG | Supported | 1.0, 1.1, 1.2, 1.3, 1.31, 1.33, 2.0 and modified stubs |
+| MEW | Supported | 5, 10, 11 SE 1.2 and modified stubs |
 | VMProtect | Planned | - |
 | Themida / WinLicense | Planned | - |
 | Code Virtualizer | Planned | - |
@@ -138,7 +139,7 @@ mempe.exe -w target.exe
 
 Everything lands in a `mempe` folder in the current directory.
 
-A dump keeps the data exactly as it was while the program ran, decrypted strings and all, so a program that sets itself up at startup usually crashes if you start the dump. For UPX, ASPack, MPRESS, PECompact and FSG, mempe can read the data the program started with out of the packed file. When the running data differs, it asks once whether to also save a copy like `target.fresh.exe` that starts on its own. The main dump never changes. When nobody is there to answer, like in a script, it saves the copy.
+A dump keeps the data exactly as it was while the program ran, decrypted strings and all, so a program that sets itself up at startup usually crashes if you start the dump. For UPX, ASPack, MPRESS, PECompact, FSG and MEW, mempe can read the data the program started with out of the packed file. When the running data differs, it asks once whether to also save a copy like `target.fresh.exe` that starts on its own. The main dump never changes. When nobody is there to answer, like in a script, it saves the copy.
 
 To build it yourself, you need Windows 10 or later and stable Rust:
 

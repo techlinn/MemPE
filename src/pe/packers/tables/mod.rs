@@ -17,7 +17,7 @@ pub(super) use debug::{
     DEBUG_ADDRESS_OFFSET, DEBUG_ENTRY_SIZE, DEBUG_SIZE_OFFSET, DEBUG_TYPE_CODEVIEW,
     DEBUG_TYPE_OFFSET, codeview_entry, debug_timestamp, find_codeview_record,
 };
-pub(super) use directories::{recover_directories, security_cookie};
+pub(super) use directories::{is_module_name, recover_directories, security_cookie};
 pub(super) use exports::{
     export_functions, exports_intact, linker_export_layout, linker_export_start,
     moved_export_directory,
@@ -31,8 +31,8 @@ pub(super) use imports::{
 };
 pub(super) use pogo::{pogo_parts, pogo_sections, pogo_tls_directory};
 pub(super) use relocations::{
-    MAX_RELOCATION_BLOCK, RELOCATION_BLOCK_HEADER, RELOCATION_BLOCK_SIZE_OFFSET, relocate,
-    relocated_fields, relocation_blocks, relocations_intact,
+    MAX_RELOCATION_BLOCK, RELOCATION_BLOCK_HEADER, RELOCATION_BLOCK_SIZE_OFFSET,
+    find_relocation_table, relocate, relocated_fields, relocation_blocks, relocations_intact,
 };
 pub(super) use resources::{
     LinkerTree, RESOURCE_DATA_SIZE_OFFSET, RESOURCE_SIZE_ALIGNMENT, ResourceLayout,
@@ -40,9 +40,9 @@ pub(super) use resources::{
     resources_intact, restore_moved_resources, return_moved_leaves, walk_resources,
 };
 pub(super) use sections::{
-    LinkerBounds, SECTION_CHARACTERISTICS_OFFSET, SECTION_COUNT_OFFSET, SECTION_RVA_OFFSET,
-    SectionHints, SectionPiece, first_section_range, linker_bounds, name_sections,
-    replace_first_section, split_merged_section,
+    CODE_SECTION, DATA_SECTION, LinkerBounds, SECTION_CHARACTERISTICS_OFFSET, SECTION_COUNT_OFFSET,
+    SECTION_RVA_OFFSET, SectionHints, SectionPiece, first_section_range, linker_bounds,
+    name_sections, replace_first_section, split_merged_section,
 };
 pub(super) use tls::restore_tls;
 

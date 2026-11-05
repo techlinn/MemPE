@@ -194,7 +194,7 @@ fn rebuild_source(
     };
 
     let (mut output, layouts, header_size) =
-        build_output_buffer(model, memory, !plan.groups.is_empty())?;
+        build_output_buffer(model, memory, &plan.import_tables(model.kind))?;
 
     write_core_header_fields(&mut output, model, observed_base, header_size)?;
 
@@ -205,7 +205,9 @@ fn rebuild_source(
         plan: import_plan,
         written,
         unemitted,
-    } = resolve_imports(&mut output, model, plan, &mut repairs)?;
+    } = resolve_imports(&mut output, model, plan, &mut repairs, |rva| {
+        rva_to_file(rva, &layouts, header_size)
+    })?;
 
     let (final_entry_point, executable_flag_added) =
         finalize_output(&mut output, model, entry_point)?;
@@ -298,10 +300,11 @@ fn resolve_imports(
     model: &PeModel,
     plan: ImportPlan,
     repairs: &mut RepairStats,
+    slot_offset: impl Fn(u32) -> Option<usize>,
 ) -> AppResult<ImportOutcome> {
     let section = match plan.groups.is_empty() {
         true => ImportSection::NothingToWrite,
-        false => append_import_section(output, model, &plan)?,
+        false => append_import_section(output, model, &plan, slot_offset)?,
     };
 
     let (written, unemitted, cleared) = match section {

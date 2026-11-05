@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use crate::pe::image::{read_pointer, read_u32, write_u32, write_u64};
 use crate::pe::{BASERELOC_DIRECTORY, PeKind, PeModel, RELOCATION_DIR64, RELOCATION_HIGHLOW};
 
@@ -86,6 +88,68 @@ pub(crate) fn relocations_intact(bytes: &[u8], start: usize, size: usize) -> boo
     }
 
     true
+}
+
+pub(crate) fn find_relocation_table(
+    original: &[u8],
+    image: &Range<usize>,
+    base: usize,
+    page: usize,
+) -> Option<Range<usize>> {
+    (image.start..image.end)
+        .step_by(page.max(1))
+        .find_map(|start| relocation_table_at(original, start, image, base))
+}
+
+fn relocation_table_at(
+    original: &[u8],
+    start: usize,
+    image: &Range<usize>,
+    base: usize,
+) -> Option<Range<usize>> {
+    let mut cursor = start;
+    let mut fixups = 0usize;
+
+    loop {
+        let page = read_u32(original, cursor).ok()? as usize;
+        let size =
+            read_u32(original, cursor.checked_add(RELOCATION_BLOCK_SIZE_OFFSET)?).ok()? as usize;
+        if page == 0 && size == 0 {
+            break;
+        }
+
+        let block = page & PAGE_MASK as usize == 0
+            && image.contains(&page)
+            && (RELOCATION_BLOCK_HEADER..=MAX_RELOCATION_BLOCK).contains(&size)
+            && size.is_multiple_of(2);
+        block.then_some(())?;
+
+        let words = original
+            .get(cursor.checked_add(RELOCATION_BLOCK_HEADER)?..cursor.checked_add(size)?)?;
+        for word in words.as_chunks::<2>().0 {
+            let word = u16::from_le_bytes(*word);
+            match word >> RELOCATION_KIND_SHIFT {
+                0 => continue,
+                RELOCATION_HIGHLOW => {
+                    let field = page.checked_add(usize::from(word & RELOCATION_OFFSET_MASK))?;
+                    let value = read_u32(original, field).ok()? as usize;
+                    if value == 0 {
+                        continue; // packers blank some directories, like mew does the tls one
+                    }
+
+                    let target = value.checked_sub(base)?;
+                    (target <= image.end).then_some(())?; // the packer never ran these, so they still hold link time pointers
+                    fixups += 1;
+                }
+                _ => return None,
+            }
+        }
+
+        cursor = cursor.checked_add(size)?;
+        (cursor < image.end).then_some(())?;
+    }
+
+    (fixups > 0).then_some(start..cursor)
 }
 
 pub(crate) fn relocate(

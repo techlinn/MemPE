@@ -185,18 +185,24 @@ fn write_derived_header_fields(output: &mut [u8], model: &PeModel) -> AppResult<
         sizes.add_section(output, offset, model.file_alignment)?;
     }
 
-    write_u32(output, model.size_of_code_offset, sizes.code)?;
-    write_u32(
-        output,
-        model.size_of_initialized_data_offset,
-        sizes.initialized_data,
-    )?;
-    write_u32(
-        output,
-        model.size_of_uninitialized_data_offset,
-        sizes.uninitialized_data,
-    )?;
-    write_u32(output, model.base_of_code_offset, sizes.base_of_code)
+    for (offset, value) in [
+        (model.size_of_code_offset, sizes.code),
+        (
+            model.size_of_initialized_data_offset,
+            sizes.initialized_data,
+        ),
+        (
+            model.size_of_uninitialized_data_offset,
+            sizes.uninitialized_data,
+        ),
+        (model.base_of_code_offset, sizes.base_of_code),
+    ] {
+        if offset.abs_diff(DOS_LFANEW_OFFSET) >= 4 {
+            write_u32(output, offset, value)?; // mew folds the headers so that e_lfanew is one of these fields
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Default)]

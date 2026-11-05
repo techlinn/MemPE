@@ -139,7 +139,7 @@ fn delay_descriptor(bytes: &[u8], at: usize, base: usize, end: usize) -> bool {
         && field(DELAY_NAME_OFFSET).is_some_and(|name| is_module_name(bytes, name))
 }
 
-fn is_module_name(bytes: &[u8], at: usize) -> bool {
+pub(crate) fn is_module_name(bytes: &[u8], at: usize) -> bool {
     let Some(text) = bytes.get(at..at.saturating_add(MAX_DLL_NAME).min(bytes.len())) else {
         return false;
     };

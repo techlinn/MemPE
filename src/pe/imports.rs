@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ops::Range;
 
 use crate::pe::exports::{ExportIndex, ResolvedExport, embedded_module_name};
 use crate::pe::image;
@@ -99,6 +100,19 @@ pub(super) struct ImportPlan {
     own: Option<String>,
     ambiguous_slots: BTreeSet<u32>,
     unbound_delay_slots: BTreeSet<u32>,
+}
+
+impl ImportPlan {
+    pub(super) fn import_tables(&self, kind: PeKind) -> Vec<Range<usize>> {
+        self.groups
+            .iter()
+            .map(|group| {
+                let start = group.first_thunk as usize;
+                start
+                    ..start.saturating_add(group.entries.len().saturating_mul(kind.pointer_width()))
+            })
+            .collect()
+    }
 }
 
 pub(super) fn build_plan(

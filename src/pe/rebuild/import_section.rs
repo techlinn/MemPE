@@ -1,6 +1,6 @@
 use super::directories::{clear_directory, write_directory};
 use super::{MAX_OUTPUT_SIZE, SECTION_HEADER_SIZE, align_up, align_up_u64};
-use crate::pe::image::{read_u16, read_u32, write_u16, write_u32, write_u64};
+use crate::pe::image::{read_pointer, read_u16, read_u32, write_u16, write_u32, write_u64};
 use crate::pe::imports::{ImportGroup, ImportPlan};
 use crate::pe::{BOUND_IMPORT_DIRECTORY, IAT_DIRECTORY, IMPORT_DIRECTORY, PeKind, PeModel};
 use crate::{AppError, AppResult};
@@ -19,6 +19,7 @@ pub(super) fn append_import_section(
     output: &mut Vec<u8>,
     model: &PeModel,
     plan: &ImportPlan,
+    slot_offset: impl Fn(u32) -> Option<usize>,
 ) -> AppResult<ImportSection> {
     if IMPORT_DIRECTORY >= model.directory_count {
         return Ok(ImportSection::NoImportDirectory);
@@ -76,6 +77,15 @@ pub(super) fn append_import_section(
         raw_size,
     )?;
 
+    fill_empty_slots(
+        output,
+        plan,
+        &payload,
+        model.kind,
+        virtual_address,
+        slot_offset,
+    )?;
+
     let mut cleared = Vec::new();
 
     if bound_cleared {
@@ -87,6 +97,50 @@ pub(super) fn append_import_section(
     }
 
     Ok(ImportSection::Written { cleared })
+}
+
+fn fill_empty_slots(
+    output: &mut [u8],
+    plan: &ImportPlan,
+    payload: &[u8],
+    kind: PeKind,
+    section_rva: u32,
+    slot_offset: impl Fn(u32) -> Option<usize>,
+) -> AppResult<()> {
+    let width = kind.pointer_width();
+
+    for (index, group) in plan.groups.iter().enumerate() {
+        let descriptor = index
+            .checked_mul(IMPORT_DESCRIPTOR_SIZE)
+            .and_then(|offset| offset.checked_add(plan.existing.len()))
+            .ok_or_else(|| AppError::new("import descriptor offset overflowed"))?;
+        let lookup = read_u32(payload, descriptor)?
+            .checked_sub(section_rva)
+            .ok_or_else(|| AppError::new("import lookup table lies before its section"))?
+            as usize;
+
+        for entry in 0..group.entries.len() {
+            let Some(slot) = u32::try_from(entry.saturating_mul(width))
+                .ok()
+                .and_then(|delta| group.first_thunk.checked_add(delta))
+                .and_then(&slot_offset)
+            else {
+                continue;
+            };
+            if read_pointer(output, slot, kind)? != 0 {
+                continue;
+            }
+
+            let thunk = read_pointer(
+                payload,
+                lookup.saturating_add(entry.saturating_mul(width)),
+                kind,
+            )?;
+            write_thunk(output, slot, kind, thunk as u64)?; // the loader stops at an empty slot, so one the stub never filled gets its lookup entry
+        }
+    }
+
+    Ok(())
 }
 
 fn clear_overlapping_bound_imports(

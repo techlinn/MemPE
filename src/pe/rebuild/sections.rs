@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use super::{
     IMAGE_SCN_CNT_CODE, MAX_OUTPUT_SIZE, PAGE_SIZE, SECTION_HEADER_SIZE, SectionLayout, align_up,
 };
@@ -15,15 +17,15 @@ const MAX_RENAME_ATTEMPTS: usize = 64;
 pub(super) fn build_output_buffer<'a>(
     model: &'a PeModel,
     memory: &[u8],
-    reserve_import_header: bool,
+    import_tables: &[Range<usize>],
 ) -> AppResult<(Vec<u8>, Vec<SectionLayout<'a>>, usize)> {
     let section_table_end = model
         .sections
         .last()
         .map(|section| section.header_offset.saturating_add(SECTION_HEADER_SIZE))
         .ok_or_else(|| AppError::new("PE has no section headers"))?;
-    let header_size = header_size(model, section_table_end, reserve_import_header)?;
-    let layouts = layout_sections(model, memory, header_size)?;
+    let header_size = header_size(model, section_table_end, !import_tables.is_empty())?;
+    let layouts = layout_sections(model, memory, header_size, import_tables)?;
     let output_size = layouts
         .iter()
         .map(|layout| layout.raw_offset.saturating_add(layout.raw_size))
@@ -300,6 +302,7 @@ fn layout_sections<'a>(
     model: &'a PeModel,
     memory: &[u8],
     header_size: usize,
+    import_tables: &[Range<usize>],
 ) -> AppResult<Vec<SectionLayout<'a>>> {
     let mut sections = model.sections.iter().collect::<Vec<_>>();
     sections.sort_unstable_by_key(|section| section.virtual_address);
@@ -317,12 +320,16 @@ fn layout_sections<'a>(
         let until_next = next_rva.saturating_sub(source_offset);
         let available = memory.len().saturating_sub(source_offset);
         let source_length = declared_length.min(until_next).min(available);
-        let raw_size =
-            if source_length == 0 || section_is_zero(memory, source_offset, source_length) {
-                0
-            } else {
-                align_up(source_length, model.file_alignment as usize)?
-            };
+        let source_end = source_offset.saturating_add(source_length);
+        let holds_import_table = import_tables
+            .iter()
+            .any(|table| table.start < source_end && table.end > source_offset); // its empty slots get lookup entries, which need file data
+        let empty = section_is_zero(memory, source_offset, source_length) && !holds_import_table;
+        let raw_size = if source_length == 0 || empty {
+            0
+        } else {
+            align_up(source_length, model.file_alignment as usize)?
+        };
         layouts.push(SectionLayout {
             model: section,
             source_length,
