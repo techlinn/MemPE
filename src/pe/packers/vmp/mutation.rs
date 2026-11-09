@@ -67,13 +67,7 @@ struct Cleaned {
     pub(super) complete: bool, // false when part of the function would not decode so it must not be used
 }
 
-fn clean(
-    image: &[u8],
-    base: u64,
-    bits: u32,
-    entry: u64,
-    payload: &Payload<'_>,
-) -> Cleaned {
+fn clean(image: &[u8], base: u64, bits: u32, entry: u64, payload: &Payload<'_>) -> Cleaned {
     let insns = decode(image, base, bits, entry, payload);
     let succ = successors(&insns, payload);
 

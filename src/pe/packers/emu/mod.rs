@@ -91,13 +91,7 @@ const STACK_ARGS: u64 = 4;
 const VEX_SCRATCH_SLOT: u64 = 32;
 const VEX_SCRATCH_SIZE: usize = 64;
 
-fn behaviour(
-    image: &[u8],
-    image_base: u64,
-    bits: u32,
-    entry: u64,
-    pointers: bool,
-) -> Behaviour {
+fn behaviour(image: &[u8], image_base: u64, bits: u32, entry: u64, pointers: bool) -> Behaviour {
     const BUDGET: usize = 200_000;
     let kept: &[usize] = if bits == 64 {
         &[0, 3, 4, 5, 6, 7, 12, 13, 14, 15] // rax rbx rsp rbp rsi rdi and r12 to r15
