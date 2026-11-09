@@ -1,5 +1,6 @@
 mod aspack;
 mod codecs;
+mod emu;
 mod fsg;
 mod mew;
 mod mpress;
@@ -7,6 +8,7 @@ mod pecompact;
 mod streamed;
 mod tables;
 mod upx;
+mod vmp;
 
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
@@ -16,19 +18,21 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::pe::PeImage;
+use crate::pe::exports::ExportIndex;
 use tables::Restoration;
 
 type Unpacker = fn(&PeImage<'_>, &Origin<'_>) -> Option<Unpacked>;
 
 const MAX_PACKED_FILE: u64 = 512 * 1024 * 1024;
 
-const UNPACKERS: [Unpacker; 6] = [
+const UNPACKERS: [Unpacker; 7] = [
     upx::unpack,
     aspack::unpack,
     mpress::unpack,
     pecompact::unpack,
     fsg::unpack,
     mew::unpack,
+    vmp::unpack,
 ];
 
 #[derive(Clone, Copy)]
@@ -41,6 +45,7 @@ pub(super) struct Origin<'a> {
     pub(super) base: usize,
     pub(super) headers: HeaderSource,
     pub(super) file: Option<&'a Path>,
+    pub(super) exports: &'a ExportIndex,
 }
 
 impl Origin<'_> {
@@ -102,6 +107,7 @@ pub(crate) struct PackerReport {
     pub(crate) restored: Vec<&'static str>,
     pub(crate) unrestored: Vec<&'static str>,
     pub(crate) lost: Vec<&'static str>,
+    pub(crate) notes: Vec<String>,
 }
 
 impl PackerReport {
@@ -112,6 +118,7 @@ impl PackerReport {
             restored: Vec::new(),
             unrestored: Vec::new(),
             lost: Vec::new(),
+            notes: Vec::new(),
         }
     }
 

@@ -57,6 +57,7 @@ pub(crate) struct ArtifactInfo {
     pub(crate) never_decrypted_sections: usize,
     pub(crate) absent_sections: usize,
     pub(crate) packer: Option<PackerReport>,
+    pub(crate) resource_protection: bool,
     pub(crate) resident_pages: usize,
     pub(crate) private_pages: usize,
     pub(crate) unlinked: bool,
@@ -127,6 +128,7 @@ impl ArtifactInfo {
             never_decrypted_sections: 0,
             absent_sections: 0,
             packer: None,
+            resource_protection: false,
             resident_pages: 0,
             private_pages: 0,
             unlinked: false,
@@ -190,6 +192,7 @@ pub(crate) struct DumpSummary {
     pub(crate) raw_region_unreadable_pages: usize,
     pub(crate) raw_regions: usize,
     pub(crate) embedded_pes: usize,
+    pub(crate) resource_protection: usize,
 }
 
 pub(crate) struct BuildReport {
@@ -305,6 +308,7 @@ impl DumpOutcome {
             || self.images_skipped > 0
             || self.summary.aliased_names > 0
             || self.summary.invalid_pdata_sections > 0
+            || self.summary.resource_protection > 0
     }
 }
 
@@ -424,6 +428,9 @@ impl DumpSummary {
             .never_decrypted_sections
             .saturating_add(info.never_decrypted_sections);
         self.absent_sections = self.absent_sections.saturating_add(info.absent_sections);
+        self.resource_protection = self
+            .resource_protection
+            .saturating_add(usize::from(info.resource_protection));
 
         if let Some(packer) = &info.packer {
             self.partly_unpacked = self
@@ -490,6 +497,16 @@ pub(crate) fn build(
 
     push_raw_regions(&raw_regions, &mut report);
 
+    let resource_hooked = images
+        .iter()
+        .find(|image| {
+            image
+                .name
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case("ntdll.dll"))
+        })
+        .is_some_and(|ntdll| pe::resource_apis_hooked(&ntdll.bytes, ntdll.base));
+
     let mut selected = 0usize;
     for image in images {
         if only.is_some_and(|want| !image_matches(&image, want)) {
@@ -505,6 +522,17 @@ pub(crate) fn build(
         if validates_manual_entry_point && !report.main_rebuilt {
             break;
         }
+    }
+
+    if resource_hooked
+        && let Some(main) = report.files.iter_mut().find(|file| file.context.is_main)
+        && main
+            .context
+            .packer
+            .as_ref()
+            .is_some_and(|packer| packer.name == "VMProtect")
+    {
+        main.context.resource_protection = true;
     }
 
     report.selected_images = only.map(|_| selected);
@@ -757,6 +785,7 @@ fn artifact_info(image: &CapturedImage, rebuilt: &RebuiltImage) -> ArtifactInfo 
         never_decrypted_sections: rebuilt.never_decrypted_sections,
         absent_sections: rebuilt.absent_sections,
         packer: rebuilt.packer.clone(),
+        resource_protection: false,
         resident_pages: image.resident_pages,
         private_pages: image.private_pages,
         unlinked: !image.linked && !image.hidden,

@@ -7,7 +7,7 @@ use std::thread;
 use std::time::Duration;
 
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_BAD_LENGTH, ERROR_NO_MORE_FILES, FILETIME, HANDLE, LUID,
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_BAD_LENGTH, ERROR_NO_MORE_FILES, FILETIME, HANDLE, LUID,
 };
 use windows::Win32::Security::{
     AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_DEBUG_NAME,
@@ -90,8 +90,14 @@ pub(crate) struct OwnedHandle(HANDLE);
 
 impl OwnedHandle {
     pub(crate) fn open(pid: ProcessId, rights: PROCESS_ACCESS_RIGHTS) -> AppResult<Self> {
-        let handle = unsafe { OpenProcess(rights, false, pid.get()) }
-            .map_err(|error| windows_error("OpenProcess", error))?;
+        let handle = unsafe { OpenProcess(rights, false, pid.get()) }.map_err(|error| {
+            if error.code() == ERROR_ACCESS_DENIED.to_hresult() {
+                return AppError::new(format!(
+                    "OpenProcess failed: {error}; run mempe as administrator"
+                ));
+            }
+            windows_error("OpenProcess", error)
+        })?;
         Ok(Self(handle))
     }
 

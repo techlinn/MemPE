@@ -319,6 +319,10 @@ fn render_packer_gaps(console: &Console, packer: &pe::PackerReport) {
     if !packer.lost.is_empty() {
         console.field("Lost", format_args!("{}", packer.lost.join(", ")));
     }
+
+    if !packer.notes.is_empty() {
+        console.field("Detail", format_args!("{}", packer.notes.join("; ")));
+    }
 }
 
 fn unwind_note(covered: Option<bool>) -> &'static str {
@@ -418,6 +422,12 @@ fn render_warnings(console: &Console, outcome: &DumpOutcome) {
     render_repair_warnings(console, outcome);
     render_import_warnings(console, outcome);
     render_build_failures(console, outcome);
+
+    if outcome.summary.resource_protection > 0 {
+        console.warning(format_args!(
+            "VMProtect resource protection is active, so protected resources and strings decrypt only on access; any the program had not reached before the dump are missing here"
+        ));
+    }
 
     if outcome.images_skipped > 0 {
         console.warning(format_args!(

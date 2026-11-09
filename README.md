@@ -92,12 +92,12 @@ mempe snapshots the process, finds every module plus any PE hiding in non-image 
 | PECompact | Supported | 2.3, 2.67 and 3.11, plus five other 2.x builds from 2005 and 2006 |
 | FSG | Supported | 1.0, 1.1, 1.2, 1.3, 1.31, 1.33, 2.0 and modified stubs |
 | MEW | Supported | 5, 10, 11 SE 1.2 and modified stubs |
+| VMProtect | Supported | 3.9.4 and 3.9.6 |
 | Enigma Protector | Planned | - |
 | Enigma Virtual Box | Planned | - |
 | Obsidium | Planned | - |
 | Themida / WinLicense | Planned | - |
 | Code Virtualizer | Planned | - |
-| VMProtect | Planned | - |
 | Anything else | Generic dump | Any |
 
 Anything missing? [Open an issue](https://github.com/techlinn/MemPE/issues) and I'll add it.

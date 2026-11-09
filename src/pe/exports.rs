@@ -7,7 +7,7 @@ use crate::pe::parse::parse_memory_image;
 use crate::pe::{EXPORT_DIRECTORY, PeImage, Rva};
 
 const EXPORT_HEADER_SIZE: usize = 40;
-const MAX_EXPORTS: usize = 1_048_576;
+pub(super) const MAX_EXPORTS: usize = 1_048_576;
 const MAX_EXPORT_NAME: usize = 4_096;
 const MAX_FORWARD_DEPTH: usize = 8;
 

@@ -6,7 +6,7 @@ use crate::pe::{PeKind, PeModel, SECTION_HEADER_SIZE};
 pub(crate) const SECTION_COUNT_OFFSET: usize = 6; // from the nt signature
 pub(crate) const SECTION_RVA_OFFSET: usize = 12;
 pub(crate) const SECTION_CHARACTERISTICS_OFFSET: usize = 36;
-const SECTION_VIRTUAL_SIZE_OFFSET: usize = 8;
+pub(crate) const SECTION_VIRTUAL_SIZE_OFFSET: usize = 8;
 const SECTION_RAW_SIZE_OFFSET: usize = 16;
 const SECTION_RAW_POINTER_OFFSET: usize = 20;
 pub(crate) const CODE_SECTION: u32 = 0x6000_0020; // read, execute, code

@@ -41,8 +41,8 @@ pub(super) use resources::{
 };
 pub(super) use sections::{
     CODE_SECTION, DATA_SECTION, LinkerBounds, SECTION_CHARACTERISTICS_OFFSET, SECTION_COUNT_OFFSET,
-    SECTION_RVA_OFFSET, SectionHints, SectionPiece, first_section_range, linker_bounds,
-    name_sections, replace_first_section, split_merged_section,
+    SECTION_RVA_OFFSET, SECTION_VIRTUAL_SIZE_OFFSET, SectionHints, SectionPiece,
+    first_section_range, linker_bounds, name_sections, replace_first_section, split_merged_section,
 };
 pub(super) use tls::restore_tls;
 

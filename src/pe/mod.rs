@@ -14,6 +14,77 @@ pub(crate) use packers::PackerReport;
 pub(crate) use parse::memory_image_size;
 pub(crate) use rebuild::{DiskImage, RebuiltImage, append_overlay, overlay_offset, rebuild};
 
+pub(crate) fn resource_apis_hooked(bytes: &[u8], base: usize) -> bool {
+    const RESOURCE_APIS: [&str; 2] = ["LdrFindResource_U", "LdrAccessResource"];
+
+    let Ok(parsed) = parse::parse_memory_image(bytes) else {
+        return false;
+    };
+    let Some(export) = parsed
+        .model()
+        .directory(bytes, EXPORT_DIRECTORY)
+        .ok()
+        .flatten()
+    else {
+        return false;
+    };
+    let export = export.rva().as_usize();
+
+    let (Ok(name_count), Ok(functions), Ok(names), Ok(ordinals)) = (
+        image::read_u32(bytes, export + 24),
+        image::read_u32(bytes, export + 28),
+        image::read_u32(bytes, export + 32),
+        image::read_u32(bytes, export + 36),
+    ) else {
+        return false;
+    };
+    let module = base..base.saturating_add(bytes.len());
+
+    for index in 0..(name_count as usize).min(exports::MAX_EXPORTS) {
+        let Ok(name_rva) = image::read_u32(bytes, names as usize + index * 4) else {
+            continue;
+        };
+        if !RESOURCE_APIS
+            .iter()
+            .any(|api| export_name_is(bytes, name_rva as usize, api))
+        {
+            continue;
+        }
+
+        let Ok(ordinal) = image::read_u16(bytes, ordinals as usize + index * 2) else {
+            continue;
+        };
+        let Ok(function) = image::read_u32(bytes, functions as usize + ordinal as usize * 4) else {
+            continue;
+        };
+        let function = function as usize;
+
+        let Some(code) = bytes.get(function..function.saturating_add(5)) else {
+            continue;
+        };
+        if code[0] == 0xE9 {
+            let target = base
+                .wrapping_add(function)
+                .wrapping_add(5)
+                .wrapping_add_signed(
+                    i32::from_le_bytes([code[1], code[2], code[3], code[4]]) as isize
+                );
+            if !module.contains(&target) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn export_name_is(bytes: &[u8], rva: usize, name: &str) -> bool {
+    bytes
+        .get(rva..rva.saturating_add(name.len()))
+        .is_some_and(|text| text == name.as_bytes())
+        && bytes.get(rva.saturating_add(name.len())) == Some(&0)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RegionEvidence {
     pub(crate) offset: usize,
@@ -56,6 +127,8 @@ pub(crate) const RUNTIME_FUNCTION_SIZE: usize = 12;
 pub(crate) const RELOCATION_HIGHLOW: u16 = 3;
 pub(crate) const RELOCATION_DIR64: u16 = 10;
 pub(crate) const DYNAMIC_BASE: u16 = 0x0040;
+pub(crate) const RELOCS_STRIPPED: u16 = 0x0001;
+pub(crate) const FILE_CHARACTERISTICS_OFFSET: usize = 22;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PeKind {

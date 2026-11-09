@@ -1,8 +1,8 @@
 use super::{SectionLayout, rva_to_file};
 use crate::pe::image::{read_u16, read_u32, write_u16, write_u32};
 use crate::pe::{
-    BASERELOC_DIRECTORY, DEBUG_DIRECTORY, DYNAMIC_BASE, PeKind, PeModel, RELOCATION_DIR64,
-    RELOCATION_HIGHLOW, SECURITY_DIRECTORY,
+    BASERELOC_DIRECTORY, DEBUG_DIRECTORY, DYNAMIC_BASE, FILE_CHARACTERISTICS_OFFSET, PeKind,
+    PeModel, RELOCATION_DIR64, RELOCATION_HIGHLOW, RELOCS_STRIPPED, SECURITY_DIRECTORY,
 };
 use crate::{AppError, AppResult};
 
@@ -259,6 +259,10 @@ pub(super) fn clear_dynamic_base(output: &mut [u8], model: &PeModel) -> AppResul
     {
         return Ok(false);
     }
+
+    let file = model.nt_offset.saturating_add(FILE_CHARACTERISTICS_OFFSET);
+    let stripped = read_u16(output, file)?;
+    write_u16(output, file, stripped | RELOCS_STRIPPED)?;
 
     let characteristics = read_u16(output, model.dll_characteristics_offset)?;
 

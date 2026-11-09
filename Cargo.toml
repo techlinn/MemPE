@@ -1,12 +1,13 @@
 [package]
 name = "mempe"
-version = "0.5.17"
+version = "0.5.2"
 edition = "2024"
 license = "MIT"
 description = "Windows PE memory dumper and rebuilder for reverse engineering"
 
 [dependencies]
 pelite = { version = "0.10.0", default-features = false, features = ["std"] }
+iced-x86 = { version = "1.22.0", default-features = false, features = ["std", "decoder", "instr_info", "encoder", "block_encoder"] }
 windows = { version = "0.62.2", default-features = false, features = [
     "Win32_Foundation",
     "Win32_Security",

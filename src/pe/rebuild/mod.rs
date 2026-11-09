@@ -114,7 +114,8 @@ pub(crate) fn rebuild(
     page_flags: &[u8],
 ) -> AppResult<RebuiltImage> {
     let attempt = |unpack: Unpack| {
-        let mut source = resolve_source_bytes(memory, regions, observed_base, disk, unpack)?;
+        let mut source =
+            resolve_source_bytes(memory, regions, observed_base, disk, exports, unpack)?;
         let fresh = source.fresh.take().map(|fresh| {
             let copy = Source {
                 bytes: Cow::Owned(fresh.bytes),

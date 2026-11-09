@@ -3,6 +3,7 @@ use std::borrow::Cow;
 use super::DiskImage;
 use super::sections::recover_section_headers;
 use super::{SECTION_HEADER_SIZE, align_up};
+use crate::pe::exports::ExportIndex;
 use crate::pe::image::{read_u16, read_u32, write_u32, write_u64};
 use crate::pe::packers::{FreshImage, HeaderSource, Origin, PackerFindings, Unpacked, unpack};
 use crate::pe::parse::{parse_disk_image, parse_memory_image};
@@ -29,6 +30,7 @@ pub(super) fn resolve_source_bytes<'a>(
     regions: &[RegionEvidence],
     observed_base: usize,
     disk: DiskImage<'_>,
+    exports: &ExportIndex,
     unpack_mode: Unpack,
 ) -> AppResult<Source<'a>> {
     let (initial, disk_headers_used) = match parse_memory_image(memory) {
@@ -58,6 +60,7 @@ pub(super) fn resolve_source_bytes<'a>(
         base: observed_base,
         headers,
         file: disk.file,
+        exports,
     };
 
     let packer = match (unpack(&image, &origin), unpack_mode) {

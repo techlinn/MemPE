@@ -139,6 +139,10 @@ pub(super) fn unpack(image: &PeImage<'_>, origin: &Origin<'_>) -> Option<Unpacke
         decode(&mapped_file(&file, image)?)
     }); // mew never overwrites its packed data
     let Some((version, decoded)) = decoded else {
+        candidates
+            .iter()
+            .any(|candidate| candidate.stock.is_some())
+            .then_some(())?;
         return Some(Unpacked::detected_only(
             NAME,
             Some(first_version.to_owned()),
