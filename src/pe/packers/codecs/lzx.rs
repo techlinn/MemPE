@@ -17,6 +17,7 @@ const ALIGNED_BITS: u32 = 3;
 const DEFAULT_ALIGNED_LENGTH: u8 = 3; // every aligned length at 3 switches the aligned tree off
 const MAX_CODE_LENGTH: u32 = 15;
 const WINDOW_BITS: u32 = 24;
+const WIDE_LOW_BITS: u32 = 16;
 const LENGTH_WRAP: u8 = 16;
 const REPEAT_LENGTH: u16 = 16;
 const SHORT_ZEROS: u16 = 17;
@@ -86,13 +87,19 @@ impl<'a> Bits<'a> {
     }
 
     fn take(&mut self, bits: u32) -> Option<u32> {
-        if bits == 0 {
-            return Some(0);
+        match bits {
+            0 => Some(0),
+            1..=WINDOW_BITS => {
+                let value = self.peek()? >> (WINDOW_BITS - bits);
+                self.skip(bits);
+                Some(value)
+            }
+            25..=u32::BITS => {
+                let high = self.take(bits - WIDE_LOW_BITS)?;
+                Some((high << WIDE_LOW_BITS) | self.take(WIDE_LOW_BITS)?)
+            }
+            _ => None,
         }
-
-        let value = self.peek()? >> (WINDOW_BITS - bits);
-        self.skip(bits);
-        Some(value)
     }
 }
 

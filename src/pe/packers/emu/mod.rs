@@ -8,6 +8,7 @@ const STACK_SIZE: u64 = 0x1_0000;
 const STACK_BASE_64: u64 = 0x7FF0_0000_0000;
 const STACK_BASE_32: u64 = 0x6000_0000;
 const BUDGET: usize = 50_000;
+const STRING_FUEL: u64 = 1 << 24;
 const EXEC_STACK_SIZE: u64 = 0x20_0000; // a whole virtualized function needs far more stack than a stub
 const FRAME_SLOTS: u64 = 8; // caller stack slots marked to prove the stub leaves the caller frame alone
 const MIN_STUB_STEPS: usize = 8;
@@ -37,6 +38,7 @@ struct Cpu<'a> {
     extra: Vec<(u64, Vec<u8>)>,
     x87: fp::X87,
     vex_scratch: u64,
+    string_fuel: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -131,10 +133,21 @@ fn behaviour(image: &[u8], image_base: u64, bits: u32, entry: u64, pointers: boo
     }
 
     let (returned, stop) = cpu.run_function(entry, BUDGET);
+    let left_to = (!cpu.in_image(stop)).then_some(stop);
+    let arguments: &[usize] = match (left_to, bits) {
+        (None, _) => &[],
+        (Some(_), 64) => &[1, 2, 8, 9], // rcx rdx r8 r9
+        (Some(_), _) => &[1, 2],        // ecx edx carry thiscall and fastcall arguments
+    };
+
     Behaviour {
         returned,
-        left_to: (!cpu.in_image(stop)).then_some(stop),
-        regs: kept.iter().map(|&reg| cpu.gpr[reg]).collect(),
+        left_to,
+        regs: kept
+            .iter()
+            .chain(arguments)
+            .map(|&reg| cpu.gpr[reg])
+            .collect(),
         buffers: cpu
             .extra
             .split_off(synthetic)
@@ -193,6 +206,7 @@ impl<'a> Cpu<'a> {
                 ..Default::default()
             },
             vex_scratch: 0,
+            string_fuel: STRING_FUEL,
         };
         cpu.gpr[4] = stack_base + STACK_SIZE / 2; // rsp mid stack so push and pop both have room
         cpu
@@ -223,6 +237,7 @@ impl<'a> Cpu<'a> {
                 ..Default::default()
             },
             vex_scratch: 0,
+            string_fuel: STRING_FUEL,
         };
         cpu.gpr[4] = stack_base + EXEC_STACK_SIZE / 2;
 
@@ -247,10 +262,29 @@ impl<'a> Cpu<'a> {
     }
 
     fn fetch(&self) -> Option<Instruction> {
-        let code = self.code_at(self.rip)?;
+        let mut rewritten = [0u8; WINDOW];
+        let code = match self.rewritten_code(&mut rewritten) {
+            Some(length) => rewritten.get(..length)?,
+            None => self.code_at(self.rip)?,
+        };
         let mut decoder = Decoder::with_ip(self.bits, code, self.rip, DecoderOptions::NONE);
         let insn = decoder.decode();
         (!insn.is_invalid()).then_some(insn)
+    }
+
+    fn rewritten_code(&self, window: &mut [u8; WINDOW]) -> Option<usize> {
+        let end = self.rip.saturating_add(WINDOW as u64);
+        self.overlay.as_ref()?.range(self.rip..end).next()?;
+
+        let mut length = 0;
+        for (slot, addr) in window.iter_mut().zip(self.rip..end) {
+            let Some(byte) = self.read_byte(addr) else {
+                break;
+            };
+            *slot = byte;
+            length += 1;
+        }
+        Some(length)
     }
 
     fn code_at(&self, addr: u64) -> Option<&[u8]> {
@@ -951,9 +985,8 @@ impl<'a> Cpu<'a> {
         let mask = self.addr_mask();
         let step = size as u64;
         let mut count = string_count(self, insn);
-        if count > 1 << 24 {
-            return None;
-        }
+        self.string_fuel = self.string_fuel.checked_sub(count)?;
+
         while count > 0 {
             let (si, di) = (self.gpr[6], self.gpr[7]);
             match kind {
@@ -1050,6 +1083,7 @@ impl<'a> Cpu<'a> {
     fn add(&mut self, a: u64, b: u64, cin: bool, size: usize) -> u64 {
         let bits = size * 8;
         let m = width_mask(size);
+        let (a, b) = (a & m, b & m);
         let full = u128::from(a) + u128::from(b) + u128::from(cin);
         let r = (full as u64) & m;
         self.flags.cf = full > u128::from(m);
@@ -1063,6 +1097,7 @@ impl<'a> Cpu<'a> {
     fn sub(&mut self, a: u64, b: u64, cin: bool, size: usize) -> u64 {
         let bits = size * 8;
         let m = width_mask(size);
+        let (a, b) = (a & m, b & m);
         let r = a.wrapping_sub(b).wrapping_sub(u64::from(cin)) & m;
         self.flags.cf = u128::from(a) < u128::from(b) + u128::from(cin);
         let sign = 1u64 << (bits - 1);
@@ -1296,7 +1331,10 @@ impl<'a> Cpu<'a> {
         let dividend = self.dividend(size) as i128;
         let bits = (2 * size * 8).min(128) as u32;
         let dividend = (dividend << (128 - bits)) >> (128 - bits); // sign extend the 2*size byte value
-        let (q, r) = (dividend / divisor, dividend % divisor);
+        let (q, r) = (
+            dividend.checked_div(divisor)?,
+            dividend.checked_rem(divisor)?,
+        );
         self.store_quot_rem(size, q as u64, r as u64);
         Some(())
     }

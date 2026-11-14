@@ -1147,20 +1147,13 @@ fn hidden_image_at(space: &AddressSpace, base: usize, allocation_end: usize) -> 
     }
 
     let available = allocation_end.saturating_sub(base);
-
-    if available > MAX_IMAGE_SIZE {
-        return None;
-    }
-
     let mut header = vec![0u8; available.min(MAX_HEADER_READ)];
-
-    if !space.read_exact(base, &mut header) {
-        return None;
-    }
+    read_region(space, base, &mut header);
 
     let image_size = crate::pe::memory_image_size(&header).ok()?;
+    let mapped = image_size.checked_next_multiple_of(PAGE_SIZE)?;
 
-    (image_size <= available).then_some(available)
+    (mapped <= available).then_some(mapped)
 }
 
 fn regions_in_range(
@@ -1254,6 +1247,7 @@ fn is_readable(protect: u32) -> bool {
         PAGE_READONLY.0,
         PAGE_READWRITE.0,
         PAGE_WRITECOPY.0,
+        PAGE_EXECUTE.0,
         PAGE_EXECUTE_READ.0,
         PAGE_EXECUTE_READWRITE.0,
         PAGE_EXECUTE_WRITECOPY.0,

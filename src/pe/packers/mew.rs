@@ -537,14 +537,21 @@ fn unpack_encrypted(image: &PeImage<'_>, origin: &Origin<'_>) -> Option<Unpacked
             .for_each(|byte| *byte = decrypt(*byte));
         Some(file)
     });
+    let decrypted_in_memory = stub_decrypted(image.bytes().get(range.clone())?, decrypt);
     let finished = match &pristine {
         Some(pristine) => image.bytes().get(range.clone()) == pristine.get(range.clone()), // the stub decrypts in place, so a match with the decrypted file means it ran
-        None => loader_ran(image.bytes(), model),
+        None => decrypted_in_memory.unwrap_or_else(|| loader_ran(image.bytes(), model)),
     };
 
     let mut restored = image.bytes().to_vec();
     let version = if stock { "5" } else { MODIFIED_5 };
     let mut report = PackerReport::new(NAME, Some(version.to_owned()));
+    if pristine.is_none() && decrypted_in_memory.is_none() {
+        report
+            .unrestored
+            .push("code (could not tell whether the stub had decrypted it)");
+    }
+
     if !finished {
         let (code, source) = match &pristine {
             Some(pristine) => (
@@ -582,8 +589,9 @@ fn unpack_encrypted(image: &PeImage<'_>, origin: &Origin<'_>) -> Option<Unpacked
                 &mut &memory[..],
             )
         }); // mew 5 leaves the import table alone
-    if imports.is_some() {
-        report.restored.push("imports");
+    match imports {
+        Some(_) => report.restored.push("imports"),
+        None => report.unrestored.push("imports"),
     }
 
     let flags_at = section
@@ -614,6 +622,21 @@ fn unpack_encrypted(image: &PeImage<'_>, origin: &Origin<'_>) -> Option<Unpacked
         },
         fresh,
     })
+}
+
+fn stub_decrypted(section: &[u8], decrypt: impl Fn(u8) -> u8) -> Option<bool> {
+    let mut counts = [0usize; 256];
+    for byte in section {
+        counts[usize::from(*byte)] += 1;
+    }
+
+    let commonest = (0..=u8::MAX).max_by_key(|byte| counts[usize::from(*byte)])?;
+    match (commonest, decrypt(commonest)) {
+        (0, 0) => None,
+        (0, _) => Some(true),
+        (_, 0) => Some(false),
+        _ => None,
+    }
 }
 
 fn loader_ran(memory: &[u8], model: &PeModel) -> bool {

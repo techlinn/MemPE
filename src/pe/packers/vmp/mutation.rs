@@ -19,6 +19,7 @@ const MAX_INSNS: usize = 4_000; // a mutated function fits well under this and t
 const WINDOW: usize = 16; // longest x86 instruction
 const MIN_REAL_INSNS: usize = 4; // fewer than this is not a function worth reporting as recovered
 const MAX_TARGETS: usize = 50_000; // bound the survey work on a large image
+const MAX_CALL_PADDING: u64 = 2; // emu::resolve takes a return up to two bytes past the five byte call
 
 const STACK_WINDOW: i64 = 128;
 const WHOLE_STACK: u128 = u128::MAX;
@@ -157,7 +158,15 @@ fn layout(
                 FlowControl::UnconditionalBranch | FlowControl::IndirectBranch => break,
                 _ if payload.calls_in(&insn) => {
                     let back = payload.after_call(&insn); // the stub returns past its padding wherever the call now sits
-                    for _ in insn.next_ip()..back {
+                    let Some(padding) = back
+                        .checked_sub(insn.next_ip())
+                        .filter(|padding| *padding <= MAX_CALL_PADDING)
+                    else {
+                        complete = false;
+                        break;
+                    };
+
+                    for _ in 0..padding {
                         out.push(Instruction::with(Code::Nopd));
                     }
                     at = land(back);
@@ -419,17 +428,28 @@ fn successors(
 }
 
 fn step_stack(insn: &Instruction, width: i64) -> Option<i64> {
+    let signed = |value: u64| match width {
+        4 => i64::from(value as u32 as i32),
+        _ => value as i64,
+    };
+    let into_rsp = insn.op0_kind() == iced_x86::OpKind::Register
+        && insn.op0_register().full_register() == Register::RSP;
+
     match insn.mnemonic() {
-        Mnemonic::Push | Mnemonic::Pushf | Mnemonic::Pushfd | Mnemonic::Pushfq => {
-            return Some(-width);
-        }
-        Mnemonic::Pop | Mnemonic::Popf | Mnemonic::Popfd | Mnemonic::Popfq => return Some(width),
+        Mnemonic::Leave | Mnemonic::Enter => return None,
+        Mnemonic::Pop if into_rsp => return None,
+        Mnemonic::Push
+        | Mnemonic::Pushf
+        | Mnemonic::Pushfd
+        | Mnemonic::Pushfq
+        | Mnemonic::Pop
+        | Mnemonic::Popf
+        | Mnemonic::Popfd
+        | Mnemonic::Popfq => return Some(i64::from(insn.stack_pointer_increment())),
         Mnemonic::Lea if insn.memory_base().full_register() == Register::RSP => {
-            let into_rsp = insn.op0_kind() == iced_x86::OpKind::Register
-                && insn.op0_register().full_register() == Register::RSP;
             let simple = insn.memory_index() == Register::None;
             return match into_rsp && simple {
-                true => Some(insn.memory_displacement64() as i64),
+                true => Some(signed(insn.memory_displacement64())),
                 false => None,
             };
         }
@@ -444,8 +464,6 @@ fn step_stack(insn: &Instruction, width: i64) -> Option<i64> {
         return Some(0); // rsp only as the base of a memory operand or not named at all
     }
 
-    let into_rsp = insn.op0_kind() == iced_x86::OpKind::Register
-        && insn.op0_register().full_register() == Register::RSP;
     let by = matches!(
         insn.op1_kind(),
         iced_x86::OpKind::Immediate8
@@ -456,7 +474,7 @@ fn step_stack(insn: &Instruction, width: i64) -> Option<i64> {
             | iced_x86::OpKind::Immediate32
             | iced_x86::OpKind::Immediate32to64
     )
-    .then(|| insn.immediate(1) as i64);
+    .then(|| signed(insn.immediate(1)));
 
     match (insn.mnemonic(), into_rsp, by) {
         (Mnemonic::Sub, true, Some(amount)) => Some(-amount),
@@ -588,9 +606,21 @@ fn effect(
     if matches!(
         insn.flow_control(),
         FlowControl::Call | FlowControl::IndirectCall
-    ) && bits == 64
-    {
-        for register in [Register::RCX, Register::RDX, Register::R8, Register::R9] {
+    ) {
+        let arguments: &[Register] = match bits {
+            64 => &[
+                Register::RCX,
+                Register::RDX,
+                Register::R8,
+                Register::R9,
+                Register::RAX, // __chkstk and varargs
+                Register::R10,
+                Register::R11,
+            ],
+            _ => &[Register::EAX, Register::ECX, Register::EDX], // thiscall, fastcall, delphi register and _alloca_probe
+        };
+
+        for &register in arguments {
             if let Some((index, _)) = gpr_bytes(register) {
                 reads[index] |= read_mask(register);
             }

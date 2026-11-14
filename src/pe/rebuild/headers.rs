@@ -117,16 +117,24 @@ pub(super) fn write_core_header_fields(
 }
 
 fn rebuilt_image_size(model: &PeModel) -> AppResult<u32> {
+    let alignment = u64::from(model.section_alignment);
+    let declared_end = align_up_u64(u64::from(model.image_size), alignment)?;
+
     let maximum_end = model
         .sections
         .iter()
         .map(|section| {
-            u64::from(section.virtual_address.get())
-                + u64::from(section.virtual_size.max(section.raw_size))
+            let start = u64::from(section.virtual_address.get());
+            let widest = start + u64::from(section.span());
+
+            match widest <= declared_end {
+                true => widest,
+                false => start + u64::from(section.mapped_size()),
+            }
         })
         .max()
         .unwrap_or(0);
-    let aligned = align_up_u64(maximum_end, u64::from(model.section_alignment))?;
+    let aligned = align_up_u64(maximum_end, alignment)?;
     u32::try_from(aligned).map_err(|_| AppError::new("rebuilt image size exceeds u32"))
 }
 

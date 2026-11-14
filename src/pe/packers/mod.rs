@@ -158,7 +158,19 @@ pub(super) enum ImportedFunction {
 }
 
 pub(super) fn unpack(image: &PeImage<'_>, origin: &Origin<'_>) -> Option<Unpacked> {
-    UNPACKERS.iter().find_map(|unpack| unpack(image, origin))
+    let mut detected = None;
+
+    for unpack in UNPACKERS {
+        match unpack(image, origin) {
+            Some(unpacked) if unpacked.image.is_some() => return Some(unpacked),
+            Some(unpacked) => {
+                detected.get_or_insert(unpacked);
+            }
+            None => {}
+        }
+    }
+
+    detected
 }
 
 pub(super) fn find_pattern(haystack: &[u8], pattern: &str) -> Option<usize> {

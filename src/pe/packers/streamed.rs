@@ -509,7 +509,7 @@ fn stream_sections(
     let mut pieces = Vec::new();
     for piece in name_sections(starts, end, &hints) {
         let written = (piece.characteristics == CODE_SECTION)
-            .then(|| first_written_page(evidence, &piece, page))
+            .then(|| first_written_page(evidence, &piece, page, entry))
             .flatten(); // a program never writes its code, so where it wrote is merged data
         match written {
             Some(data) => {
@@ -532,10 +532,16 @@ fn stream_sections(
     pieces
 }
 
-fn first_written_page(evidence: &Evidence<'_>, piece: &SectionPiece, page: usize) -> Option<usize> {
+fn first_written_page(
+    evidence: &Evidence<'_>,
+    piece: &SectionPiece,
+    page: usize,
+    entry: usize,
+) -> Option<usize> {
     (piece.start..piece.end)
         .step_by(page)
         .skip(1)
+        .filter(|start| *start > entry)
         .find(|start| !evidence.untouched(*start..start.saturating_add(page).min(piece.end)))
 }
 

@@ -84,6 +84,7 @@ pub(crate) struct TargetProcess {
     pub(crate) main_module: Option<ModuleInfo>,
     pub(crate) modules: Vec<ModuleInfo>,
     pub(crate) module_listing_denied: bool,
+    pub(crate) main_module_unlisted: bool,
 }
 
 pub(crate) struct OwnedHandle(HANDLE);
@@ -157,10 +158,8 @@ pub(crate) fn query(pid: ProcessId) -> AppResult<TargetProcess> {
     let listing = get_modules(pid).map_err(|error| explain_denied_access(pid, error));
     let module_listing_denied = listing.is_err();
     let modules = listing.unwrap_or_default();
-    let main_module = match modules.is_empty() {
-        true => None,
-        false => Some(find_main_module(&path, &modules)?),
-    };
+    let main_module = find_main_module(&path, &modules);
+    let main_module_unlisted = main_module.is_none() && !modules.is_empty();
 
     Ok(TargetProcess {
         pid,
@@ -171,6 +170,7 @@ pub(crate) fn query(pid: ProcessId) -> AppResult<TargetProcess> {
         main_module,
         modules,
         module_listing_denied,
+        main_module_unlisted,
     })
 }
 
@@ -410,25 +410,12 @@ fn module_from_entry(entry: &MODULEENTRY32W) -> ModuleInfo {
     }
 }
 
-fn find_main_module(path: &Path, modules: &[ModuleInfo]) -> AppResult<ModuleInfo> {
-    if modules.is_empty() {
-        return Err(AppError::new("target has no modules"));
-    }
-
-    if let Some(module) = modules
+fn find_main_module(path: &Path, modules: &[ModuleInfo]) -> Option<ModuleInfo> {
+    modules
         .iter()
         .find(|module| paths_equal(&module.path, path))
         .or_else(|| find_by_basename(path, modules))
-    {
-        return Ok(module.clone());
-    }
-
-    Err(AppError::new(format!(
-        "no loaded module matches the target image {}; refusing to guess which of the {} mapped \
-         modules is the main image",
-        path.display(),
-        modules.len()
-    )))
+        .cloned()
 }
 
 fn find_by_basename<'a>(path: &Path, modules: &'a [ModuleInfo]) -> Option<&'a ModuleInfo> {

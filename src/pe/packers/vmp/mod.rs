@@ -8,11 +8,12 @@ use super::tables::{
     SECTION_COUNT_OFFSET, SECTION_RVA_OFFSET, SECTION_VIRTUAL_SIZE_OFFSET,
 };
 use super::{Origin, PackerFindings, PackerImports, PackerReport, Unpacked, find_patterns};
-use crate::pe::image::{read_u16, read_u32, write_u16, write_u32, write_u64};
+use crate::pe::image::{read_pointer, read_u16, read_u32, write_u16, write_u32, write_u64};
 use crate::pe::{
-    BASERELOC_DIRECTORY, DELAY_IMPORT_DIRECTORY, EXCEPTION_DIRECTORY, IAT_DIRECTORY,
-    IMPORT_DIRECTORY, LOAD_CONFIG_DIRECTORY, PeImage, PeKind, PeModel, RUNTIME_FUNCTION_SIZE, Rva,
-    SECTION_HEADER_SIZE, SECURITY_DIRECTORY, SectionModel, TLS_DIRECTORY,
+    BASERELOC_DIRECTORY, DEBUG_DIRECTORY, DELAY_IMPORT_DIRECTORY, EXCEPTION_DIRECTORY,
+    EXPORT_DIRECTORY, IAT_DIRECTORY, IMPORT_DIRECTORY, LOAD_CONFIG_DIRECTORY, PeImage, PeKind,
+    PeModel, RUNTIME_FUNCTION_SIZE, Rva, SECTION_HEADER_SIZE, SECURITY_DIRECTORY, SectionModel,
+    TLS_DIRECTORY,
 };
 
 const BSS_SECTION: u32 = 0x4000_0080; // readable uninitialized data
@@ -20,6 +21,20 @@ const MAX_IAT_IMAGE: usize = 1 << 30; // keep the grown image within the rebuild
 const MODULE_GAP: u64 = 0x1_0000; // api addresses this far apart get a zero slot between them
 
 const REL_CALL_LEN: usize = 5; // E8/E9 + rel32
+const VM_ENTRY_LEN: usize = 10; // push imm32 with the handler key then call into the vm
+const PUSH_IMM32: u8 = 0x68;
+const CALL_REL32: u8 = 0xE8;
+
+const EXPORT_TABLE_FIELDS: [usize; 4] = [12, 28, 32, 36]; // Name, AddressOfFunctions, AddressOfNames, AddressOfNameOrdinals
+const EXPORT_NAME_COUNT: usize = 24;
+const EXPORT_NAMES_RVA: usize = 32;
+const DELAY_LOOKUP_RVA: usize = 16;
+const TLS_POINTER_FIELDS: usize = 4; // raw data start and end, index, callbacks
+const DEBUG_ENTRY_SIZE: usize = 28;
+const DEBUG_RAW_DATA_RVA: usize = 20;
+const DELAY_DESCRIPTOR_SIZE: usize = 32;
+const DELAY_RVA_FIELDS: [usize; 5] = [4, 8, 12, 16, 20]; // name, module handle, iat, int, bound iat
+const MAX_TABLE_ENTRIES: usize = 4096;
 const MAX_STUB_SITES: usize = 200_000;
 const PACKED_ENTROPY: f64 = 6.5; // vmp payload sections are near random and the original code sits well below
 const ENTROPY_STEP: usize = 4; // sampling every few bytes is enough to tell packed from code
@@ -102,6 +117,17 @@ pub(super) fn unpack(image: &PeImage<'_>, origin: &Origin<'_>) -> Option<Unpacke
 
     let sites: Vec<Range<usize>> = code.iter().cloned().chain(demutated.code).collect();
     let (resolved, refused) = resolve_imports(&restored, model, &vm, &sites, &vm_code, origin);
+    let block = payload..vm.end;
+    let confirmed = !resolved.is_empty()
+        || demutated.mutated > 0
+        || vmp_section_name(model)
+        || vm_entry(image.bytes(), model, &block);
+    if !confirmed {
+        let reason =
+            "image (the layout looks like vmp, but nothing confirmed it, so it was left as it is)";
+        return Some(Unpacked::detected_only(NAME, None, reason));
+    }
+
     let imports = rebuild_imports(&mut restored, model, &resolved, origin.base);
     match imports {
         Some(_) => report.restored.push("imports"),
@@ -145,9 +171,24 @@ pub(super) fn unpack(image: &PeImage<'_>, origin: &Origin<'_>) -> Option<Unpacke
         ),
     }
 
-    let block = payload..vm.end;
-    if evacuate(&mut restored, model, &(0..payload), &block) {
-        if let Some((dropped, kept)) = drop_vm_relocations(&mut restored, model, &block)
+    if !evacuate(&mut restored, model, &(0..payload), &block) {
+        report
+            .unrestored
+            .push("vmp's sections (a table they hold had nowhere to move to)");
+    } else {
+        let referenced = table_references(&restored, model, origin.base);
+        let sections = vmp_sections(model, &block);
+        let (pinned, unused): (Vec<_>, Vec<_>) = sections
+            .iter()
+            .cloned()
+            .partition(|section| referenced.iter().any(|rva| section.contains(rva)));
+        if !pinned.is_empty() {
+            report.unrestored.push(
+                "some of vmp's sections (a table moved out of them still points at data they hold)",
+            );
+        }
+
+        if let Some((dropped, kept)) = drop_vm_relocations(&mut restored, model, &sections) // a kept section's fixups are still vmp's own
             && dropped > 0
         {
             report.notes.push(match kept {
@@ -160,17 +201,13 @@ pub(super) fn unpack(image: &PeImage<'_>, origin: &Origin<'_>) -> Option<Unpacke
             });
         }
 
-        let dropped = shed(&mut restored, model, &block);
+        let dropped = shed(&mut restored, model, &unused);
         if dropped > 0 {
             report.notes.push(format!(
                 "{} KiB of vmp's own sections dropped from the file, their pages left mapped and empty",
                 dropped / 1024
             ));
         }
-    } else {
-        report
-            .unrestored
-            .push("vmp's sections (a table they hold had nowhere to move to)");
     }
 
     report.lost.push(if demutated.written < demutated.mutated {
@@ -462,10 +499,119 @@ fn evacuate(
     true
 }
 
+fn table_references(restored: &[u8], model: &PeModel, base: usize) -> Vec<usize> {
+    let directory = |index: usize| {
+        model
+            .directory(restored, index)
+            .ok()
+            .flatten()
+            .map(|data| (data.rva().as_usize(), data.size() as usize))
+    };
+    let rva_at = |at: usize| read_u32(restored, at).ok().map(|rva| rva as usize);
+    let pointer_at = |at: usize| {
+        read_pointer(restored, at, model.kind())
+            .ok()
+            .and_then(|address| address.checked_sub(base))
+    };
+    let width = model.kind().pointer_width();
+    let mut found = Vec::new();
+
+    if let Some((at, _)) = directory(EXPORT_DIRECTORY) {
+        found.extend(
+            EXPORT_TABLE_FIELDS
+                .iter()
+                .filter_map(|field| rva_at(at.saturating_add(*field))),
+        );
+
+        let names = rva_at(at.saturating_add(EXPORT_NAMES_RVA)).unwrap_or(0);
+        let count = rva_at(at.saturating_add(EXPORT_NAME_COUNT)).unwrap_or(0);
+        found.extend(
+            (0..count.min(MAX_TABLE_ENTRIES))
+                .filter_map(|index| rva_at(names.saturating_add(index * 4))),
+        );
+    }
+
+    if let Some((at, _)) = directory(TLS_DIRECTORY) {
+        found.extend(
+            (0..TLS_POINTER_FIELDS)
+                .filter_map(|field| pointer_at(at.saturating_add(field * width))),
+        );
+    }
+
+    if let Some((at, size)) = directory(DEBUG_DIRECTORY) {
+        found.extend(
+            (0..(size / DEBUG_ENTRY_SIZE).min(MAX_TABLE_ENTRIES)).filter_map(|index| {
+                rva_at(at.saturating_add(index * DEBUG_ENTRY_SIZE + DEBUG_RAW_DATA_RVA))
+            }),
+        );
+    }
+
+    if let Some((at, size)) = directory(DELAY_IMPORT_DIRECTORY) {
+        for index in 0..(size / DELAY_DESCRIPTOR_SIZE).min(MAX_TABLE_ENTRIES) {
+            let descriptor = at.saturating_add(index * DELAY_DESCRIPTOR_SIZE);
+            found.extend(
+                DELAY_RVA_FIELDS
+                    .iter()
+                    .filter_map(|field| rva_at(descriptor.saturating_add(*field))),
+            );
+
+            let lookups = rva_at(descriptor.saturating_add(DELAY_LOOKUP_RVA)).unwrap_or(0);
+            found.extend(
+                (0..MAX_TABLE_ENTRIES)
+                    .map_while(|slot| {
+                        read_pointer(restored, lookups.saturating_add(slot * width), model.kind())
+                            .ok()
+                            .filter(|entry| *entry != 0)
+                    })
+                    .filter(|entry| entry >> (width * 8 - 1) == 0), // the top bit marks an ordinal
+            );
+        }
+    }
+
+    found
+}
+
+fn vmp_sections(model: &PeModel, block: &Range<usize>) -> Vec<Range<usize>> {
+    model
+        .sections()
+        .iter()
+        .map(|section| {
+            let start = section.virtual_address().as_usize();
+            start..start.saturating_add(section.span() as usize)
+        })
+        .filter(|section| block.contains(&section.start))
+        .collect()
+}
+
+fn vmp_section_name(model: &PeModel) -> bool {
+    model
+        .sections()
+        .iter()
+        .any(|section| section.name().starts_with(b".vmp"))
+}
+
+fn vm_entry(bytes: &[u8], model: &PeModel, block: &Range<usize>) -> bool {
+    let Ok(entry) = read_u32(bytes, model.entry_point_offset) else {
+        return false;
+    };
+    let entry = entry as usize;
+    let Some(code) = bytes.get(entry..entry.saturating_add(VM_ENTRY_LEN)) else {
+        return false;
+    };
+    if code[0] != PUSH_IMM32 || code[5] != CALL_REL32 {
+        return false;
+    }
+
+    let rel = i32::from_le_bytes([code[6], code[7], code[8], code[9]]);
+    (entry + VM_ENTRY_LEN)
+        .checked_add_signed(rel as isize)
+        .is_some_and(|target| block.contains(&target))
+}
+
 fn drop_vm_relocations(
     restored: &mut [u8],
     model: &PeModel,
-    block: &Range<usize>,
+    sections: &[Range<usize>],
 ) -> Option<(usize, usize)> {
     let entry = model.directory_offset(BASERELOC_DIRECTORY).ok()??;
     let rva = read_u32(restored, entry).ok()? as usize;
@@ -483,7 +629,7 @@ fn drop_vm_relocations(
             break; // a malformed tail is left where it is for the rebuild to judge
         }
 
-        match block.contains(&page) {
+        match sections.iter().any(|section| section.contains(&page)) {
             true => dropped += 1,
             false => {
                 blocks += 1;
@@ -507,12 +653,12 @@ fn drop_vm_relocations(
     Some((dropped, blocks))
 }
 
-fn shed(restored: &mut [u8], model: &PeModel, block: &Range<usize>) -> usize {
+fn shed(restored: &mut [u8], model: &PeModel, unused: &[Range<usize>]) -> usize {
     let mut dropped = 0;
 
     for section in model.sections() {
         let start = section.virtual_address().as_usize();
-        if !block.contains(&start) {
+        if !unused.iter().any(|range| range.start == start) {
             continue;
         }
 

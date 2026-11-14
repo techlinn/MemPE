@@ -141,6 +141,12 @@ fn render_target(console: &Console, target: &TargetProcess) {
         ));
     }
 
+    if target.main_module_unlisted {
+        console.warning(format_args!(
+            "No module in the loader list matches the target image, so the main image is found from mapped files; the target may have edited its module list"
+        ));
+    }
+
     console.blank();
 }
 

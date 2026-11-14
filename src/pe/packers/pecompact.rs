@@ -16,7 +16,7 @@ use super::tables::{
 };
 use super::{
     ImportedFunction, ModuleImports, Origin, PackerFindings, PackerImports, PackerReport, Unpacked,
-    find_pattern,
+    find_pattern, pattern_at,
 };
 use crate::pe::image::{read_u16, read_u32, write_u32};
 use crate::pe::parse::{parse_disk_image, parse_memory_image};
@@ -33,6 +33,7 @@ const HANDLER_BODY: &str = "8B 54 24 04 8B 52 0C C6 02 E9 83 C2 05 2B CA 89 4A F
 const HANDLER_PREFIX: usize = 0x0E; // mov eax, lea ecx and mov [ecx+1], eax come before the body
 const PACKER_SECTIONS: usize = 2; // the loader lives in the last section, or the one before a new .reloc
 const STUB_CODE: usize = 0x18;
+const ENTRY_STUB: &str = "B8 ?? ?? ?? ?? 50 64 FF 35 00 00 00 00"; // mov eax, handler then the seh frame push
 const STUB_REBASED: usize = 5; // mov eax, handler is fixed up by the loader
 const STUB_MARKERS: [&[u8]; 2] = [b"PECompact2\0", b"PEC2\0"];
 const LOADER_INFO_SIZE: usize = 0x24; // the loader's parameters sit right before the handler
@@ -177,7 +178,7 @@ fn restore(
     let stub = packed.host_field(HOST_STUB)?;
     let stub_code = stub.checked_add(STUB_REBASED)?..stub.checked_add(STUB_CODE)?;
     let unpacked = match packed.in_memory {
-        true => original.is_none(), // the packed data only decodes until the loader unpacks over it
+        true => original.is_none() && !pattern_at(image.bytes(), stub, ENTRY_STUB), // the packed data only decodes until the loader unpacks over it, and it restores the stub last
         false => restored.get(stub_code.clone()) != packed.mapped.get(stub_code), // the loader writes over the stub last
     };
 

@@ -264,12 +264,13 @@ fn parse_exports(base: usize, bytes: &[u8], fallback_name: Option<&str>) -> Opti
     let header = export_header(&image, bytes)?;
     let embedded = read_u32(bytes, header.directory_rva as usize + 12)
         .and_then(|rva| read_ascii(bytes, rva as usize));
-    let module = normalize_module(
-        embedded
-            .as_deref()
-            .or(fallback_name)
-            .unwrap_or("unknown.dll"),
-    );
+    let loaded_as = fallback_name.map(normalize_module);
+    let module = match (embedded.as_deref().map(normalize_module), loaded_as) {
+        (Some(embedded), Some(loaded)) if embedded.eq_ignore_ascii_case(&loaded) => embedded,
+        (_, Some(loaded)) => loaded,
+        (Some(embedded), None) => embedded,
+        (None, None) => normalize_module("unknown.dll"),
+    };
 
     let names = export_names(bytes, &header)?;
 

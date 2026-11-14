@@ -38,6 +38,7 @@ const MOV_LOAD_LENGTH: usize = 7;
 const MOV_REX_W: u8 = 0x48;
 const MOV_REX_WR: u8 = 0x4C;
 const MOV_LOAD_OPCODE: u8 = 0x8B;
+const MOV_EAX_MOFFS: u8 = 0xA1;
 const MODRM_RIP_MASK: u8 = 0xC7;
 const MODRM_RIP_VALUE: u8 = 0x05;
 
@@ -674,9 +675,13 @@ fn scan_import_range(
     let width = kind.pointer_width();
     let aligned_start = start.saturating_add((width - start % width) % width);
     let mut offset = aligned_start;
+    let declared = !matches!(source, ImportSource::Scanned);
+    let mut hole = None;
 
     while offset.saturating_add(width) <= end && plan.recovered < MAX_IMPORTS {
         let run_start = offset;
+        let after_hole = declared && hole.is_some_and(|hole: usize| hole + width == run_start);
+        let mut before_hole = false;
         let mut entries = Vec::<SlotCandidate>::new();
         while offset.saturating_add(width) <= end && entries.len() < MAX_IMPORTS {
             let Some(value) = read_pointer(memory, offset, width) else {
@@ -690,11 +695,15 @@ fn scan_import_range(
             let Ok((symbol, ambiguous, aliased)) =
                 resolve_value(memory, observed_base, kind, value, exports)
             else {
+                hole = Some(offset);
+                before_hole = declared && value != 0;
                 break;
             };
 
             if ambiguous {
                 plan.ambiguous_slots.insert(slot);
+                hole = Some(offset);
+                before_hole = declared;
                 break;
             }
 
@@ -714,7 +723,14 @@ fn scan_import_range(
                 == Some(0);
         let ends_cleanly = read_pointer(memory, offset, width) == Some(0) || offset == end;
 
-        if entries.len() >= minimum && starts_cleanly && ends_cleanly {
+        let beside_hole = (after_hole && !starts_cleanly) || (before_hole && !ends_cleanly);
+        let needed = match beside_hole {
+            true => minimum.max(SCANNED_MINIMUM_ENTRIES),
+            false => minimum,
+        };
+        let bounded = (starts_cleanly || after_hole) && (ends_cleanly || before_hole);
+
+        if entries.len() >= needed && bounded {
             record_mixed_module_run(plan, &entries);
             append_groups(entries, width, minimum, source, referenced, plan);
         }
@@ -923,6 +939,33 @@ fn find_referenced_slots(image: &PeImage<'_>, observed_base: usize) -> BTreeMap<
     slots
 }
 
+fn decode_x86_load(
+    memory: &[u8],
+    observed_base: usize,
+    instruction: usize,
+) -> Option<(u32, Reference)> {
+    let code = memory.get(instruction..)?;
+    let operand = match *code.first()? {
+        MOV_EAX_MOFFS => code.get(1..5)?,
+        MOV_LOAD_OPCODE if *code.get(1)? & MODRM_RIP_MASK == MODRM_RIP_VALUE => code.get(2..6)?, // mov esi, [__imp_x] then call esi
+        _ => return None,
+    };
+
+    let address = u32::from_le_bytes(operand.try_into().ok()?) as usize;
+    let slot = address.checked_sub(observed_base)?;
+    if !slot.is_multiple_of(4) {
+        return None;
+    }
+
+    let held = read_pointer(memory, slot, 4)?;
+    let image = observed_base..observed_base.saturating_add(memory.len());
+    if held == 0 || image.contains(&held) {
+        return None;
+    }
+
+    Some((u32::try_from(slot).ok()?, Reference::Loaded))
+}
+
 fn decode_slot_reference(
     memory: &[u8],
     observed_base: usize,
@@ -947,7 +990,7 @@ fn decode_slot_reference(
     }
 
     if kind != PeKind::Pe32Plus {
-        return None;
+        return decode_x86_load(memory, observed_base, instruction);
     }
 
     let code = memory.get(instruction..instruction.checked_add(MOV_LOAD_LENGTH)?)?;

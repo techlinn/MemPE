@@ -1,8 +1,9 @@
 use super::{SectionLayout, rva_to_file};
 use crate::pe::image::{read_u16, read_u32, write_u16, write_u32};
 use crate::pe::{
-    BASERELOC_DIRECTORY, DEBUG_DIRECTORY, DYNAMIC_BASE, FILE_CHARACTERISTICS_OFFSET, PeKind,
-    PeModel, RELOCATION_DIR64, RELOCATION_HIGHLOW, RELOCS_STRIPPED, SECURITY_DIRECTORY,
+    BASERELOC_DIRECTORY, DEBUG_DIRECTORY, DELAY_IMPORT_DIRECTORY, DYNAMIC_BASE,
+    FILE_CHARACTERISTICS_OFFSET, IMPORT_DIRECTORY, PeKind, PeModel, RELOCATION_DIR64,
+    RELOCATION_HIGHLOW, RELOCS_STRIPPED, RESOURCE_DIRECTORY, SECURITY_DIRECTORY, TLS_DIRECTORY,
 };
 use crate::{AppError, AppResult};
 
@@ -16,6 +17,12 @@ const DEBUG_ENTRY_RAW_RVA: usize = 20;
 const DEBUG_ENTRY_RAW_POINTER: usize = 24;
 const MAX_DEBUG_ENTRIES: usize = 256;
 const DIRECTORY_COUNT: usize = 16;
+const SIZE_IGNORED_DIRECTORIES: [usize; 4] = [
+    IMPORT_DIRECTORY,
+    RESOURCE_DIRECTORY,
+    TLS_DIRECTORY,
+    DELAY_IMPORT_DIRECTORY,
+];
 
 const DIRECTORY_NAMES: [&str; DIRECTORY_COUNT] = [
     "Export",
@@ -123,6 +130,15 @@ pub(super) fn clear_bad_directories(
             && directory_is_mapped(rva, size, layouts, header_size)
             && (index != BASERELOC_DIRECTORY
                 || relocations_are_walkable(output, model, layouts, header_size, rva, size));
+
+        let room = (!valid && size != 0 && SIZE_IGNORED_DIRECTORIES.contains(&index))
+            .then(|| room_after(rva, layouts, header_size))
+            .flatten();
+        if let Some(room) = room {
+            write_directory(output, model, index, rva, room)?;
+            continue;
+        }
+
         if !valid {
             write_directory(output, model, index, 0, 0)?;
             cleared.record(index);
@@ -277,6 +293,22 @@ pub(super) fn clear_dynamic_base(output: &mut [u8], model: &PeModel) -> AppResul
     )?;
 
     Ok(true)
+}
+
+fn room_after(rva: u32, layouts: &[SectionLayout<'_>], header_size: usize) -> Option<u32> {
+    let start = rva as usize;
+    let end = match start < header_size {
+        true => header_size,
+        false => layouts.iter().find_map(|layout| {
+            let section_start = layout.model.virtual_address.get() as usize;
+            let section_end = section_start.saturating_add(layout.source_length);
+            (section_start..section_end)
+                .contains(&start)
+                .then_some(section_end)
+        })?,
+    };
+
+    u32::try_from(end - start).ok()
 }
 
 fn directory_is_mapped(
