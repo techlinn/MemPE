@@ -16,6 +16,9 @@ const LOAD_CONFIG_TIMESTAMP_OFFSET: usize = 4;
 const LOAD_CONFIG_COOKIE_PE32: usize = 0x3C;
 const LOAD_CONFIG_COOKIE_PE32_PLUS: usize = 0x58;
 const LOAD_CONFIG_HANDLERS_PE32: usize = 0x40; // safeseh table, then its count
+const LOAD_CONFIG_HANDLERS_PE32_PLUS: usize = 0x60;
+const LOAD_CONFIG_HANDLERS_END_PE32_PLUS: usize = 0x70;
+const LOAD_CONFIG_VERSION_OFFSET: usize = 8; // major and minor version, which linkers leave zero
 const MAX_SAFESEH_HANDLERS: u32 = 0x10000;
 const MAX_LOAD_CONFIG_SIZE: u32 = 0x400;
 const LOAD_CONFIG_DIRECTORY_SIZE: usize = 0x40; // msvc PE32 value, the loader reads the struct's own size
@@ -38,14 +41,8 @@ pub(crate) fn recover_directories(
 
     if lost(restored, LOAD_CONFIG_DIRECTORY)
         && let Some(rva) = find_load_config(restored, model.kind(), base, end)
-        && set_directory(
-            restored,
-            model,
-            LOAD_CONFIG_DIRECTORY,
-            rva,
-            LOAD_CONFIG_DIRECTORY_SIZE,
-        )
-        .is_some()
+        && let Some(size) = load_config_directory_size(restored, model.kind(), rva)
+        && set_directory(restored, model, LOAD_CONFIG_DIRECTORY, rva, size).is_some()
     {
         report.restored.push("load config");
     }
@@ -173,8 +170,44 @@ fn find_load_config(bytes: &[u8], kind: PeKind, base: usize, end: usize) -> Opti
             && size.is_multiple_of(4)
             && read_u32(bytes, at.saturating_add(LOAD_CONFIG_TIMESTAMP_OFFSET)) == Ok(0)
             && cookie.is_some_and(in_image)
-            && (matches!(kind, PeKind::Pe32Plus) || safeseh_fits(bytes, *at, in_image))
+            && match kind {
+                PeKind::Pe32 => safeseh_fits(bytes, *at, in_image),
+                PeKind::Pe32Plus => x64_fields_fit(bytes, *at, size as usize, cookie, base),
+            }
     }))
+}
+
+pub(crate) fn load_config_length(bytes: &[u8], rva: usize, declared: usize) -> usize {
+    let own = read_u32(bytes, rva).map_or(0, |size| size.min(MAX_LOAD_CONFIG_SIZE));
+    declared.max(own as usize) // a PE32 directory says 0x40 however long the struct is
+}
+
+fn load_config_directory_size(bytes: &[u8], kind: PeKind, rva: usize) -> Option<usize> {
+    match kind {
+        PeKind::Pe32 => Some(LOAD_CONFIG_DIRECTORY_SIZE),
+        PeKind::Pe32Plus => read_u32(bytes, rva).ok().map(|size| size as usize), // x64 linkers write the struct's own size
+    }
+}
+
+fn x64_fields_fit(
+    bytes: &[u8],
+    at: usize,
+    size: usize,
+    cookie: Option<usize>,
+    base: usize,
+) -> bool {
+    let pointer = |offset: usize| read_pointer(bytes, at.saturating_add(offset), PeKind::Pe32Plus);
+    let no_handlers = size < LOAD_CONFIG_HANDLERS_END_PE32_PLUS
+        || (pointer(LOAD_CONFIG_HANDLERS_PE32_PLUS) == Ok(0)
+            && pointer(LOAD_CONFIG_HANDLERS_PE32_PLUS + 8) == Ok(0)); // safeseh does not exist on x64
+    let seeded = cookie
+        .filter(|cookie| cookie.is_multiple_of(8))
+        .and_then(|cookie| cookie.checked_sub(base))
+        .is_some_and(|rva| {
+            read_pointer(bytes, rva, PeKind::Pe32Plus).is_ok_and(|value| value != 0)
+        });
+
+    read_u32(bytes, at.saturating_add(LOAD_CONFIG_VERSION_OFFSET)) == Ok(0) && no_handlers && seeded
 }
 
 fn safeseh_fits(bytes: &[u8], at: usize, in_image: impl Fn(usize) -> bool) -> bool {

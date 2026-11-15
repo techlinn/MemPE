@@ -2,7 +2,7 @@ use super::{SectionLayout, rva_to_file};
 use crate::pe::image::{read_u16, read_u32, write_u16, write_u32};
 use crate::pe::{
     BASERELOC_DIRECTORY, DEBUG_DIRECTORY, DELAY_IMPORT_DIRECTORY, DYNAMIC_BASE,
-    FILE_CHARACTERISTICS_OFFSET, IMPORT_DIRECTORY, PeKind, PeModel, RELOCATION_DIR64,
+    FILE_CHARACTERISTICS_OFFSET, IAT_DIRECTORY, IMPORT_DIRECTORY, PeModel, RELOCATION_DIR64,
     RELOCATION_HIGHLOW, RELOCS_STRIPPED, RESOURCE_DIRECTORY, SECURITY_DIRECTORY, TLS_DIRECTORY,
 };
 use crate::{AppError, AppResult};
@@ -11,18 +11,27 @@ const RELOCATION_BLOCK_HEADER: usize = 8;
 const RELOCATION_ABSOLUTE: u16 = 0;
 const RELOCATION_HIGH: u16 = 1;
 const RELOCATION_LOW: u16 = 2;
+const RELOCATION_HIGH_ADJUST: u16 = 4; // its low half sits in the next entry
+const APPLIED_RELOCATIONS: [u16; 5] = [
+    RELOCATION_HIGH,
+    RELOCATION_LOW,
+    RELOCATION_HIGHLOW,
+    RELOCATION_HIGH_ADJUST,
+    RELOCATION_DIR64,
+]; // the loader applies all of these whatever the image's bitness
 const MAX_RELOCATION_BLOCKS: usize = 65_536;
 const DEBUG_ENTRY_SIZE: usize = 28;
 const DEBUG_ENTRY_RAW_RVA: usize = 20;
 const DEBUG_ENTRY_RAW_POINTER: usize = 24;
 const MAX_DEBUG_ENTRIES: usize = 256;
 const DIRECTORY_COUNT: usize = 16;
-const SIZE_IGNORED_DIRECTORIES: [usize; 4] = [
+const SIZE_IGNORED_DIRECTORIES: [usize; 5] = [
     IMPORT_DIRECTORY,
     RESOURCE_DIRECTORY,
     TLS_DIRECTORY,
+    IAT_DIRECTORY,
     DELAY_IMPORT_DIRECTORY,
-];
+]; // the loader walks these to their terminators, and only unprotects the iat by its size
 
 const DIRECTORY_NAMES: [&str; DIRECTORY_COUNT] = [
     "Export",
@@ -129,7 +138,7 @@ pub(super) fn clear_bad_directories(
         let valid = index != SECURITY_DIRECTORY
             && directory_is_mapped(rva, size, layouts, header_size)
             && (index != BASERELOC_DIRECTORY
-                || relocations_are_walkable(output, model, layouts, header_size, rva, size));
+                || relocations_are_walkable(output, layouts, header_size, rva, size));
 
         let room = (!valid && size != 0 && SIZE_IGNORED_DIRECTORIES.contains(&index))
             .then(|| room_after(rva, layouts, header_size))
@@ -150,7 +159,6 @@ pub(super) fn clear_bad_directories(
 
 fn relocations_are_walkable(
     output: &[u8],
-    model: &PeModel,
     layouts: &[SectionLayout<'_>],
     header_size: usize,
     rva: u32,
@@ -161,11 +169,6 @@ fn relocations_are_walkable(
     };
 
     let end = start.saturating_add(size as usize);
-    let expected: &[u16] = match model.kind {
-        PeKind::Pe32 => &[RELOCATION_HIGHLOW, RELOCATION_HIGH, RELOCATION_LOW],
-        PeKind::Pe32Plus => &[RELOCATION_DIR64],
-    };
-
     let mut cursor = start;
     let mut fixups = 0usize;
     for _block in 0..MAX_RELOCATION_BLOCKS {
@@ -189,7 +192,9 @@ fn relocations_are_walkable(
             return false;
         }
 
-        for index in 0..block_size.saturating_sub(RELOCATION_BLOCK_HEADER) / 2 {
+        let entries = block_size.saturating_sub(RELOCATION_BLOCK_HEADER) / 2;
+        let mut index = 0usize;
+        while index < entries {
             let offset = cursor
                 .saturating_add(RELOCATION_BLOCK_HEADER)
                 .saturating_add(index.saturating_mul(2));
@@ -198,13 +203,22 @@ fn relocations_are_walkable(
             };
 
             let kind = entry >> 12;
+            index = index.saturating_add(1);
 
             if kind == RELOCATION_ABSOLUTE {
                 continue;
             }
 
-            if !expected.contains(&kind) {
+            if !APPLIED_RELOCATIONS.contains(&kind) {
                 return false;
+            }
+
+            if kind == RELOCATION_HIGH_ADJUST {
+                if index >= entries {
+                    return false;
+                }
+
+                index = index.saturating_add(1);
             }
 
             fixups = fixups.saturating_add(1);

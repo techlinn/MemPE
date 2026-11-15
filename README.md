@@ -96,7 +96,7 @@ mempe snapshots the process, finds every module plus any PE hiding in non-image 
 | Enigma Protector | Planned | - |
 | Enigma Virtual Box | Planned | - |
 | Obsidium | Planned | - |
-| Themida / WinLicense | Planned | - |
+| Themida / WinLicense | Supported | 3.1.8 and 3.2.4, x86 and x64 |
 | Code Virtualizer | Planned | - |
 | Anything else | Generic dump | Any |
 

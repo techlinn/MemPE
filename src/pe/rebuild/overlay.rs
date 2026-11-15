@@ -9,20 +9,55 @@ use crate::{AppError, AppResult};
 const CERTIFICATE_HEADER: usize = 8;
 const CERTIFICATE_REVISION_OFFSET: usize = 4;
 const CERTIFICATE_REVISION: u16 = 0x0200;
-const CERTIFICATE_ALIGNMENT: usize = 8;
+const STANDARD_RAW_ALIGNMENT: u64 = 0x200; // the loader rounds a standard image's raw pointers down to this
 
-pub(crate) fn overlay_offset(disk_headers: &[u8]) -> Option<u64> {
+pub(crate) struct OverlayStart {
+    pub(crate) offset: u64,
+    padding: usize, // bytes up to the file alignment, which belong to the last section when they are all zero
+}
+
+impl OverlayStart {
+    pub(crate) fn without_padding(&self, mut overlay: Vec<u8>) -> Vec<u8> {
+        let padding = self.padding.min(overlay.len());
+
+        if overlay
+            .get(..padding)
+            .is_some_and(|bytes| bytes.iter().all(|byte| *byte == 0))
+        {
+            overlay.drain(..padding);
+        }
+
+        overlay
+    }
+}
+
+pub(crate) fn overlay_offset(disk_headers: &[u8]) -> Option<OverlayStart> {
     let image = parse_disk_image(disk_headers).ok()?;
     let model = image.model();
-    let alignment = u64::from(model.file_alignment.max(1));
+    let headers = u64::from(read_u32(disk_headers, model.size_of_headers_offset).ok()?);
+    let alignment = u64::from(model.file_alignment);
+    let rounding = match model.is_low_alignment() {
+        true => 1,
+        false => STANDARD_RAW_ALIGNMENT,
+    };
 
-    model
+    let (data_end, padded_end) = model
         .sections()
         .iter()
+        .filter(|section| section.raw_size != 0)
         .map(|section| {
-            u64::from(section.raw_pointer) + u64::from(section.raw_size).next_multiple_of(alignment)
+            let start = u64::from(section.raw_pointer) / rounding * rounding;
+            let raw = u64::from(section.raw_size);
+            (start + raw, start + raw.next_multiple_of(alignment))
         })
-        .max() // the loader maps raw data up to the file alignment
+        .max()
+        .unwrap_or((0, 0));
+
+    let offset = data_end.max(headers);
+    Some(OverlayStart {
+        offset,
+        padding: usize::try_from(padded_end.saturating_sub(offset)).ok()?,
+    })
 }
 
 pub(crate) fn append_overlay(rebuilt: &mut RebuiltImage, overlay: &[u8]) -> AppResult<()> {
@@ -37,14 +72,19 @@ pub(crate) fn append_overlay(rebuilt: &mut RebuiltImage, overlay: &[u8]) -> AppR
         ));
     }
 
+    let has_slot = model.directory_offset(SECURITY_DIRECTORY)?.is_some(); // with no slot the packed file could not register them either
+    let certificate = match certificate_table_length(overlay).filter(|_| has_slot) {
+        Some(length) => Some((
+            u32::try_from(start).map_err(|_| AppError::new("overlay offset overflowed"))?,
+            length,
+        )),
+        None => None,
+    };
+
     rebuilt.bytes.resize(start, 0);
     rebuilt.bytes.extend_from_slice(overlay);
 
-    if let Some(length) = certificate_table_length(overlay)
-        && start.is_multiple_of(CERTIFICATE_ALIGNMENT)
-    {
-        let offset =
-            u32::try_from(start).map_err(|_| AppError::new("overlay offset overflowed"))?;
+    if let Some((offset, length)) = certificate {
         write_directory(
             &mut rebuilt.bytes,
             &model,

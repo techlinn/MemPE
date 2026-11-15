@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 
-use crate::pe::exports::{ExportIndex, ResolvedExport, embedded_module_name};
+use crate::pe::exports::{ExportIndex, ResolvedExport, embedded_module_name, is_api_set};
 use crate::pe::image;
-use crate::pe::packers::{ImportedFunction, ModuleImports};
+use crate::pe::packers::{ImportedFunction, ModuleImports, NameHint, NameHints};
 use crate::pe::{
     DELAY_IMPORT_DIRECTORY, IAT_DIRECTORY, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ,
     IMAGE_SCN_MEM_WRITE, IMPORT_DIRECTORY, LOAD_CONFIG_DIRECTORY, PeImage, PeKind, Rva,
@@ -56,6 +56,7 @@ pub(super) struct ImportEntry {
 
 struct SlotCandidate {
     slot: u32,
+    value: usize,
     symbol: ResolvedExport,
     aliased: bool,
 }
@@ -98,6 +99,8 @@ pub(super) struct ImportPlan {
     pub(super) unrepresentable: usize,
     pub(super) keep_iat_directory: bool,
     pub(super) existing: Vec<u8>,
+    pub(super) rejected_descriptors: usize,
+    name_hints: NameHints,
     own: Option<String>,
     ambiguous_slots: BTreeSet<u32>,
     unbound_delay_slots: BTreeSet<u32>,
@@ -166,7 +169,7 @@ pub(super) fn build_restored_plan(
                 );
             }
         }
-        None => plan.existing = existing_descriptors(image).unwrap_or_default(),
+        None => (plan.existing, plan.rejected_descriptors) = read_descriptors(image),
     }
 
     scan_delay_imports(image, observed_base, exports, &referenced, &mut plan);
@@ -179,9 +182,11 @@ pub(super) fn build_iat_plan(
     observed_base: usize,
     exports: &ExportIndex,
     iat: (u32, u32),
+    names: &NameHints,
 ) -> ImportPlan {
     let mut plan = ImportPlan {
         keep_iat_directory: true,
+        name_hints: names.clone(),
         ..ImportPlan::default()
     };
 
@@ -707,8 +712,20 @@ fn scan_import_range(
                 break;
             }
 
+            let hinted = plan.name_hints.get(&slot).and_then(|hint| match hint {
+                NameHint::Length(length) => exports
+                    .resolve_fitting(value, |name| length.contains(&name))
+                    .cloned(), // the one alias as long as the name the linker wrote
+                NameHint::Ordinal(ordinal) => exports.resolve_ordinal(value, *ordinal),
+            });
+            let (symbol, aliased) = match hinted {
+                Some(hinted) => (hinted, false),
+                None => (symbol, aliased),
+            };
+
             entries.push(SlotCandidate {
                 slot,
+                value,
                 symbol,
                 aliased,
             });
@@ -731,6 +748,7 @@ fn scan_import_range(
         let bounded = (starts_cleanly || after_hole) && (ends_cleanly || before_hole);
 
         if entries.len() >= needed && bounded {
+            settle_run_module(&mut entries, exports);
             record_mixed_module_run(plan, &entries);
             append_groups(entries, width, minimum, source, referenced, plan);
         }
@@ -805,6 +823,7 @@ fn recover_referenced_imports(
 
         entries.push(SlotCandidate {
             slot,
+            value,
             symbol,
             aliased,
         });
@@ -893,6 +912,13 @@ fn neighbor_shares_module(
         .filter_map(|neighbor| read_pointer(memory, neighbor as usize, width))
         .filter_map(|value| resolve_value(memory, observed_base, kind, value, exports).ok())
         .any(|(symbol, _, _)| symbol.module.eq_ignore_ascii_case(module))
+}
+
+pub(super) fn code_referenced_slots(image: &PeImage<'_>, observed_base: usize) -> BTreeSet<usize> {
+    find_referenced_slots(image, observed_base)
+        .into_keys()
+        .map(|slot| slot as usize)
+        .collect()
 }
 
 fn find_referenced_slots(image: &PeImage<'_>, observed_base: usize) -> BTreeMap<u32, Reference> {
@@ -1112,6 +1138,7 @@ fn append_groups(
         slot,
         symbol,
         aliased,
+        ..
     } in entries
     {
         if plan
@@ -1216,6 +1243,39 @@ fn count_referenced_slots(
         })
         .filter(|slot| referenced.contains_key(slot))
         .count()
+}
+
+fn settle_run_module(entries: &mut [SlotCandidate], exports: &ExportIndex) {
+    let named = |entry: &SlotCandidate, module: &str| {
+        let name = entry.symbol.name.as_deref()?;
+        exports.export_named(entry.value, module, name)
+    };
+    let Some(first) = entries.first() else {
+        return;
+    };
+
+    let mut covering: Vec<String> = exports
+        .modules_at(first.value)
+        .map(|(module, _)| module.to_ascii_lowercase())
+        .filter(|module| entries.iter().all(|entry| named(entry, module).is_some()))
+        .collect();
+    covering.sort_unstable();
+    covering.dedup();
+    let contracts: Vec<&String> = covering
+        .iter()
+        .filter(|module| is_api_set(module))
+        .collect();
+    let module = match (&covering[..], &contracts[..]) {
+        ([only], _) => only,
+        (_, [contract]) => *contract, // msvc links the crt through its api set contracts, not ucrtbase
+        _ => return, // none or several could name the whole run, so nothing settles it
+    };
+
+    for entry in entries.iter_mut() {
+        if let Some(symbol) = named(entry, module) {
+            entry.symbol = symbol; // a run between zero slots is one module's table, so the module naming all of it is the one linked
+        }
+    }
 }
 
 fn record_mixed_module_run(plan: &mut ImportPlan, entries: &[SlotCandidate]) {
@@ -1356,30 +1416,50 @@ fn decode_x86_thunk(memory: &[u8], base: usize, rva: usize) -> Option<usize> {
 }
 
 fn existing_descriptors(image: &PeImage<'_>) -> Option<Vec<u8>> {
+    let (descriptors, _) = read_descriptors(image);
+    (!descriptors.is_empty()).then_some(descriptors)
+}
+
+fn read_descriptors(image: &PeImage<'_>) -> (Vec<u8>, usize) {
     let memory = image.bytes();
     let model = image.model();
-    let (directory_rva, directory_size) = directory(image, IMPORT_DIRECTORY)?;
+    let Some((directory_rva, directory_size)) = directory(image, IMPORT_DIRECTORY) else {
+        return (Vec::new(), 0);
+    };
 
     if directory_size < IMPORT_DESCRIPTOR_SIZE as u32 {
-        return None;
+        return (Vec::new(), 0);
     }
 
     let max_descriptors = (directory_size as usize / IMPORT_DESCRIPTOR_SIZE).min(MAX_IMPORT_GROUPS);
     let mut descriptors = Vec::new();
+    let mut rejected = 0usize;
     let mut budget = MAX_IMPORTS;
 
     for index in 0..max_descriptors {
-        let offset =
-            (directory_rva as usize).checked_add(index.saturating_mul(IMPORT_DESCRIPTOR_SIZE))?;
-        let descriptor = memory.get(offset..offset.saturating_add(IMPORT_DESCRIPTOR_SIZE))?;
+        let Some(offset) =
+            (directory_rva as usize).checked_add(index.saturating_mul(IMPORT_DESCRIPTOR_SIZE))
+        else {
+            break;
+        };
+        let Some(descriptor) = memory.get(offset..offset.saturating_add(IMPORT_DESCRIPTOR_SIZE))
+        else {
+            break;
+        };
 
         if descriptor.iter().all(|byte| *byte == 0) {
-            return (!descriptors.is_empty()).then_some(descriptors);
+            break;
         }
 
-        let original_thunk = read_u32(memory, offset)?;
-        let name_rva = read_u32(memory, offset.saturating_add(12))?;
-        let first_thunk = read_u32(memory, offset.saturating_add(16))?;
+        let fields = (
+            read_u32(memory, offset),
+            read_u32(memory, offset.saturating_add(12)),
+            read_u32(memory, offset.saturating_add(16)),
+        );
+        let (Some(original_thunk), Some(name_rva), Some(first_thunk)) = fields else {
+            break;
+        };
+
         if read_ascii(memory, name_rva as usize).is_none()
             || !thunk_table_is_valid(
                 memory,
@@ -1389,13 +1469,14 @@ fn existing_descriptors(image: &PeImage<'_>) -> Option<Vec<u8>> {
                 &mut budget,
             )
         {
+            rejected = rejected.saturating_add(1);
             continue;
         }
 
         descriptors.extend_from_slice(descriptor);
     }
 
-    (!descriptors.is_empty()).then_some(descriptors)
+    (descriptors, rejected)
 }
 
 fn thunk_table_is_valid(

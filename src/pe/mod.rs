@@ -5,14 +5,16 @@ mod imports;
 mod packers;
 mod parse;
 mod rebuild;
+mod space;
 
 use std::fmt::{Display, Formatter};
 
 pub(crate) use carve::{CarveResult, CarveSource, carve_embedded};
 pub(crate) use exports::{ExportIndex, ExportStats, embedded_module_name};
 pub(crate) use packers::PackerReport;
-pub(crate) use parse::memory_image_size;
+pub(crate) use parse::{check_memory_headers, map_disk_image, memory_image_size};
 pub(crate) use rebuild::{DiskImage, RebuiltImage, append_overlay, overlay_offset, rebuild};
+pub(crate) use space::{Process, ProcessMemory};
 
 pub(crate) fn resource_apis_hooked(bytes: &[u8], base: usize) -> bool {
     const RESOURCE_APIS: [&str; 2] = ["LdrFindResource_U", "LdrAccessResource"];
@@ -143,6 +145,13 @@ impl PeKind {
             Self::Pe32Plus => 8,
         }
     }
+
+    pub(crate) fn bits(self) -> u32 {
+        match self {
+            Self::Pe32 => 32,
+            Self::Pe32Plus => 64,
+        }
+    }
 }
 
 impl Display for PeKind {
@@ -182,6 +191,7 @@ struct SectionModel {
     raw_pointer: u32,
     raw_size: u32,
     characteristics: u32,
+    extent: u32, // the range the loader maps: the mapped size rounded up to the section alignment
 }
 
 struct PeModel {

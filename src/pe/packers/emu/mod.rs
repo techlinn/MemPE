@@ -1,12 +1,23 @@
 use std::collections::BTreeMap;
+use std::ops::Range;
 
 use iced_x86::{ConditionCode, Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
 
 mod fp;
+mod probe;
+mod snapshot;
+mod sse;
+
+pub(super) use probe::{Probe, Trial};
+pub(super) use snapshot::{Destination, Handover, Landing, Snapshot};
+
+use crate::pe::space::ProcessMemory;
 
 const STACK_SIZE: u64 = 0x1_0000;
 const STACK_BASE_64: u64 = 0x7FF0_0000_0000;
 const STACK_BASE_32: u64 = 0x6000_0000;
+const TEB_BASE_64: u64 = 0x7FFE_0000_0000;
+const TEB_BASE_32: u64 = 0x7FFD_8000; // a 32-bit program reads its teb and peb pointers as 32 bits
 const BUDGET: usize = 50_000;
 const STRING_FUEL: u64 = 1 << 24;
 const EXEC_STACK_SIZE: u64 = 0x20_0000; // a whole virtualized function needs far more stack than a stub
@@ -37,8 +48,11 @@ struct Cpu<'a> {
     seg_base: u64,
     extra: Vec<(u64, Vec<u8>)>,
     x87: fp::X87,
+    xmm: [u128; 16],
     vex_scratch: u64,
     string_fuel: u64,
+    outside: Option<&'a ProcessMemory<'a>>, // the rest of the process, read-only
+    unmapped: Option<u64>, // a seed that gives every address nothing maps a byte of its own, for code run on made-up state
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -93,7 +107,39 @@ const STACK_ARGS: u64 = 4;
 const VEX_SCRATCH_SLOT: u64 = 32;
 const VEX_SCRATCH_SIZE: usize = 64;
 
-fn behaviour(image: &[u8], image_base: u64, bits: u32, entry: u64, pointers: bool) -> Behaviour {
+#[derive(Clone, Copy)]
+enum Arguments {
+    Seeded,   // registers and arguments as the emulator seeds them
+    Pointers, // every register and argument points at a buffer of its own
+    Small,    // small values with every address readable, so a loop bounded by an argument ends
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum Agreement {
+    Every, // every run alike, even one the budget cut short: vmp's cleaner can leave its own junk in, which only that catches
+    Finished, // every run the original finished alike, so a loop that outlasts the budget is no reason to refuse
+}
+
+impl Agreement {
+    fn arguments(self) -> &'static [Arguments] {
+        match self {
+            Agreement::Every => &[Arguments::Seeded, Arguments::Pointers],
+            Agreement::Finished => &[Arguments::Seeded, Arguments::Pointers, Arguments::Small],
+        }
+    }
+}
+
+const SMALL_ARGUMENT: u64 = 0x40;
+const SMALL_SEED: u64 = 0x5EED;
+
+fn behaviour(
+    image: &[u8],
+    image_base: u64,
+    bits: u32,
+    entry: u64,
+    arguments: Arguments,
+    private: &Range<u64>,
+) -> Behaviour {
     const BUDGET: usize = 200_000;
     let kept: &[usize] = if bits == 64 {
         &[0, 3, 4, 5, 6, 7, 12, 13, 14, 15] // rax rbx rsp rbp rsi rdi and r12 to r15
@@ -103,7 +149,7 @@ fn behaviour(image: &[u8], image_base: u64, bits: u32, entry: u64, pointers: boo
 
     let mut cpu = Cpu::new_exec(image, image_base, bits);
     let stack = cpu.gpr[4];
-    cpu.seed(u64::from(pointers));
+    cpu.seed(u64::from(matches!(arguments, Arguments::Pointers)));
     cpu.gpr[4] = stack;
 
     let first = if bits == 64 {
@@ -115,7 +161,20 @@ fn behaviour(image: &[u8], image_base: u64, bits: u32, entry: u64, pointers: boo
     cpu.extra.push((cpu.vex_scratch, vec![0; VEX_SCRATCH_SIZE]));
 
     let synthetic = cpu.extra.len(); // the teb and peb new_exec maps which are not the function doing
-    if pointers {
+    if let Arguments::Small = arguments {
+        let ptr = u64::from(bits / 8);
+        let regs = cpu.gpr_count() as u64;
+        let small = |k: u64| (k * 7 + 3) % SMALL_ARGUMENT;
+
+        cpu.unmapped = Some(SMALL_SEED);
+        for reg in (0..regs).filter(|&reg| reg != 4) {
+            cpu.gpr[reg as usize] = small(reg);
+        }
+        for k in 0..STACK_ARGS {
+            cpu.write_mem(stack + (k + 1) * ptr, ptr as usize, small(regs + k)); // above the return address
+        }
+    }
+    if let Arguments::Pointers = arguments {
         let ptr = u64::from(bits / 8);
         let regs = cpu.gpr_count() as u64;
         let pointer = |k: u64| first + k * POINTER_BUFFER + POINTER_BUFFER / 2;
@@ -154,7 +213,12 @@ fn behaviour(image: &[u8], image_base: u64, bits: u32, entry: u64, pointers: boo
             .into_iter()
             .map(|(_, bytes)| bytes)
             .collect(),
-        writes: cpu.overlay.unwrap_or_default(),
+        writes: cpu
+            .overlay
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(at, _)| !private.contains(at)) // state the packer keeps for itself is no part of what the code does
+            .collect(),
     }
 }
 
@@ -164,22 +228,27 @@ pub(super) fn same_behaviour(
     image_base: u64,
     bits: u32,
     entry: u64,
+    private: &Range<u64>,
+    agreement: Agreement,
 ) -> bool {
-    let runs: Vec<(Behaviour, Behaviour)> = [false, true]
-        .into_iter()
-        .map(|pointers| {
+    let runs: Vec<(Behaviour, Behaviour)> = agreement
+        .arguments()
+        .iter()
+        .map(|arguments| {
             (
-                behaviour(original, image_base, bits, entry, pointers),
-                behaviour(patched, image_base, bits, entry, pointers),
+                behaviour(original, image_base, bits, entry, *arguments, private),
+                behaviour(patched, image_base, bits, entry, *arguments, private),
             )
         })
         .collect();
 
-    let alike = runs.iter().all(|(vmp, clean)| vmp == clean);
-    let conclusive = runs
+    let finished = |run: &Behaviour| run.returned || run.left_to.is_some();
+    let conclusive = runs.iter().any(|(packed, _)| finished(packed));
+    let alike = runs
         .iter()
-        .any(|(vmp, _)| vmp.returned || vmp.left_to.is_some());
-    alike && conclusive
+        .filter(|(packed, _)| matches!(agreement, Agreement::Every) || finished(packed)) // one cut short stops at no particular point
+        .all(|(packed, clean)| packed == clean);
+    conclusive && alike
 }
 
 impl<'a> Cpu<'a> {
@@ -205,8 +274,11 @@ impl<'a> Cpu<'a> {
                 cw: 0x037F,
                 ..Default::default()
             },
+            xmm: [0; 16],
             vex_scratch: 0,
             string_fuel: STRING_FUEL,
+            outside: None,
+            unmapped: None,
         };
         cpu.gpr[4] = stack_base + STACK_SIZE / 2; // rsp mid stack so push and pop both have room
         cpu
@@ -218,7 +290,11 @@ impl<'a> Cpu<'a> {
         } else {
             STACK_BASE_32
         };
-        let teb_base = 0x7FFE_0000_0000u64;
+        Self::new_exec_at(image, image_base, bits, stack_base)
+    }
+
+    fn new_exec_at(image: &'a [u8], image_base: u64, bits: u32, stack_base: u64) -> Self {
+        let teb_base = if bits == 64 { TEB_BASE_64 } else { TEB_BASE_32 };
         let peb_base = teb_base + 0x4000;
         let mut cpu = Cpu {
             gpr: [0; 16],
@@ -236,8 +312,11 @@ impl<'a> Cpu<'a> {
                 cw: 0x037F,
                 ..Default::default()
             },
+            xmm: [0; 16],
             vex_scratch: 0,
             string_fuel: STRING_FUEL,
+            outside: None,
+            unmapped: None,
         };
         cpu.gpr[4] = stack_base + EXEC_STACK_SIZE / 2;
 
@@ -519,7 +598,10 @@ impl<'a> Cpu<'a> {
                 return Some(*byte);
             }
         }
-        None
+        if let Some(seed) = self.unmapped {
+            return Some(unmapped_byte(seed, addr));
+        }
+        self.outside?.byte(usize::try_from(addr).ok()?)
     }
 
     fn write_byte(&mut self, addr: u64, value: u8) -> Option<()> {
@@ -542,7 +624,12 @@ impl<'a> Cpu<'a> {
                 return Some(());
             }
         }
-        None
+
+        if self.unmapped.is_none() {
+            self.outside?.byte(usize::try_from(addr).ok()?)?;
+        }
+        self.overlay.as_mut()?.insert(addr, value); // the process itself is never written
+        Some(())
     }
 
     fn region(&self, addr: u64, size: usize) -> Option<&[u8]> {
@@ -662,6 +749,10 @@ impl<'a> Cpu<'a> {
 
     fn step(&mut self, insn: &Instruction) -> Option<()> {
         self.rip = insn.next_ip();
+        if sse::is_sse(insn) {
+            return self.sse_step(insn); // before the match, where the string movsd shares the mnemonic
+        }
+
         match insn.mnemonic() {
             Mnemonic::Nop | Mnemonic::Prefetchw | Mnemonic::Cld | Mnemonic::Std => Some(()),
             Mnemonic::Cdq => {
@@ -1478,6 +1569,13 @@ fn frame_mark(seed: u64, slot: u64, bits: u32) -> u64 {
     } else {
         0xB000_0000 | ((seed << 24) & 0x0F00_0000) | (slot << 4) | 0x7
     }
+}
+
+fn unmapped_byte(seed: u64, addr: u64) -> u8 {
+    let mut mixed = (addr ^ seed.rotate_left(32)).wrapping_mul(0x9E37_79B9_7F4A_7C15); // splitmix64 finaliser
+    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    (mixed ^ (mixed >> 31)) as u8
 }
 
 fn mask(value: u64, size: usize) -> u64 {

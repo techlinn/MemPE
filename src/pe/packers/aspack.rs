@@ -12,8 +12,8 @@ use super::tables::{
     return_moved_leaves, set_directory,
 };
 use super::{
-    ImportedFunction, ModuleImports, Origin, PackerFindings, PackerImports, PackerReport, Unpacked,
-    find_pattern,
+    ImportedFunction, ModuleImports, NameHints, Origin, PackerFindings, PackerImports,
+    PackerReport, Unpacked, find_pattern,
 };
 use crate::pe::image::{read_u32, write_u16, write_u32};
 use crate::pe::parse::{parse_disk_image, parse_memory_image};
@@ -709,7 +709,11 @@ fn restore_imports(
 
     let Some(listed) = listed else {
         let (rva, size) = (u32::try_from(iat).ok()?, u32::try_from(span).ok()?);
-        return Some(PackerImports::FilledIat { rva, size });
+        return Some(PackerImports::FilledIat {
+            rva,
+            size,
+            names: NameHints::new(),
+        });
     };
 
     let modules = tables

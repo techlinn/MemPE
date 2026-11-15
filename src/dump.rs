@@ -7,13 +7,15 @@ use crate::memory::{Capture, CapturedImage, RawRegion};
 use crate::output::{OutputFile, OutputPlan, WrittenFile};
 use crate::pe::{
     self, CarveResult, CarveSource, DiskImage, EntryPointRva, ExportIndex, ExportStats,
-    PackerReport, PeKind, RebuiltImage,
+    PackerReport, PeKind, Process, ProcessMemory, RebuiltImage,
 };
 use crate::process::TargetProcess;
 use crate::{AppError, AppResult};
 
 const MAX_DISK_HEADER_BYTES: u64 = 1024 * 1024;
 const MAX_OVERLAY_BYTES: u64 = 1024 * 1024 * 1024;
+const CRT_API_SET_PREFIX: &str = "api-ms-win-crt-";
+const MAX_API_SET_BYTES: u64 = 1024 * 1024;
 
 pub(crate) struct ArtifactInfo {
     pub(crate) base: usize,
@@ -453,6 +455,28 @@ fn image_matches(image: &CapturedImage, want: &str) -> bool {
         .is_some_and(|name| name.eq_ignore_ascii_case(want))
 }
 
+fn crt_api_sets() -> Vec<Vec<u8>> {
+    let windows =
+        std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
+    let Ok(entries) = std::fs::read_dir(windows.join("System32").join("downlevel")) else {
+        return Vec::new(); // the names packers erase stay ucrtbase's without them
+    };
+
+    entries
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            name.starts_with(CRT_API_SET_PREFIX) && name.ends_with(".dll")
+        })
+        .filter(|entry| {
+            entry
+                .metadata()
+                .is_ok_and(|meta| meta.len() <= MAX_API_SET_BYTES)
+        })
+        .filter_map(|entry| std::fs::read(entry.path()).ok())
+        .collect()
+}
+
 pub(crate) fn build(
     target: &TargetProcess,
     capture: Capture,
@@ -476,7 +500,23 @@ pub(crate) fn build(
         images
             .iter()
             .map(|image| (image.base, image.bytes.as_slice(), image.name.as_deref())),
+        &crt_api_sets(),
     );
+
+    let memory = ProcessMemory::new(
+        images
+            .iter()
+            .map(|image| (image.base, image.bytes.as_slice()))
+            .chain(
+                carve_regions
+                    .iter()
+                    .map(|region| (region.base, region.bytes.as_slice())),
+            ),
+    ); // wrappers a packer leaves behind read other modules and run through private code
+    let process = Process {
+        exports: &exports,
+        memory: &memory,
+    };
 
     let export_stats = exports.stats();
     let mut report = empty_report(target, &images, export_stats, counts);
@@ -508,16 +548,16 @@ pub(crate) fn build(
         .is_some_and(|ntdll| pe::resource_apis_hooked(&ntdll.bytes, ntdll.base));
 
     let mut selected = 0usize;
-    for image in images {
-        if only.is_some_and(|want| !image_matches(&image, want)) {
+    for image in &images {
+        if only.is_some_and(|want| !image_matches(image, want)) {
             continue;
         }
 
         selected = selected.saturating_add(1);
-        push_embedded(target, &image, &mut report);
+        push_embedded(target, image, &mut report);
 
         let validates_manual_entry_point = image.is_main && entry_point.is_some();
-        build_image(target, image, &exports, entry_point, &mut report);
+        build_image(target, image, process, entry_point, &mut report);
 
         if validates_manual_entry_point && !report.main_rebuilt {
             break;
@@ -704,20 +744,20 @@ fn empty_report(
 
 fn build_image(
     target: &TargetProcess,
-    image: CapturedImage,
-    exports: &ExportIndex,
+    image: &CapturedImage,
+    process: Process<'_>,
     entry_point: Option<EntryPointRva>,
     report: &mut BuildReport,
 ) {
     let known_module = image.name.is_some();
     let image_entry_point = if image.is_main { entry_point } else { None };
-    match rebuild_image(&image, exports, image_entry_point)
-        .map(|rebuilt| with_overlay(&image, rebuilt))
+    match rebuild_image(image, process, image_entry_point)
+        .map(|rebuilt| with_overlay(image, rebuilt))
     {
-        Ok(mut rebuilt) if should_write(&image, &rebuilt, known_module) => {
+        Ok(mut rebuilt) if should_write(image, &rebuilt, known_module) => {
             report.main_rebuilt |= image.is_main;
 
-            let preferred_name = output_name(target, &image, &rebuilt);
+            let preferred_name = output_name(target, image, &rebuilt);
             if let Some(fresh) = rebuilt.fresh.take() {
                 report.fresh.push(OutputFile {
                     preferred_name: fresh_name(&preferred_name),
@@ -726,7 +766,7 @@ fn build_image(
                 });
             }
 
-            let context = artifact_info(&image, &rebuilt);
+            let context = artifact_info(image, &rebuilt);
             report.files.push(OutputFile {
                 preferred_name,
                 bytes: rebuilt.bytes,
@@ -734,7 +774,7 @@ fn build_image(
             });
         }
         Ok(_) => {}
-        Err(error) => record_failure(target, &image, known_module, error, report),
+        Err(error) => record_failure(target, image, known_module, error, report),
     }
 }
 
@@ -831,10 +871,14 @@ fn record_failure(
 
 fn rebuild_image(
     image: &CapturedImage,
-    exports: &ExportIndex,
+    process: Process<'_>,
     entry_point: Option<EntryPointRva>,
 ) -> AppResult<RebuiltImage> {
-    match pe::rebuild(
+    if let Err(memory_error) = pe::check_memory_headers(&image.bytes) {
+        return rebuild_with_disk_headers(image, process, entry_point, memory_error);
+    }
+
+    pe::rebuild(
         &image.bytes,
         &image.regions,
         image.base,
@@ -842,18 +886,15 @@ fn rebuild_image(
             headers: None,
             file: packed_file(image),
         },
-        exports,
+        process,
         entry_point,
         &image.page_flags,
-    ) {
-        Ok(rebuilt) => Ok(rebuilt),
-        Err(memory_error) => rebuild_with_disk_headers(image, exports, entry_point, memory_error),
-    }
+    )
 }
 
 fn rebuild_with_disk_headers(
     image: &CapturedImage,
-    exports: &ExportIndex,
+    process: Process<'_>,
     entry_point: Option<EntryPointRva>,
     memory_error: AppError,
 ) -> AppResult<RebuiltImage> {
@@ -889,7 +930,7 @@ fn rebuild_with_disk_headers(
             headers: Some(&disk_headers),
             file: Some(path),
         },
-        exports,
+        process,
         entry_point,
         &image.page_flags,
     )
@@ -946,17 +987,20 @@ fn read_overlay(path: &Path) -> AppResult<Option<Vec<u8>>> {
         |error: std::io::Error| AppError::new(format!("cannot read {}: {error}", path.display()));
     let mut file = File::open(path).map_err(unreadable)?;
 
-    if file.metadata().map_err(unreadable)?.len() <= start {
+    if file.metadata().map_err(unreadable)?.len() <= start.offset {
         return Ok(None);
     }
 
-    file.seek(SeekFrom::Start(start)).map_err(unreadable)?;
+    file.seek(SeekFrom::Start(start.offset))
+        .map_err(unreadable)?;
 
     let mut overlay = Vec::new();
     file.take(MAX_OVERLAY_BYTES)
         .read_to_end(&mut overlay)
         .map_err(unreadable)?;
-    Ok(Some(overlay))
+
+    let overlay = start.without_padding(overlay);
+    Ok((!overlay.is_empty()).then_some(overlay))
 }
 
 fn read_disk_headers(path: &Path) -> AppResult<Vec<u8>> {

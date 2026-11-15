@@ -11,9 +11,11 @@ use std::borrow::Cow;
 use std::path::Path;
 
 use crate::pe::exports::ExportIndex;
+use crate::pe::image::read_u32;
 use crate::pe::imports::{ImportPlan, build_iat_plan, build_plan, build_restored_plan};
 use crate::pe::packers::PackerImports;
 use crate::pe::parse::parse_memory_image;
+use crate::pe::space::Process;
 use crate::pe::{
     EntryPointRva, IAT_DIRECTORY, IMPORT_DIRECTORY, PackerReport, PeImage, PeKind, PeModel,
     RegionEvidence, SECTION_HEADER_SIZE, SectionModel,
@@ -31,7 +33,7 @@ use observe::{
     invalid_pdata_sections, never_decrypted_sections,
 };
 use sections::{build_output_buffer, write_sections};
-use source::{Source, Unpack, resolve_source_bytes};
+use source::{Resolution, Source, resolve_source_bytes};
 
 pub(crate) use overlay::{append_overlay, overlay_offset};
 
@@ -109,49 +111,71 @@ pub(crate) fn rebuild(
     regions: &[RegionEvidence],
     observed_base: usize,
     disk: DiskImage<'_>,
+    process: Process<'_>,
+    entry_point: Option<EntryPointRva>,
+    page_flags: &[u8],
+) -> AppResult<RebuiltImage> {
+    let Resolution { source, fallback } =
+        resolve_source_bytes(memory, regions, observed_base, disk, process)?;
+    let build = |source| {
+        rebuild_with_fresh(
+            source,
+            regions,
+            observed_base,
+            process.exports,
+            entry_point,
+            page_flags,
+        )
+    };
+
+    build(source).or_else(|error| {
+        let Some(fallback) = fallback else {
+            return Err(error);
+        };
+
+        fallback.source(regions).and_then(build).map_err(|_| error) // the packed image as captured, when the unpacked one does not rebuild
+    })
+}
+
+fn rebuild_with_fresh(
+    mut source: Source<'_>,
+    regions: &[RegionEvidence],
+    observed_base: usize,
     exports: &ExportIndex,
     entry_point: Option<EntryPointRva>,
     page_flags: &[u8],
 ) -> AppResult<RebuiltImage> {
-    let attempt = |unpack: Unpack| {
-        let mut source =
-            resolve_source_bytes(memory, regions, observed_base, disk, exports, unpack)?;
-        let fresh = source.fresh.take().map(|fresh| {
-            let copy = Source {
-                bytes: Cow::Owned(fresh.bytes),
-                disk_headers_used: source.disk_headers_used,
-                packer: source.packer.clone(),
-                fresh: None,
-            };
-            (copy, fresh.changed)
-        });
-
-        let rebuild = |source| {
-            rebuild_source(
-                source,
-                regions,
-                observed_base,
-                exports,
-                entry_point,
-                page_flags,
-            )
+    let fresh = source.fresh.take().map(|fresh| {
+        let copy = Source {
+            bytes: Cow::Owned(fresh.bytes),
+            disk_headers_used: source.disk_headers_used,
+            salvaged_headers: source.salvaged_headers,
+            packer: source.packer.clone(),
+            fresh: None,
         };
+        (copy, fresh.changed)
+    });
 
-        let mut rebuilt = rebuild(source)?;
-        rebuilt.fresh = fresh.and_then(|(copy, changed)| {
-            Some(FreshCopy {
-                image: Box::new(rebuild(copy).ok()?),
-                changed,
-            })
-        });
-
-        Ok(rebuilt)
+    let rebuild = |source| {
+        rebuild_source(
+            source,
+            regions,
+            observed_base,
+            exports,
+            entry_point,
+            page_flags,
+        )
     };
 
-    attempt(Unpack::Restore).or_else(|error| match attempt(Unpack::DetectOnly) {
-        Ok(rebuilt) if rebuilt.packer.is_some() => Ok(rebuilt), // fall back to the packed image
-        _ => Err(error),
-    })
+    let mut rebuilt = rebuild(source)?;
+    rebuilt.fresh = fresh.and_then(|(copy, changed)| {
+        Some(FreshCopy {
+            image: Box::new(rebuild(copy).ok()?),
+            changed,
+        })
+    });
+
+    Ok(rebuilt)
 }
 
 fn rebuild_source(
@@ -165,7 +189,8 @@ fn rebuild_source(
     let Source {
         bytes: source,
         disk_headers_used,
-        packer,
+        salvaged_headers,
+        mut packer,
         ..
     } = source;
 
@@ -183,8 +208,8 @@ fn rebuild_source(
         Some(PackerImports::Listed(modules)) => {
             build_restored_plan(&image, observed_base, exports, Some(modules))
         }
-        Some(PackerImports::FilledIat { rva, size }) => {
-            build_iat_plan(&image, observed_base, exports, (*rva, *size))
+        Some(PackerImports::FilledIat { rva, size, names }) => {
+            build_iat_plan(&image, observed_base, exports, (*rva, *size), names)
         }
         Some(PackerImports::Unknown) => {
             let mut plan = build_plan(&image, observed_base, exports);
@@ -193,6 +218,12 @@ fn rebuild_source(
         }
         None => build_plan(&image, observed_base, exports),
     };
+
+    let rejected_restored_table = matches!(restored_imports, Some(PackerImports::Intact))
+        && (plan.existing.is_empty() || plan.rejected_descriptors > 0);
+    if rejected_restored_table && let Some(findings) = &mut packer {
+        reject_restored_imports(&mut findings.report, !plan.existing.is_empty());
+    }
 
     let (mut output, layouts, header_size) =
         build_output_buffer(model, memory, &plan.import_tables(model.kind))?;
@@ -217,7 +248,7 @@ fn rebuild_source(
         kind: model.kind,
         is_dll: model.is_dll,
         section_count: model.sections.len().saturating_add(usize::from(written)),
-        salvaged_headers: model.salvaged,
+        salvaged_headers: salvaged_headers || model.salvaged,
         disk_headers_used,
         cleared_directories: repairs.cleared.total,
         notable_cleared_directories: repairs.cleared.notable_names(),
@@ -245,7 +276,7 @@ fn rebuild_source(
         renamed_sections,
         tls_callbacks: count_tls_callbacks(&image, observed_base),
         entry_point: final_entry_point,
-        entry_section: entry_section_name(&layouts, final_entry_point),
+        entry_section: entry_section_name(&output, &layouts, final_entry_point),
         repaired_debug_entries: repairs.repaired_debug_entries,
         fixed_image_base: repairs.fixed_image_base,
         executable_flag_added,
@@ -303,7 +334,9 @@ fn resolve_imports(
     repairs: &mut RepairStats,
     slot_offset: impl Fn(u32) -> Option<usize>,
 ) -> AppResult<ImportOutcome> {
-    let section = match plan.groups.is_empty() {
+    let orphaned =
+        !plan.existing.is_empty() && directory_rva(output, model, IMPORT_DIRECTORY)? == 0; // descriptors read from memory whose directory did not survive the layout
+    let section = match plan.groups.is_empty() && !orphaned {
         true => ImportSection::NothingToWrite,
         false => append_import_section(output, model, &plan, slot_offset)?,
     };
@@ -335,6 +368,24 @@ fn resolve_imports(
         written,
         unemitted,
     })
+}
+
+fn reject_restored_imports(report: &mut PackerReport, kept_some: bool) {
+    if !kept_some {
+        report.restored.retain(|item| !item.starts_with("imports"));
+    }
+
+    report.unrestored.push(match kept_some {
+        true => "some imports (descriptors the unpacker restored did not validate)",
+        false => "imports (the table the unpacker restored did not validate)",
+    });
+}
+
+fn directory_rva(output: &[u8], model: &PeModel, index: usize) -> AppResult<u32> {
+    match model.directory_offset(index)? {
+        Some(offset) => read_u32(output, offset),
+        None => Ok(0),
+    }
 }
 
 fn declared_iat_slots(image: &PeImage<'_>, model: &PeModel) -> usize {

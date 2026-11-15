@@ -1,5 +1,7 @@
 mod debug;
 mod directories;
+mod evacuate;
+mod exceptions;
 mod exports;
 mod fresh;
 mod icons;
@@ -13,16 +15,21 @@ mod tls;
 use crate::pe::PeModel;
 use crate::pe::image::write_u32;
 
+pub(super) use crate::pe::map_disk_image;
 pub(super) use debug::{
     DEBUG_ADDRESS_OFFSET, DEBUG_ENTRY_SIZE, DEBUG_SIZE_OFFSET, DEBUG_TYPE_CODEVIEW,
     DEBUG_TYPE_OFFSET, codeview_entry, debug_timestamp, find_codeview_record,
 };
-pub(super) use directories::{is_module_name, recover_directories, security_cookie};
+pub(super) use directories::{
+    is_module_name, load_config_length, recover_directories, security_cookie,
+};
+pub(super) use evacuate::{evacuate, place_table, table_references};
+pub(super) use exceptions::{keep_unwind_within, restore_exception_directory};
 pub(super) use exports::{
     export_functions, exports_intact, linker_export_layout, linker_export_start,
     moved_export_directory,
 };
-pub(super) use fresh::{fresh_image, map_disk_image};
+pub(super) use fresh::fresh_image;
 pub(super) use icons::repair_icon_groups;
 pub(super) use imports::{
     HINT_SIZE, IMPORT_DESCRIPTOR_SIZE, IMPORT_IAT_OFFSET, IMPORT_NAME_OFFSET,
@@ -31,8 +38,9 @@ pub(super) use imports::{
 };
 pub(super) use pogo::{pogo_parts, pogo_sections, pogo_tls_directory};
 pub(super) use relocations::{
-    MAX_RELOCATION_BLOCK, RELOCATION_BLOCK_HEADER, RELOCATION_BLOCK_SIZE_OFFSET,
-    find_relocation_table, relocate, relocated_fields, relocation_blocks, relocations_intact,
+    Fixups, MAX_RELOCATION_BLOCK, RELOCATION_BLOCK_HEADER, RELOCATION_BLOCK_SIZE_OFFSET,
+    drop_relocation_blocks, find_relocation_table, relocate, relocated_fields, relocation_blocks,
+    relocations_intact, restore_relocation_directory,
 };
 pub(super) use resources::{
     LinkerTree, RESOURCE_DATA_SIZE_OFFSET, RESOURCE_SIZE_ALIGNMENT, ResourceLayout,
@@ -40,9 +48,11 @@ pub(super) use resources::{
     resources_intact, restore_moved_resources, return_moved_leaves, walk_resources,
 };
 pub(super) use sections::{
-    CODE_SECTION, DATA_SECTION, LinkerBounds, SECTION_CHARACTERISTICS_OFFSET, SECTION_COUNT_OFFSET,
-    SECTION_RVA_OFFSET, SECTION_VIRTUAL_SIZE_OFFSET, SectionHints, SectionPiece,
-    first_section_range, linker_bounds, name_sections, replace_first_section, split_merged_section,
+    CODE_SECTION, DATA_SECTION, LinkerBounds, READ_ONLY_SECTION, RELOCATION_SECTION,
+    SECTION_CHARACTERISTICS_OFFSET, SECTION_COUNT_OFFSET, SECTION_RVA_OFFSET,
+    SECTION_VIRTUAL_SIZE_OFFSET, SectionHints, SectionPiece, append, cut_tail, first_section_range,
+    linker_bounds, name_sections, next_section_rva, replace_first_section, shed,
+    split_merged_section,
 };
 pub(super) use tls::restore_tls;
 
@@ -95,7 +105,8 @@ pub(super) fn clear_directory(restored: &mut [u8], model: &PeModel, index: usize
     let _ = set_directory(restored, model, index, 0, 0);
 }
 
-pub(super) fn unique<T>(mut found: impl Iterator<Item = T>) -> Option<T> {
+pub(super) fn unique<T>(found: impl IntoIterator<Item = T>) -> Option<T> {
+    let mut found = found.into_iter();
     let first = found.next()?;
     found.next().is_none().then_some(first)
 }

@@ -1,5 +1,6 @@
 use std::ops::Range;
 
+use super::{FIRST_SECTION_RVA, set_directory};
 use crate::pe::image::{read_pointer, read_u32, write_u32, write_u64};
 use crate::pe::{BASERELOC_DIRECTORY, PeKind, PeModel, RELOCATION_DIR64, RELOCATION_HIGHLOW};
 
@@ -10,6 +11,7 @@ pub(crate) const MAX_RELOCATION_BLOCK: usize = 0x10000;
 const RELOCATION_KIND_SHIFT: u16 = 12;
 const KNOWN_RELOCATION_KINDS: [u16; 5] = [0, 1, 2, 3, 10];
 const RELOCATION_OFFSET_MASK: u16 = 0xFFF;
+const USED_FIXUP_MAJORITY: usize = 3; // a real table keeps pointers in most fields however long the program ran
 
 pub(crate) fn relocation_blocks(entries: &[(u32, u16)]) -> Option<Vec<u8>> {
     let mut sorted = entries.to_vec();
@@ -90,15 +92,51 @@ pub(crate) fn relocations_intact(bytes: &[u8], start: usize, size: usize) -> boo
     true
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Fixups {
+    Pristine, // nothing ran since the fixups were applied, so every field still holds a pointer
+    Used,     // the program ran, and has since stored other things in some of the fields
+}
+
 pub(crate) fn find_relocation_table(
     original: &[u8],
     image: &Range<usize>,
     base: usize,
     page: usize,
+    fixups: Fixups,
 ) -> Option<Range<usize>> {
     (image.start..image.end)
         .step_by(page.max(1))
-        .find_map(|start| relocation_table_at(original, start, image, base))
+        .find_map(|start| relocation_table_at(original, start, image, base, fixups))
+}
+
+pub(crate) fn restore_relocation_directory(
+    restored: &mut [u8],
+    model: &PeModel,
+    base: usize,
+    end: usize,
+) -> Option<usize> {
+    let declared = model
+        .directory(restored, BASERELOC_DIRECTORY)
+        .ok()
+        .flatten()
+        .map(|directory| directory.rva().as_usize());
+    if declared.is_some_and(|rva| rva < end) {
+        return None; // still the program's own
+    }
+
+    let image = FIRST_SECTION_RVA..end;
+    let page = model.section_alignment as usize;
+    let table = find_relocation_table(restored, &image, base, page, Fixups::Used)?; // the packer applied them itself and points the header at a table of its own
+
+    set_directory(
+        restored,
+        model,
+        BASERELOC_DIRECTORY,
+        table.start,
+        table.len(),
+    )?;
+    Some(table.start)
 }
 
 fn relocation_table_at(
@@ -106,9 +144,11 @@ fn relocation_table_at(
     start: usize,
     image: &Range<usize>,
     base: usize,
+    state: Fixups,
 ) -> Option<Range<usize>> {
     let mut cursor = start;
     let mut fixups = 0usize;
+    let mut overwritten = 0usize;
 
     loop {
         let page = read_u32(original, cursor).ok()? as usize;
@@ -130,16 +170,25 @@ fn relocation_table_at(
             let word = u16::from_le_bytes(*word);
             match word >> RELOCATION_KIND_SHIFT {
                 0 => continue,
-                RELOCATION_HIGHLOW => {
+                kind @ (RELOCATION_HIGHLOW | RELOCATION_DIR64) => {
+                    let width = match kind {
+                        RELOCATION_DIR64 => PeKind::Pe32Plus,
+                        _ => PeKind::Pe32,
+                    };
                     let field = page.checked_add(usize::from(word & RELOCATION_OFFSET_MASK))?;
-                    let value = read_u32(original, field).ok()? as usize;
+                    let value = read_pointer(original, field, width).ok()?;
                     if value == 0 {
                         continue; // packers blank some directories, like mew does the tls one
                     }
 
-                    let target = value.checked_sub(base)?;
-                    (target <= image.end).then_some(())?; // the packer never ran these, so they still hold link time pointers
-                    fixups += 1;
+                    let points_inside = value
+                        .checked_sub(base)
+                        .is_some_and(|target| target <= image.end);
+                    match (points_inside, state) {
+                        (true, _) => fixups += 1,
+                        (false, Fixups::Used) => overwritten += 1,
+                        (false, Fixups::Pristine) => return None, // the packer never ran these, so they still hold link time pointers
+                    }
                 }
                 _ => return None,
             }
@@ -149,7 +198,7 @@ fn relocation_table_at(
         (cursor < image.end).then_some(())?;
     }
 
-    (fixups > 0).then_some(start..cursor)
+    (fixups > overwritten.saturating_mul(USED_FIXUP_MAJORITY)).then_some(start..cursor)
 }
 
 pub(crate) fn relocate(
@@ -202,4 +251,49 @@ pub(crate) fn relocated_fields(restored: &[u8], model: &PeModel) -> Option<Vec<(
     }
 
     Some(fields)
+}
+
+pub(crate) fn drop_relocation_blocks(
+    restored: &mut [u8],
+    model: &PeModel,
+    sections: &[Range<usize>],
+) -> Option<(usize, usize)> {
+    let entry = model.directory_offset(BASERELOC_DIRECTORY).ok()??;
+    let rva = read_u32(restored, entry).ok()? as usize;
+    let size = read_u32(restored, entry + 4).ok()? as usize;
+    let table = restored.get(rva..rva.checked_add(size)?)?.to_vec();
+
+    let mut kept: Vec<u8> = Vec::with_capacity(table.len());
+    let mut dropped = 0;
+    let mut blocks = 0;
+    let mut at = 0;
+    while at + RELOCATION_BLOCK_HEADER <= table.len() {
+        let page = read_u32(&table, at).ok()? as usize;
+        let length = read_u32(&table, at + 4).ok()? as usize;
+        if length < RELOCATION_BLOCK_HEADER || at.checked_add(length)? > table.len() {
+            break; // a malformed tail is left where it is for the rebuild to judge
+        }
+
+        match sections.iter().any(|section| section.contains(&page)) {
+            true => dropped += 1,
+            false => {
+                blocks += 1;
+                kept.extend_from_slice(&table[at..at + length]);
+            }
+        }
+        at += length;
+    }
+
+    let area = restored.get_mut(rva..rva + size)?;
+    area.fill(0);
+    area[..kept.len()].copy_from_slice(&kept);
+
+    match kept.is_empty() {
+        true => {
+            write_u32(restored, entry, 0).ok()?;
+            write_u32(restored, entry + 4, 0).ok()?;
+        }
+        false => write_u32(restored, entry + 4, u32::try_from(kept.len()).ok()?).ok()?,
+    }
+    Some((dropped, blocks))
 }

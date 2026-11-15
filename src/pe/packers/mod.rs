@@ -1,37 +1,44 @@
 mod aspack;
+mod branches;
 mod codecs;
 mod emu;
+mod entry;
 mod fsg;
 mod mew;
 mod mpress;
 mod pecompact;
 mod streamed;
 mod tables;
+mod themida;
 mod upx;
 mod vmp;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io::Read;
+use std::ops::RangeInclusive;
 use std::path::Path;
 use std::sync::Arc;
 
 use crate::pe::PeImage;
 use crate::pe::exports::ExportIndex;
+use crate::pe::space::ProcessMemory;
 use tables::Restoration;
 
 type Unpacker = fn(&PeImage<'_>, &Origin<'_>) -> Option<Unpacked>;
+pub(crate) type NameHints = HashMap<u32, NameHint>; // by import slot
 
 const MAX_PACKED_FILE: u64 = 512 * 1024 * 1024;
 
-const UNPACKERS: [Unpacker; 7] = [
+const UNPACKERS: [Unpacker; 8] = [
     upx::unpack,
     aspack::unpack,
     mpress::unpack,
     pecompact::unpack,
     fsg::unpack,
     mew::unpack,
+    themida::unpack,
     vmp::unpack,
 ];
 
@@ -46,6 +53,7 @@ pub(super) struct Origin<'a> {
     pub(super) headers: HeaderSource,
     pub(super) file: Option<&'a Path>,
     pub(super) exports: &'a ExportIndex,
+    pub(super) memory: &'a ProcessMemory<'a>,
 }
 
 impl Origin<'_> {
@@ -96,7 +104,11 @@ pub(super) struct PackerFindings {
 pub(super) enum PackerImports {
     Intact,
     Listed(Vec<ModuleImports>),
-    FilledIat { rva: u32, size: u32 },
+    FilledIat {
+        rva: u32,
+        size: u32,
+        names: NameHints, // what the packer left behind about each slot's name
+    },
     Unknown,
 }
 
@@ -139,6 +151,12 @@ impl Display for PackerReport {
             None => formatter.write_str(self.name),
         }
     }
+}
+
+#[derive(Clone)]
+pub(crate) enum NameHint {
+    Length(RangeInclusive<usize>), // picks between names that share an address
+    Ordinal(u32),
 }
 
 #[derive(Clone)]

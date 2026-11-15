@@ -4,33 +4,10 @@ use super::FIRST_SECTION_RVA;
 use super::relocations::relocate;
 use crate::pe::image::read_u32;
 use crate::pe::packers::FreshImage;
-use crate::pe::parse::{parse_disk_image, parse_memory_image};
+use crate::pe::parse::parse_memory_image;
 use crate::pe::{PeModel, Rva};
 
 const DIRECTORY_COUNT: usize = 16;
-
-pub(crate) fn map_disk_image(file: &[u8], end: usize) -> Option<Vec<u8>> {
-    let disk = parse_disk_image(file).ok()?;
-    let mut image = vec![0u8; end];
-
-    let headers = read_u32(file, disk.model().size_of_headers_offset).ok()? as usize;
-    let mapped_headers = headers.min(file.len()).min(end);
-    image
-        .get_mut(..mapped_headers)?
-        .copy_from_slice(file.get(..mapped_headers)?);
-
-    for section in disk.model().sections() {
-        let rva = section.virtual_address().as_usize();
-        let start = section.raw_pointer as usize;
-        let length = (section.raw_size as usize).min(section.span() as usize);
-        let raw = file.get(start..start.checked_add(length)?)?;
-        if let Some(slot) = image.get_mut(rva..rva.saturating_add(raw.len())) {
-            slot.copy_from_slice(raw);
-        }
-    }
-
-    Some(image)
-}
 
 pub(crate) fn fresh_image(
     memory: &[u8],

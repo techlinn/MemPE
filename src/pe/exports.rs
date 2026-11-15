@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 
 use crate::pe::image;
-use crate::pe::parse::parse_memory_image;
+use crate::pe::parse::{map_disk_image, parse_disk_image, parse_memory_image};
 use crate::pe::{EXPORT_DIRECTORY, PeImage, Rva};
 
 const EXPORT_HEADER_SIZE: usize = 40;
@@ -87,6 +87,7 @@ impl Definitions {
 impl ExportIndex {
     pub(crate) fn build<'a>(
         images: impl IntoIterator<Item = (usize, &'a [u8], Option<&'a str>)>,
+        api_sets: &[Vec<u8>], // api set contract files, which only forward and so only add names
     ) -> Self {
         let mut index = Self::default();
         let mut definitions = HashMap::<(String, ExportKey), usize>::new();
@@ -109,7 +110,16 @@ impl ExportIndex {
         }
 
         index.stats.forwarders = forwarders.len();
-        resolve_forwarders(&mut index, &Definitions::build(definitions), &forwarders);
+        let definitions = Definitions::build(definitions);
+        resolve_forwarders(&mut index, &definitions, &forwarders);
+
+        let contracts: Vec<ForwardedExport> = api_sets
+            .iter()
+            .flat_map(|file| api_set_forwarders(file))
+            .collect();
+        let unresolved = index.stats.unresolved_forwarders;
+        resolve_forwarders(&mut index, &definitions, &contracts);
+        index.stats.unresolved_forwarders = unresolved; // a contract for a dll the process never loaded is no finding
         index.stats.addresses = index.addresses.len();
         index.image_ranges.sort_unstable_by_key(|range| range.start);
         index
@@ -153,6 +163,19 @@ impl ExportIndex {
             .filter_map(|symbol| symbol.name.as_deref())
     }
 
+    pub(crate) fn export_named(
+        &self,
+        address: usize,
+        module: &str,
+        name: &str,
+    ) -> Option<ResolvedExport> {
+        self.symbols_at(address)
+            .find(|symbol| {
+                symbol.module.eq_ignore_ascii_case(module) && symbol.name.as_deref() == Some(name)
+            })
+            .cloned()
+    }
+
     pub(crate) fn names_at(&self, address: usize) -> impl Iterator<Item = &str> {
         self.symbols_at(address)
             .filter_map(|symbol| symbol.name.as_deref())
@@ -168,6 +191,54 @@ impl ExportIndex {
             .into_iter()
             .flatten()
             .map(|symbol| (symbol.module.as_str(), symbol.forwarded))
+    }
+
+    pub(crate) fn resolve_fitting(
+        &self,
+        address: usize,
+        fits: impl Fn(usize) -> bool,
+    ) -> Option<&ResolvedExport> {
+        let fitting: Vec<&ResolvedExport> = self
+            .symbols_at(address)
+            .filter(|symbol| symbol.name.as_deref().is_some_and(|name| fits(name.len())))
+            .collect();
+        let name = &fitting.first()?.name;
+
+        fitting
+            .iter()
+            .all(|symbol| &symbol.name == name)
+            .then(|| {
+                fitting
+                    .iter()
+                    .copied()
+                    .min_by_key(|symbol| Reverse(naming_priority(symbol)))
+            })
+            .flatten()
+    }
+
+    pub(crate) fn resolve_ordinal(&self, address: usize, ordinal: u32) -> Option<ResolvedExport> {
+        let symbol = self
+            .symbols_at(address)
+            .filter(|symbol| symbol.ordinal == ordinal)
+            .min_by_key(|symbol| Reverse(naming_priority(symbol)))?;
+
+        Some(ResolvedExport {
+            name: None,
+            ..symbol.clone()
+        })
+    }
+
+    pub(crate) fn address_of(&self, module: &str, name: &str) -> Option<usize> {
+        self.addresses
+            .iter()
+            .find(|(_, symbols)| {
+                symbols.iter().any(|symbol| {
+                    !symbol.forwarded
+                        && symbol.module.eq_ignore_ascii_case(module)
+                        && symbol.name.as_deref() == Some(name)
+                })
+            })
+            .map(|(address, _)| *address)
     }
 
     pub(crate) fn ordinal_in(&self, address: usize, module: &str) -> Option<u32> {
@@ -429,6 +500,16 @@ fn resolve_forwarders(
     }
 }
 
+fn api_set_forwarders(file: &[u8]) -> Vec<ForwardedExport> {
+    let mapped = parse_disk_image(file)
+        .ok()
+        .and_then(|disk| map_disk_image(file, disk.model().image_size() as usize));
+    mapped
+        .and_then(|image| parse_exports(0, &image, None))
+        .map(|parsed| parsed.forwarders)
+        .unwrap_or_default()
+}
+
 fn resolve_key(
     module: &str,
     key: &ExportKey,
@@ -461,7 +542,7 @@ fn resolve_key(
     None
 }
 
-fn is_api_set(module: &str) -> bool {
+pub(crate) fn is_api_set(module: &str) -> bool {
     let Some(head) = module.as_bytes().get(..4) else {
         return false;
     };

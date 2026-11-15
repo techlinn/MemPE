@@ -3,26 +3,45 @@ use std::borrow::Cow;
 use super::DiskImage;
 use super::sections::recover_section_headers;
 use super::{SECTION_HEADER_SIZE, align_up};
-use crate::pe::exports::ExportIndex;
-use crate::pe::image::{read_u16, read_u32, write_u32, write_u64};
+use crate::pe::image::{read_u16, read_u32, write_pointer, write_u16, write_u32};
 use crate::pe::packers::{FreshImage, HeaderSource, Origin, PackerFindings, Unpacked, unpack};
 use crate::pe::parse::{parse_disk_image, parse_memory_image};
+use crate::pe::space::Process;
 use crate::pe::{PeKind, PeModel, RegionEvidence, Rva};
 use crate::{AppError, AppResult};
 
 const MAX_DISK_HEADERS: usize = 1024 * 1024;
-
-#[derive(Clone, Copy)]
-pub(super) enum Unpack {
-    Restore,
-    DetectOnly,
-}
+const DOS_MAGIC: u16 = 0x5A4D;
+const DOS_LFANEW_OFFSET: usize = 0x3c;
 
 pub(super) struct Source<'a> {
     pub(super) bytes: Cow<'a, [u8]>,
     pub(super) disk_headers_used: bool,
+    pub(super) salvaged_headers: bool,
     pub(super) packer: Option<PackerFindings>,
     pub(super) fresh: Option<FreshImage>,
+}
+
+pub(super) struct Resolution<'a> {
+    pub(super) source: Source<'a>,
+    pub(super) fallback: Option<Fallback<'a>>,
+}
+
+pub(super) struct Fallback<'a> {
+    captured: Captured<'a>,
+    findings: PackerFindings,
+}
+
+impl<'a> Fallback<'a> {
+    pub(super) fn source(self, regions: &[RegionEvidence]) -> AppResult<Source<'a>> {
+        captured_source(self.captured, regions, Some(detection_only(self.findings)))
+    }
+}
+
+struct Captured<'a> {
+    bytes: Cow<'a, [u8]>,
+    disk_headers_used: bool,
+    salvaged_headers: bool,
 }
 
 pub(super) fn resolve_source_bytes<'a>(
@@ -30,9 +49,77 @@ pub(super) fn resolve_source_bytes<'a>(
     regions: &[RegionEvidence],
     observed_base: usize,
     disk: DiskImage<'_>,
-    exports: &ExportIndex,
-    unpack_mode: Unpack,
+    process: Process<'_>,
+) -> AppResult<Resolution<'a>> {
+    let captured = capture(memory, observed_base, disk)?;
+    let image = parse_memory_image(&captured.bytes)?;
+    let origin = Origin {
+        base: observed_base,
+        headers: match captured.disk_headers_used {
+            true => HeaderSource::Disk,
+            false => HeaderSource::Memory,
+        },
+        file: disk.file,
+        exports: process.exports,
+        memory: process.memory,
+    };
+
+    match unpack(&image, &origin) {
+        Some(Unpacked {
+            image: Some(rebuilt),
+            findings,
+            fresh,
+        }) => {
+            let source = Source {
+                bytes: Cow::Owned(rebuilt),
+                disk_headers_used: captured.disk_headers_used,
+                salvaged_headers: captured.salvaged_headers,
+                packer: Some(findings.clone()),
+                fresh,
+            };
+            let fallback = Fallback { captured, findings };
+
+            Ok(Resolution {
+                source,
+                fallback: Some(fallback),
+            })
+        }
+        detected => Ok(Resolution {
+            source: captured_source(
+                captured,
+                regions,
+                detected.map(|unpacked| unpacked.findings),
+            )?,
+            fallback: None,
+        }),
+    }
+}
+
+fn captured_source<'a>(
+    captured: Captured<'a>,
+    regions: &[RegionEvidence],
+    packer: Option<PackerFindings>,
 ) -> AppResult<Source<'a>> {
+    let image = parse_memory_image(&captured.bytes)?;
+    let bytes = match recover_section_headers(image.bytes(), image.model(), regions)? {
+        Some(bytes) => Cow::Owned(bytes),
+        None => captured.bytes,
+    };
+
+    Ok(Source {
+        bytes,
+        disk_headers_used: captured.disk_headers_used,
+        salvaged_headers: captured.salvaged_headers,
+        packer,
+        fresh: None,
+    })
+}
+
+fn capture<'a>(
+    memory: &'a [u8],
+    observed_base: usize,
+    disk: DiskImage<'_>,
+) -> AppResult<Captured<'a>> {
     let (initial, disk_headers_used) = match parse_memory_image(memory) {
         Ok(_) => (Cow::Borrowed(memory), false),
         Err(memory_error) => {
@@ -50,61 +137,45 @@ pub(super) fn resolve_source_bytes<'a>(
         }
     };
 
-    let headers = match disk_headers_used {
-        true => HeaderSource::Disk,
-        false => HeaderSource::Memory,
+    let (nt_offset, salvaged_headers) = {
+        let model = parse_memory_image(&initial)?.model;
+        (model.nt_offset, model.salvaged)
     };
 
-    let image = parse_memory_image(&initial)?;
-    let origin = Origin {
-        base: observed_base,
-        headers,
-        file: disk.file,
-        exports,
-    };
+    if !salvaged_headers {
+        return Ok(Captured {
+            bytes: initial,
+            disk_headers_used,
+            salvaged_headers,
+        });
+    }
 
-    let packer = match (unpack(&image, &origin), unpack_mode) {
-        (
-            Some(Unpacked {
-                image: Some(rebuilt),
-                findings,
-                fresh,
-            }),
-            Unpack::Restore,
-        ) => {
-            return Ok(Source {
-                bytes: Cow::Owned(rebuilt),
-                disk_headers_used,
-                packer: Some(findings),
-                fresh,
-            });
-        }
-        (detected, Unpack::Restore) => detected.map(|unpacked| unpacked.findings),
-        (detected, Unpack::DetectOnly) => detected.map(detection_only),
-    };
-
-    let bytes = match recover_section_headers(image.bytes(), image.model(), regions)? {
-        Some(bytes) => Cow::Owned(bytes),
-        None => initial,
-    };
-
-    Ok(Source {
-        bytes,
+    Ok(Captured {
+        bytes: restore_dos_header(initial, nt_offset),
         disk_headers_used,
-        packer,
-        fresh: None,
+        salvaged_headers,
     })
 }
 
-fn detection_only(unpacked: Unpacked) -> PackerFindings {
-    let mut findings = unpacked.findings;
+fn restore_dos_header(bytes: Cow<'_, [u8]>, nt_offset: usize) -> Cow<'_, [u8]> {
+    let Ok(lfanew) = u32::try_from(nt_offset) else {
+        return bytes;
+    };
 
-    if unpacked.image.is_some() {
-        findings.report.restored.clear();
-        findings.report.lost.clear();
-        findings.report.unrestored = vec!["image (the unpacked image could not be rebuilt)"];
+    let mut restored = bytes.to_vec();
+    let written = write_u16(&mut restored, 0, DOS_MAGIC)
+        .and_then(|()| write_u32(&mut restored, DOS_LFANEW_OFFSET, lfanew)); // below 0x40 this is a header field too, and the file held this value
+
+    match written.is_ok() && parse_memory_image(&restored).is_ok() {
+        true => Cow::Owned(restored),
+        false => bytes,
     }
+}
 
+fn detection_only(mut findings: PackerFindings) -> PackerFindings {
+    findings.report.restored.clear();
+    findings.report.lost.clear();
+    findings.report.unrestored = vec!["image (the unpacked image could not be rebuilt)"];
     findings
 }
 
@@ -133,17 +204,12 @@ fn merge_header_evidence(memory: &[u8], disk: &[u8], observed_base: usize) -> Ap
         write_u32(&mut repaired, model.entry_point_offset, entry_point)?;
     }
 
-    match model.kind {
-        PeKind::Pe32 => write_u32(
-            &mut repaired,
-            model.image_base_offset,
-            u32::try_from(observed_base)
-                .map_err(|_| AppError::new("observed base does not fit a PE32 image"))?,
-        )?,
-        PeKind::Pe32Plus => {
-            write_u64(&mut repaired, model.image_base_offset, observed_base as u64)?
-        }
-    }
+    write_pointer(
+        &mut repaired,
+        model.image_base_offset,
+        model.kind,
+        observed_base as u64,
+    )?;
 
     Ok(repaired)
 }

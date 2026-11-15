@@ -6,6 +6,8 @@ use iced_x86::{
     InstructionBlock, InstructionInfoFactory, Mnemonic, OpAccess, OpKind, Register, RflagsBits,
 };
 
+use super::super::branches::{direct_branches, is_near_immediate};
+
 const GPR_COUNT: usize = 16;
 const RETURN_LIVE: [usize; 11] = [0, 2, 3, 4, 5, 6, 7, 12, 13, 14, 15]; // rax and rdx (edx eax) rsp and the callee saved ones x86 has no r12 to r15
 const TRACKED_FLAGS: u32 = RflagsBits::CF
@@ -48,6 +50,10 @@ pub(super) struct Payload<'a> {
 }
 
 impl Payload<'_> {
+    pub(super) fn resume_after(&self, insn: &Instruction) -> Option<u64> {
+        self.calls_in(insn).then(|| self.after_call(insn))
+    }
+
     fn contains(&self, address: u64) -> bool {
         self.range.contains(&address)
     }
@@ -201,58 +207,6 @@ fn set_branch_target(insn: &mut Instruction, target: u64) {
     }
 }
 
-pub(super) struct Branch {
-    pub(super) site: usize, // offsets into the image not addresses
-    pub(super) target: usize,
-    pub(super) call: bool,
-}
-
-pub(super) fn direct_branches(
-    image: &[u8],
-    base: u64,
-    bits: u32,
-    code: &[Range<usize>],
-    payload: &Payload<'_>,
-) -> Vec<Branch> {
-    let mut branches = Vec::new();
-    for range in code {
-        let Some(bytes) = image.get(range.clone()) else {
-            continue;
-        };
-        let start = base + range.start as u64;
-        let mut decoder = Decoder::with_ip(bits, bytes, start, DecoderOptions::NONE);
-
-        while decoder.can_decode() {
-            let insn = decoder.decode(); // decoded in order since an e8 inside another operand would match as a call
-            let call = insn.flow_control() == FlowControl::Call;
-            let jump = insn.flow_control() == FlowControl::UnconditionalBranch;
-            if !(call || jump) || !is_near_immediate(&insn) {
-                continue;
-            }
-
-            if let (Some(site), Some(target)) = (
-                insn.ip().checked_sub(base),
-                insn.near_branch_target().checked_sub(base),
-            ) {
-                branches.push(Branch {
-                    site: site as usize,
-                    target: target as usize,
-                    call,
-                });
-            }
-
-            if payload.calls_in(&insn) {
-                let back = payload.after_call(&insn);
-                if back > insn.next_ip() && back < start + bytes.len() as u64 {
-                    decoder.set_ip(back); // resume where the stub returns past the vmp padding byte
-                    let _ = decoder.set_position((back - start) as usize);
-                }
-            }
-        }
-    }
-    branches
-}
-
 fn jump_targets(
     image: &[u8],
     base: u64,
@@ -261,7 +215,7 @@ fn jump_targets(
     payload: &Payload<'_>,
 ) -> BTreeMap<usize, usize> {
     let mut targets = BTreeMap::new();
-    for branch in direct_branches(image, base, bits, code, payload) {
+    for branch in direct_branches(image, base, bits, code, &|insn| payload.resume_after(insn)) {
         if !branch.call && payload.contains(base + branch.target as u64) {
             targets.entry(branch.target).or_insert(branch.site); // a jump into the payload is a mutated or virtualized function entry
         }
@@ -400,15 +354,6 @@ fn edges(insn: &Instruction, payload: &Payload<'_>) -> Vec<u64> {
         FlowControl::ConditionalBranch => vec![insn.next_ip()],
         _ => vec![insn.next_ip()],
     }
-}
-
-fn is_near_immediate(insn: &Instruction) -> bool {
-    matches!(
-        insn.op0_kind(),
-        iced_x86::OpKind::NearBranch16
-            | iced_x86::OpKind::NearBranch32
-            | iced_x86::OpKind::NearBranch64
-    )
 }
 
 fn successors(

@@ -1,7 +1,7 @@
 use std::ops::Range;
 
 use super::tables::{
-    CODE_SECTION, DATA_SECTION, DEBUG_ADDRESS_OFFSET, DEBUG_ENTRY_SIZE, DEBUG_SIZE_OFFSET,
+    CODE_SECTION, DATA_SECTION, DEBUG_ADDRESS_OFFSET, DEBUG_ENTRY_SIZE, DEBUG_SIZE_OFFSET, Fixups,
     LinkerBounds, RESOURCE_DATA_SIZE_OFFSET, ResourceLayout, Restoration, SectionHints,
     SectionPiece, THUNK_SIZE, apply_listed_imports, clear_directory, debug_timestamp,
     find_relocation_table, fresh_image, iat_span, lay_out_resources, linker_bounds,
@@ -173,7 +173,8 @@ pub(super) fn restore(
     }
 
     let page = model.section_alignment as usize;
-    let kept_relocations = find_relocation_table(original, &image_range, origin.base, page); // kept data whose directory the packer cleared
+    let kept_relocations =
+        find_relocation_table(original, &image_range, origin.base, page, Fixups::Pristine); // kept data whose directory the packer cleared
 
     let pogo = pogo_parts(&restored, model, end);
     let linked_resources = pogo.as_deref().and_then(|parts| {

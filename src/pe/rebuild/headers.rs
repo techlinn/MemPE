@@ -1,11 +1,10 @@
-use pelite::PeFile;
-
 use super::{
     IMAGE_SCN_CNT_CODE, IMAGE_SCN_CNT_INITIALIZED_DATA, IMAGE_SCN_CNT_UNINITIALIZED_DATA,
     MAX_OUTPUT_SIZE, SECTION_HEADER_SIZE, align_up_u64,
 };
-use crate::pe::image::{read_u16, read_u32, write_u16, write_u32, write_u64};
-use crate::pe::{EntryPointRva, PeKind, PeModel, Rva};
+use crate::pe::image::{read_u16, read_u32, write_pointer, write_u16, write_u32};
+use crate::pe::parse::parse_disk_image;
+use crate::pe::{EntryPointRva, PeModel, Rva};
 use crate::{AppError, AppResult};
 
 const DOS_LFANEW_OFFSET: usize = 0x3c;
@@ -15,7 +14,7 @@ const CHECKSUM_WORD_SIZE: usize = 2;
 const MAX_CHECKSUM_WORDS: usize = MAX_OUTPUT_SIZE / CHECKSUM_WORD_SIZE;
 
 pub(super) fn finalize_output(
-    output: &mut Vec<u8>,
+    output: &mut [u8],
     model: &PeModel,
     entry_point: Option<EntryPointRva>,
 ) -> AppResult<(u32, bool)> {
@@ -23,14 +22,26 @@ pub(super) fn finalize_output(
     write_derived_header_fields(output, model)?;
 
     let executable_flag_added = ensure_executable_image_flag(output, model)?;
+    verify_header_offset(output, model)?;
     apply_checksum(output, model)?;
 
     let final_entry_point = read_u32(output, model.entry_point_offset)?;
-    PeFile::from_bytes(output).map_err(|error| {
-        AppError::new(format!("rebuilt PE failed independent reparse: {error}"))
-    })?;
+    parse_disk_image(output)
+        .map_err(|error| AppError::new(format!("rebuilt PE does not parse as a file: {error}")))?;
 
     Ok((final_entry_point, executable_flag_added))
+}
+
+fn verify_header_offset(output: &[u8], model: &PeModel) -> AppResult<()> {
+    let lfanew = read_u32(output, DOS_LFANEW_OFFSET)? as usize;
+
+    if lfanew != model.nt_offset {
+        return Err(AppError::new(
+            "e_lfanew shares its bytes with a header field the rebuild had to change",
+        ));
+    }
+
+    Ok(())
 }
 
 fn ensure_executable_image_flag(output: &mut [u8], model: &PeModel) -> AppResult<bool> {
@@ -117,37 +128,23 @@ pub(super) fn write_core_header_fields(
 }
 
 fn rebuilt_image_size(model: &PeModel) -> AppResult<u32> {
-    let alignment = u64::from(model.section_alignment);
-    let declared_end = align_up_u64(u64::from(model.image_size), alignment)?;
-
     let maximum_end = model
         .sections
         .iter()
-        .map(|section| {
-            let start = u64::from(section.virtual_address.get());
-            let widest = start + u64::from(section.span());
-
-            match widest <= declared_end {
-                true => widest,
-                false => start + u64::from(section.mapped_size()),
-            }
-        })
+        .map(|section| u64::from(section.virtual_address.get()) + u64::from(section.span()))
         .max()
         .unwrap_or(0);
-    let aligned = align_up_u64(maximum_end, alignment)?;
+    let aligned = align_up_u64(maximum_end, u64::from(model.section_alignment))?;
     u32::try_from(aligned).map_err(|_| AppError::new("rebuilt image size exceeds u32"))
 }
 
 fn write_image_base(output: &mut [u8], model: &PeModel, observed_base: usize) -> AppResult<()> {
-    match model.kind {
-        PeKind::Pe32 => write_u32(
-            output,
-            model.image_base_offset,
-            u32::try_from(observed_base)
-                .map_err(|_| AppError::new("observed PE32 image base exceeds 32 bits"))?,
-        ),
-        PeKind::Pe32Plus => write_u64(output, model.image_base_offset, observed_base as u64),
-    }
+    write_pointer(
+        output,
+        model.image_base_offset,
+        model.kind,
+        observed_base as u64,
+    )
 }
 
 fn apply_entry_point(

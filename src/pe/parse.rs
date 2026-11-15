@@ -10,9 +10,14 @@ pub(super) const MACHINE_I386: u16 = 0x014C;
 pub(super) const MACHINE_AMD64: u16 = 0x8664;
 const IMAGE_FILE_DLL: u16 = 0x2000;
 const FILE_HEADER_SIZE: usize = 20;
-const MAX_SECTIONS: usize = 128;
 const MAX_IMAGE_SIZE: usize = 1024 * 1024 * 1024;
 const MAX_SALVAGE_SCAN: usize = 1024 * 1024;
+const NT_HEADER_ALIGNMENT: usize = 4; // the loader only accepts dword-aligned nt headers
+const MIN_STANDARD_FILE_ALIGNMENT: u32 = 0x200;
+const MAX_FILE_ALIGNMENT: u32 = 0x1_0000;
+pub(super) const MIN_STANDARD_SECTION_ALIGNMENT: u32 = 0x1000;
+const MAX_SECTION_ALIGNMENT: u32 = 0x10_0000;
+const MAX_LOW_ALIGNMENT: u32 = 0x800; // below a page the loader maps the file as is and wants both alignments equal
 
 pub(super) fn parse_memory_image(bytes: &[u8]) -> AppResult<PeImage<'_>> {
     if bytes.len() < 64 {
@@ -37,7 +42,7 @@ pub(super) fn parse_memory_image(bytes: &[u8]) -> AppResult<PeImage<'_>> {
 
     let scan_limit = bytes.len().min(MAX_SALVAGE_SCAN);
 
-    for offset in 0..scan_limit.saturating_sub(4) {
+    for offset in (0..scan_limit.saturating_sub(3)).step_by(NT_HEADER_ALIGNMENT) {
         if offset == normal_offset || peek_u32(bytes, offset) != NT_SIGNATURE {
             continue;
         }
@@ -50,6 +55,33 @@ pub(super) fn parse_memory_image(bytes: &[u8]) -> AppResult<PeImage<'_>> {
     Err(AppError::new(format!(
         "PE header is not valid: {normal_error}; scan found no valid header"
     )))
+}
+
+pub(crate) fn check_memory_headers(bytes: &[u8]) -> AppResult<()> {
+    parse_memory_image(bytes).map(|_| ())
+}
+
+pub(crate) fn map_disk_image(file: &[u8], end: usize) -> Option<Vec<u8>> {
+    let disk = parse_disk_image(file).ok()?;
+    let mut image = vec![0u8; end];
+
+    let headers = read_u32(file, disk.model().size_of_headers_offset).ok()? as usize;
+    let mapped_headers = headers.min(file.len()).min(end);
+    image
+        .get_mut(..mapped_headers)?
+        .copy_from_slice(file.get(..mapped_headers)?);
+
+    for section in disk.model().sections() {
+        let rva = section.virtual_address().as_usize();
+        let start = section.raw_pointer as usize;
+        let length = (section.raw_size as usize).min(section.span() as usize);
+        let raw = file.get(start..start.checked_add(length)?)?;
+        if let Some(slot) = image.get_mut(rva..rva.saturating_add(raw.len())) {
+            slot.copy_from_slice(raw);
+        }
+    }
+
+    Some(image)
 }
 
 pub(super) fn parse_disk_image(bytes: &[u8]) -> AppResult<PeImage<'_>> {
@@ -156,6 +188,7 @@ fn parse_candidate(
         bytes,
         optional_end,
         header.section_count,
+        section_alignment,
         declared_image_size,
     )?;
 
@@ -216,10 +249,8 @@ fn parse_file_header(bytes: &[u8], nt_offset: usize) -> AppResult<FileHeader> {
     let machine = read_u16(bytes, offset)?;
     let section_count = usize::from(read_u16(bytes, checked_add(offset, 2, "section count")?)?);
 
-    if section_count == 0 || section_count > MAX_SECTIONS {
-        return Err(AppError::new(format!(
-            "invalid section count {section_count}"
-        )));
+    if section_count == 0 {
+        return Err(AppError::new("PE has no sections"));
     }
 
     let optional_size = usize::from(read_u16(
@@ -290,6 +321,7 @@ fn parse_sections(
     bytes: &[u8],
     table_offset: usize,
     section_count: usize,
+    section_alignment: u32,
     declared_image_size: usize,
 ) -> AppResult<Vec<SectionModel>> {
     let mut sections = Vec::with_capacity(section_count);
@@ -318,7 +350,7 @@ fn parse_sections(
                 .ok_or_else(|| AppError::new("section name is outside the captured image"))?,
         );
 
-        let section = SectionModel {
+        let mut section = SectionModel {
             header_offset,
             name,
             virtual_size,
@@ -326,9 +358,11 @@ fn parse_sections(
             raw_pointer,
             raw_size,
             characteristics,
+            extent: 0,
         };
 
         validate_section(&section, declared_image_size)?;
+        section.extent = section_extent(&section, section_alignment, declared_image_size);
         sections.push(section);
     }
 
@@ -338,22 +372,42 @@ fn parse_sections(
 }
 
 fn validate_alignments(file_alignment: u32, section_alignment: u32) -> AppResult<()> {
-    if !(0x200..=0x1_0000).contains(&file_alignment) || !file_alignment.is_power_of_two() {
+    if !file_alignment.is_power_of_two() || !section_alignment.is_power_of_two() {
         return Err(AppError::new(format!(
-            "invalid file alignment 0x{file_alignment:X}"
+            "alignments 0x{file_alignment:X}/0x{section_alignment:X} are not powers of two"
         )));
     }
 
-    if section_alignment < file_alignment
-        || section_alignment > 0x10_0000
-        || !section_alignment.is_power_of_two()
-    {
+    let low = section_alignment < MIN_STANDARD_SECTION_ALIGNMENT;
+    let valid = match low {
+        true => file_alignment == section_alignment && section_alignment <= MAX_LOW_ALIGNMENT,
+        false => {
+            (MIN_STANDARD_FILE_ALIGNMENT..=MAX_FILE_ALIGNMENT).contains(&file_alignment)
+                && file_alignment <= section_alignment
+                && section_alignment <= MAX_SECTION_ALIGNMENT
+        }
+    };
+
+    if !valid {
         return Err(AppError::new(format!(
-            "invalid section alignment 0x{section_alignment:X}"
+            "invalid alignments: file 0x{file_alignment:X}, section 0x{section_alignment:X}"
         )));
     }
 
     Ok(())
+}
+
+fn section_extent(section: &SectionModel, section_alignment: u32, image_size: usize) -> u32 {
+    let mapped = u64::from(section.mapped_size());
+
+    if mapped == 0 {
+        return 0;
+    }
+
+    let start = u64::from(section.virtual_address.get());
+    let room = (image_size as u64).saturating_sub(start);
+    let aligned = mapped.next_multiple_of(u64::from(section_alignment));
+    u32::try_from(aligned.min(room).max(mapped)).unwrap_or(u32::MAX)
 }
 
 fn validate_section(section: &SectionModel, image_size: usize) -> AppResult<()> {

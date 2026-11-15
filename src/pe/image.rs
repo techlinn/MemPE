@@ -1,3 +1,4 @@
+use crate::pe::parse::MIN_STANDARD_SECTION_ALIGNMENT;
 use crate::pe::{DataDirectory, PeImage, PeKind, PeModel, Rva, SectionModel};
 use crate::{AppError, AppResult};
 
@@ -39,7 +40,12 @@ impl<'a> PeImage<'a> {
 
 impl SectionModel {
     pub(super) fn span(&self) -> u32 {
-        self.virtual_size.max(self.raw_size)
+        self.extent
+    }
+
+    pub(super) fn range(&self) -> std::ops::Range<usize> {
+        let start = self.virtual_address.as_usize();
+        start..start.saturating_add(self.extent as usize)
     }
 
     pub(super) fn mapped_size(&self) -> u32 {
@@ -47,6 +53,10 @@ impl SectionModel {
             0 => self.raw_size,
             size => size, // the loader drops raw data past VirtualSize
         }
+    }
+
+    pub(super) fn held_size(&self) -> u32 {
+        self.mapped_size().max(self.raw_size.min(self.extent)) // raw data past what the loader maps is not image
     }
 
     pub(super) fn contains_rva(&self, rva: Rva) -> bool {
@@ -83,6 +93,10 @@ impl PeModel {
 
     pub(super) fn sections(&self) -> &[SectionModel] {
         &self.sections
+    }
+
+    pub(super) fn is_low_alignment(&self) -> bool {
+        self.section_alignment < MIN_STANDARD_SECTION_ALIGNMENT
     }
 
     pub(super) fn directory(&self, bytes: &[u8], index: usize) -> AppResult<Option<DataDirectory>> {
@@ -185,6 +199,22 @@ pub(super) fn write_u32(bytes: &mut [u8], offset: usize, value: u32) -> AppResul
 pub(super) fn write_u64(bytes: &mut [u8], offset: usize, value: u64) -> AppResult<()> {
     range_mut(bytes, offset, 8, "PE field")?.copy_from_slice(&value.to_le_bytes());
     Ok(())
+}
+
+pub(super) fn write_pointer(
+    bytes: &mut [u8],
+    offset: usize,
+    kind: PeKind,
+    value: u64,
+) -> AppResult<()> {
+    match kind {
+        PeKind::Pe32 => {
+            let value = u32::try_from(value)
+                .map_err(|_| AppError::new("pointer does not fit a PE32 field"))?;
+            write_u32(bytes, offset, value)
+        }
+        PeKind::Pe32Plus => write_u64(bytes, offset, value),
+    }
 }
 
 pub(super) fn require_range(bytes: &[u8], offset: usize, length: usize) -> AppResult<()> {

@@ -1,15 +1,17 @@
+use std::collections::HashSet;
 use std::ops::Range;
 
 use super::{
     IMAGE_SCN_CNT_CODE, MAX_OUTPUT_SIZE, PAGE_SIZE, SECTION_HEADER_SIZE, SectionLayout, align_up,
 };
-use crate::pe::image::{first_section_rva, write_u32};
+use crate::pe::image::{first_section_rva, read_u32, write_u32};
 use crate::pe::{
     IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE, PeModel, RegionEvidence,
+    SECURITY_DIRECTORY, SectionModel,
 };
 use crate::{AppError, AppResult};
 
-const SECTION_NAME_SIZE: usize = 8;
+pub(super) const SECTION_NAME_SIZE: usize = 8;
 const PRINTABLE_FIRST: u8 = 0x20;
 const PRINTABLE_LAST: u8 = 0x7e;
 const MAX_RENAME_ATTEMPTS: usize = 64;
@@ -24,7 +26,7 @@ pub(super) fn build_output_buffer<'a>(
         .last()
         .map(|section| section.header_offset.saturating_add(SECTION_HEADER_SIZE))
         .ok_or_else(|| AppError::new("PE has no section headers"))?;
-    let header_size = header_size(model, section_table_end, !import_tables.is_empty())?;
+    let header_size = header_size(model, memory, section_table_end, !import_tables.is_empty())?;
     let layouts = layout_sections(model, memory, header_size, import_tables)?;
     let output_size = layouts
         .iter()
@@ -52,19 +54,29 @@ pub(super) fn build_output_buffer<'a>(
 
 fn header_size(
     model: &PeModel,
+    memory: &[u8],
     section_table_end: usize,
     reserve_import_header: bool,
 ) -> AppResult<usize> {
+    let first_section = first_section_rva(&model.sections).unwrap_or(usize::MAX);
+
+    if model.is_low_alignment() {
+        return Ok(first_section.min(memory.len()).max(section_table_end)); // file offsets equal rvas there
+    }
+
+    let declared = read_u32(memory, model.size_of_headers_offset).map_or(0, |size| size as usize);
+    let kept = declared.min(first_section).min(memory.len()); // tiny packers keep code and strings past the section table
+    let used = section_table_end.max(kept);
+
     let alignment = model.file_alignment as usize;
-    let minimum = align_up(section_table_end, alignment)?;
+    let minimum = align_up(used, alignment)?;
 
     if !reserve_import_header {
         return Ok(minimum);
     }
 
     let next_header_end = section_table_end.saturating_add(SECTION_HEADER_SIZE); // the .mempe header
-    let with_room = align_up(next_header_end, alignment)?;
-    let first_section = first_section_rva(&model.sections).unwrap_or(usize::MAX);
+    let with_room = align_up(used.max(next_header_end), alignment)?;
 
     Ok(if with_room <= first_section {
         with_room
@@ -78,16 +90,28 @@ pub(super) fn write_sections(
     memory: &[u8],
     layouts: &[SectionLayout<'_>],
 ) -> AppResult<usize> {
+    let mut taken = layouts
+        .iter()
+        .map(|layout| *layout.model.name())
+        .collect::<HashSet<_>>();
     let mut renamed = 0usize;
+
     for (index, layout) in layouts.iter().enumerate() {
         let header = layout.model.header_offset;
 
-        if let Some(name) = unique_replacement_name(layouts, index) {
+        if let Some(name) =
+            unique_replacement_name(layout.model.name(), index, layouts.len(), &taken)
+        {
             output
                 .get_mut(header..header.saturating_add(SECTION_NAME_SIZE))
                 .ok_or_else(|| AppError::new("section name lies outside the rebuilt PE"))?
                 .copy_from_slice(&name);
+            taken.insert(name);
             renamed = renamed.saturating_add(1);
+        }
+
+        if layout.model.virtual_size == 0 {
+            write_u32(output, header.saturating_add(8), layout.model.mapped_size())?; // the loader falls back to the raw size, which the layout may change
         }
 
         write_u32(
@@ -153,7 +177,7 @@ pub(super) fn recover_section_headers(
             continue;
         }
 
-        let declared = section.virtual_size.max(section.raw_size) as usize;
+        let declared = section.held_size() as usize;
         let expanded = expanded_section_length(memory, regions, start, limit, declared);
         let section_end = start.saturating_add(expanded).min(limit);
         let characteristics =
@@ -309,10 +333,13 @@ fn layout_sections<'a>(
 
     let mut layouts = Vec::with_capacity(sections.len());
     let mut raw_offset = header_size;
+    let low_alignment = model.is_low_alignment();
+    let directories = directory_ranges(model, memory);
 
     for (index, section) in sections.iter().enumerate() {
         let source_offset = section.virtual_address.get() as usize;
-        let declared_length = section.virtual_size.max(section.raw_size) as usize;
+        let declared_length =
+            (section.held_size() as usize).max(directory_reach(section, &directories)); // a table may run into the zero tail the loader maps past VirtualSize
         let next_rva = sections
             .get(index + 1)
             .map(|next| next.virtual_address.get() as usize)
@@ -324,16 +351,24 @@ fn layout_sections<'a>(
         let holds_import_table = import_tables
             .iter()
             .any(|table| table.start < source_end && table.end > source_offset); // its empty slots get lookup entries, which need file data
-        let empty = section_is_zero(memory, source_offset, source_length) && !holds_import_table;
+        let empty = !low_alignment
+            && section_is_zero(memory, source_offset, source_length)
+            && !holds_import_table;
         let raw_size = if source_length == 0 || empty {
             0
         } else {
             align_up(source_length, model.file_alignment as usize)?
         };
+
+        let placed = match (raw_size, low_alignment) {
+            (0, _) => 0,
+            (_, true) => source_offset,
+            (_, false) => raw_offset,
+        };
         layouts.push(SectionLayout {
             model: section,
             source_length,
-            raw_offset: if raw_size == 0 { 0 } else { raw_offset },
+            raw_offset: placed,
             raw_size,
         });
 
@@ -345,33 +380,56 @@ fn layout_sections<'a>(
     Ok(layouts)
 }
 
+fn directory_ranges(model: &PeModel, memory: &[u8]) -> Vec<Range<usize>> {
+    (0..model.directory_count)
+        .filter(|index| *index != SECURITY_DIRECTORY) // a file offset, not an rva
+        .filter_map(|index| model.directory(memory, index).ok().flatten())
+        .map(|directory| {
+            let start = directory.rva().as_usize();
+            start..start.saturating_add(directory.size() as usize)
+        })
+        .collect()
+}
+
+fn directory_reach(section: &SectionModel, directories: &[Range<usize>]) -> usize {
+    let start = section.virtual_address.as_usize();
+    let extent = section.span() as usize;
+
+    directories
+        .iter()
+        .filter(|directory| (start..start.saturating_add(extent)).contains(&directory.start))
+        .map(|directory| directory.end.saturating_sub(start).min(extent))
+        .max()
+        .unwrap_or(0)
+}
+
 fn section_is_zero(memory: &[u8], offset: usize, length: usize) -> bool {
     memory
         .get(offset..offset.saturating_add(length))
         .is_some_and(|slice| slice.iter().all(|byte| *byte == 0))
 }
 
-fn unique_replacement_name(layouts: &[SectionLayout<'_>], index: usize) -> Option<[u8; 8]> {
-    let current = layouts.get(index)?;
+fn unique_replacement_name(
+    name: &[u8; 8],
+    index: usize,
+    count: usize,
+    taken: &HashSet<[u8; 8]>,
+) -> Option<[u8; 8]> {
     let mut position = index.saturating_add(1);
 
     for _attempt in 0..MAX_RENAME_ATTEMPTS {
-        let candidate = readable_section_name(current.model.name(), position)?;
-        let taken = layouts
-            .iter()
-            .enumerate()
-            .any(|(other, layout)| other != index && layout.model.name() == &candidate);
-        if !taken {
+        let candidate = readable_section_name(name, position)?;
+        if !taken.contains(&candidate) {
             return Some(candidate);
         }
 
-        position = position.saturating_add(layouts.len());
+        position = position.saturating_add(count);
     }
 
     None
 }
 
-pub(super) fn readable_section_name(name: &[u8; 8], position: usize) -> Option<[u8; 8]> {
+fn readable_section_name(name: &[u8; 8], position: usize) -> Option<[u8; 8]> {
     let end = name
         .iter()
         .position(|byte| *byte == 0)

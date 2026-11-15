@@ -1,5 +1,5 @@
 use super::exception::{runtime_function_is_valid, unwind_layout};
-use super::sections::readable_section_name;
+use super::sections::SECTION_NAME_SIZE;
 use super::{PAGE_SIZE, SectionLayout};
 use crate::pe::image::{read_pointer, read_u32};
 use crate::pe::{
@@ -84,8 +84,10 @@ fn section_never_decrypted(memory: &[u8], layout: &SectionLayout<'_>, page_flags
     }
 
     let first_page = start / PAGE_SIZE;
-    let page_count = layout.source_length.div_ceil(PAGE_SIZE);
-    let Some(pages) = page_flags.get(first_page..first_page.saturating_add(page_count)) else {
+    let end_page = start
+        .saturating_add(layout.source_length)
+        .div_ceil(PAGE_SIZE); // low-alignment sections need not start on a page
+    let Some(pages) = page_flags.get(first_page..end_page) else {
         return false;
     };
 
@@ -106,6 +108,10 @@ pub(super) fn invalid_pdata_sections(
     layouts: &[SectionLayout<'_>],
     header_size: usize,
 ) -> usize {
+    if model.kind() == PeKind::Pe32 {
+        return 0; // x86 has no table-based unwinding, so a .pdata section there is just a name
+    }
+
     let declared = exception_rva(output, model);
     layouts
         .iter()
@@ -238,16 +244,16 @@ pub(super) fn count_tls_callbacks(image: &PeImage<'_>, observed_base: usize) -> 
 }
 
 pub(super) fn entry_section_name(
+    output: &[u8],
     layouts: &[SectionLayout<'_>],
     entry_point: u32,
 ) -> Option<String> {
     let rva = Rva(entry_point);
-    let (index, layout) = layouts
+    let layout = layouts
         .iter()
-        .enumerate()
-        .find(|(_, layout)| layout.model.contains_rva(rva))?;
-    let name = readable_section_name(layout.model.name(), index.saturating_add(1))
-        .unwrap_or(*layout.model.name());
+        .find(|layout| layout.model.contains_rva(rva))?;
+    let header = layout.model.header_offset;
+    let name = output.get(header..header.saturating_add(SECTION_NAME_SIZE))?; // the name as written, after any rename
     let end = name
         .iter()
         .position(|byte| *byte == 0)

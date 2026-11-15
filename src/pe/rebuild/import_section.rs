@@ -1,6 +1,6 @@
 use super::directories::{clear_directory, write_directory};
 use super::{MAX_OUTPUT_SIZE, SECTION_HEADER_SIZE, align_up, align_up_u64};
-use crate::pe::image::{read_pointer, read_u16, read_u32, write_u16, write_u32, write_u64};
+use crate::pe::image::{read_pointer, read_u16, read_u32, write_pointer, write_u16, write_u32};
 use crate::pe::imports::{ImportGroup, ImportPlan};
 use crate::pe::{BOUND_IMPORT_DIRECTORY, IAT_DIRECTORY, IMPORT_DIRECTORY, PeKind, PeModel};
 use crate::{AppError, AppResult};
@@ -34,7 +34,8 @@ pub(super) fn append_import_section(
         .ok_or_else(|| AppError::new("new section-header offset overflowed"))?;
     let header_limit = usize::try_from(read_u32(output, model.size_of_headers_offset)?)
         .map_err(|_| AppError::new("PE header size does not fit memory"))?;
-    if section_header.saturating_add(SECTION_HEADER_SIZE) > header_limit {
+    let table_full = read_u16(output, model.nt_offset.saturating_add(6))? == u16::MAX;
+    if table_full || section_header.saturating_add(SECTION_HEADER_SIZE) > header_limit {
         return Ok(ImportSection::NoRoomInHeaders);
     }
 
@@ -47,7 +48,10 @@ pub(super) fn append_import_section(
         .map_err(|_| AppError::new("import section RVA exceeds u32"))?;
     let payload = build_import_payload(plan, model.kind, virtual_address)?;
     let bound_cleared = clear_overlapping_bound_imports(output, model, section_header)?;
-    let raw_offset = align_up(output.len(), model.file_alignment as usize)?;
+    let raw_offset = match model.is_low_alignment() {
+        true => virtual_address as usize, // file offsets equal rvas there
+        false => align_up(output.len(), model.file_alignment as usize)?,
+    };
     let raw_size = align_up(payload.len(), model.file_alignment as usize)?;
     let final_size = raw_offset
         .checked_add(raw_size)
@@ -136,7 +140,7 @@ fn fill_empty_slots(
                 lookup.saturating_add(entry.saturating_mul(width)),
                 kind,
             )?;
-            write_thunk(output, slot, kind, thunk as u64)?; // the loader stops at an empty slot, so one the stub never filled gets its lookup entry
+            write_pointer(output, slot, kind, thunk as u64)?; // the loader stops at an empty slot, so one the stub never filled gets its lookup entry
         }
     }
 
@@ -163,6 +167,10 @@ fn clear_overlapping_bound_imports(
         return Ok(false);
     }
 
+    if let Some(table) = output.get_mut(start..end) {
+        table.fill(0); // the stale binding goes with its directory, freeing the slot
+    }
+
     Ok(clear_directory(output, model, BOUND_IMPORT_DIRECTORY)? > 0)
 }
 
@@ -174,10 +182,14 @@ fn write_mempe_section_header(
     raw_offset: usize,
     raw_size: usize,
 ) -> AppResult<()> {
-    let name = output
-        .get_mut(section_header..section_header.saturating_add(8))
-        .ok_or_else(|| AppError::new("new section name lies outside the PE headers"))?;
-    name.copy_from_slice(b".mempe\0\0");
+    let header = output
+        .get_mut(section_header..section_header.saturating_add(SECTION_HEADER_SIZE))
+        .ok_or_else(|| AppError::new("new section header lies outside the PE headers"))?;
+    header.fill(0);
+    header
+        .get_mut(..8)
+        .ok_or_else(|| AppError::new("new section name lies outside the PE headers"))?
+        .copy_from_slice(b".mempe\0\0");
     write_u32(
         output,
         section_header.saturating_add(8),
@@ -307,7 +319,7 @@ fn write_lookup_thunks(
         let thunk_offset = lookup_offset
             .checked_add(entry_index.saturating_mul(width))
             .ok_or_else(|| AppError::new("import thunk offset overflowed"))?;
-        write_thunk(payload, thunk_offset, kind, thunk)?;
+        write_pointer(payload, thunk_offset, kind, thunk)?;
     }
 
     Ok(())
@@ -372,15 +384,4 @@ fn append_ascii(bytes: &mut Vec<u8>, value: &str) -> AppResult<()> {
 
 fn align_vec(bytes: &mut Vec<u8>, alignment: usize) {
     bytes.resize(bytes.len().next_multiple_of(alignment), 0);
-}
-
-fn write_thunk(bytes: &mut [u8], offset: usize, kind: PeKind, value: u64) -> AppResult<()> {
-    match kind {
-        PeKind::Pe32 => write_u32(
-            bytes,
-            offset,
-            u32::try_from(value).map_err(|_| AppError::new("PE32 import thunk exceeds u32"))?,
-        ),
-        PeKind::Pe32Plus => write_u64(bytes, offset, value),
-    }
 }
