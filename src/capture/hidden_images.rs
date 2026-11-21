@@ -416,6 +416,32 @@ fn raw_data_before_sections(
     })
 }
 
+pub(super) fn headerless_live_code(
+    regions: &[MemoryRegion],
+    allocations: &BTreeSet<usize>,
+    hidden: &[(usize, usize)],
+    starts: &[usize],
+) -> Vec<usize> {
+    let allocation_of = |address: usize| {
+        regions
+            .iter()
+            .find(|region| (region.base..region.end()).contains(&address))
+            .map(|region| region.allocation_base)
+    };
+    let with_pe: BTreeSet<usize> = hidden
+        .iter()
+        .filter_map(|(base, _)| allocation_of(*base))
+        .collect();
+
+    starts
+        .iter()
+        .filter_map(|start| allocation_of(*start))
+        .filter(|allocation| allocations.contains(allocation) && !with_pe.contains(allocation))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 pub(super) fn executable_non_image_allocations(regions: &[MemoryRegion]) -> BTreeSet<usize> {
     regions
         .iter()

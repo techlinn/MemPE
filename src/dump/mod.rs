@@ -116,6 +116,7 @@ pub(crate) fn build<'a>(
 ) -> BuiltDump<'a> {
     let counts = CaptureCounts {
         executable_non_image_allocations: capture.executable_non_image_allocations,
+        headerless_live_code: capture.headerless_live_code,
         unscanned_bytes: capture.unscanned_non_image_bytes,
         locked_bytes: capture.locked_non_image_bytes,
         skipped: capture.skipped,

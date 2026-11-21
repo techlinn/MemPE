@@ -14,7 +14,7 @@ use self::address_space::{AddressSpace, OpenedAddressSpace};
 pub(crate) use self::hidden_images::HiddenRejections;
 use self::hidden_images::{
     HiddenScan, ScannedAllocations, executable_non_image_allocations, find_hidden_images,
-    read_allocations, readable_non_image_allocations, unlock_regions,
+    headerless_live_code, read_allocations, readable_non_image_allocations, unlock_regions,
 };
 use self::images::{
     ImageGroup, annotate_images, group_images, image_bases, main_base_conflict, mapped_file_name,
@@ -28,7 +28,7 @@ use self::regions::{
 pub(crate) use self::wait_until_stable::wait_until_stable;
 use crate::pe::MAX_IMAGE_SIZE;
 use crate::pe::PAGE_SIZE;
-use crate::process::{MemoryRegion, TargetProcess};
+use crate::process::{MemoryRegion, TargetProcess, thread_starts};
 use crate::rebuild::RegionProtection;
 use crate::{AppError, AppResult};
 
@@ -109,6 +109,7 @@ pub(crate) struct Capture {
     pub(crate) fallback_reason: Option<String>,
     pub(crate) images: Vec<CapturedImage>,
     pub(crate) executable_non_image_allocations: usize,
+    pub(crate) headerless_live_code: Vec<usize>, // allocation bases
     pub(crate) carve_regions: Vec<RawRegion>,
     pub(crate) raw_regions: Vec<RawRegion>,
     pub(crate) unscanned_non_image_bytes: usize,
@@ -157,6 +158,7 @@ pub(crate) fn capture(target: &TargetProcess, raw_regions: bool) -> AppResult<Ca
         fallback_reason,
         images,
         executable_non_image_allocations: captured.non_image_count,
+        headerless_live_code: captured.headerless_live_code,
         carve_regions: captured.carve_regions,
         raw_regions: captured.raw_regions,
         unscanned_non_image_bytes: captured.unscanned_non_image_bytes,
@@ -172,6 +174,7 @@ pub(crate) fn capture(target: &TargetProcess, raw_regions: bool) -> AppResult<Ca
 struct CapturedSpace {
     images: Vec<CapturedImage>,
     non_image_count: usize,
+    headerless_live_code: Vec<usize>,
     carve_regions: Vec<RawRegion>,
     raw_regions: Vec<RawRegion>,
     unscanned_non_image_bytes: usize,
@@ -264,6 +267,9 @@ fn capture_from_space(
         unscanned: unscanned_hidden,
         rejected: hidden_rejected,
     } = find_hidden_images(space, &regions, &non_image_allocations, &unlocked)?;
+    let starts = thread_starts(target.pid.get());
+    let headerless_live_code =
+        headerless_live_code(&regions, &non_image_allocations, &hidden, &starts);
 
     let (images, mut skipped) =
         read_all_images(space, target, &regions, groups, &hidden, main_base)?;
@@ -315,6 +321,7 @@ fn capture_from_space(
     Ok(CapturedSpace {
         images,
         non_image_count,
+        headerless_live_code,
         carve_regions: carve.regions,
         raw_regions: raw.regions,
         unscanned_non_image_bytes: carve.skipped.saturating_add(unscanned_hidden),

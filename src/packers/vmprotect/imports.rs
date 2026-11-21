@@ -118,6 +118,9 @@ impl Unresolved {
 
 pub(super) struct Found {
     pub(super) resolved: Vec<Import>,
+    pub(super) virtualized: Vec<u64>, // apis only virtualized code calls: no site to patch
+    pub(super) vm_entries: BTreeSet<usize>,
+    linked: HashSet<String>,
     pub(super) unresolved: Unresolved,
     pub(super) sites: usize, // decoded branches into the stub section
     pub(super) placed_by_branches: usize,
@@ -196,7 +199,7 @@ pub(super) fn resolve(
     code: &[Range<usize>],
     payload: &Payload<'_>,
     origin: &Origin<'_>,
-    linked: HashSet<String>,
+    mut linked: HashSet<String>,
 ) -> Found {
     let stubs = layout.stubs.clone().unwrap_or(layout.block.clone()); // stubs only, never mempe's sections
     let base = origin.base as u64;
@@ -243,10 +246,14 @@ pub(super) fn resolve(
 
     let mut decoded = Vec::new();
     let mut read = HashSet::new();
+    let mut vm_entries = BTreeSet::new();
     let mut sites = 0;
     for branch in branches {
         if !stubs.contains(&branch.target) {
             let into_vm = layout.block.contains(&branch.target);
+            if into_vm {
+                vm_entries.insert(branch.target);
+            }
             let undersized = layout.undersized.as_ref().is_some_and(|section| {
                 section.contains(&branch.target) && !section.contains(&branch.site)
             });
@@ -303,8 +310,17 @@ pub(super) fn resolve(
     kept.extend(drop_overlaps(recovered, &mut unresolved));
     kept.sort_by_key(|site| site.site);
 
+    linked.extend(
+        kept.iter()
+            .filter(|site| !site.wrapper)
+            .filter_map(|site| module_of(origin, site.target)),
+    );
+
     let before = kept.len();
-    let kept = from_linked_modules(kept, origin.exports, linked);
+    let kept: Vec<Import> = kept
+        .into_iter()
+        .filter(|site| !site.wrapper || from_linked(origin, &linked, site.target))
+        .collect();
     unresolved.add(Why::NotAnExport, before - kept.len());
 
     Found {
@@ -313,30 +329,53 @@ pub(super) fn resolve(
             .filter(|site| placed.contains(&site.site))
             .count(),
         resolved: kept,
+        virtualized: Vec::new(),
+        vm_entries,
+        linked,
         unresolved,
         sites: decoded_sites,
     }
 }
 
-// a wrapper stands for one of the program's imports, from a dll the program links: vmp keeps one
-// import from each of those so the loader maps it. one that lands in any other dll was injected into
-// the process and hooked the api there
-fn from_linked_modules(
-    sites: Vec<Import>,
-    exports: &ExportIndex,
-    mut linked: HashSet<String>,
-) -> Vec<Import> {
-    let module = |site: &Import| {
-        exports
-            .resolve(usize::try_from(site.target).ok()?)
-            .map(|resolved| resolved.symbol.module.to_ascii_lowercase())
+pub(super) fn virtualized_calls<'a>(
+    bytes: &[u8],
+    bits: u32,
+    layout: &Layout,
+    origin: &Origin<'_>,
+    found: &Found,
+    entries: impl Iterator<Item = &'a usize>,
+) -> Vec<u64> {
+    let base = origin.base as u64;
+    let runner = StubRunner {
+        image: bytes,
+        base,
+        bits,
+        memory: origin.memory,
     };
-    linked.extend(sites.iter().filter(|site| !site.wrapper).filter_map(module));
-
-    sites
+    let packer = base + layout.block.start as u64..base + layout.block.end as u64;
+    let called: BTreeSet<u64> = entries
+        .collect::<BTreeSet<_>>()
         .into_iter()
-        .filter(|site| !site.wrapper || module(site).is_some_and(|module| linked.contains(&module)))
+        .filter_map(|entry| runner.virtualized_calls(base + *entry as u64, &packer))
+        .flatten()
+        .collect();
+
+    let stubbed: HashSet<u64> = found.resolved.iter().map(|site| site.target).collect();
+    called
+        .into_iter()
+        .filter(|api| !stubbed.contains(api) && from_linked(origin, &found.linked, *api))
         .collect()
+}
+
+fn from_linked(origin: &Origin<'_>, linked: &HashSet<String>, api: u64) -> bool {
+    module_of(origin, api).is_some_and(|module| linked.contains(&module))
+}
+
+fn module_of(origin: &Origin<'_>, api: u64) -> Option<String> {
+    origin
+        .exports
+        .resolve(usize::try_from(api).ok()?)
+        .map(|resolved| resolved.symbol.module.to_ascii_lowercase())
 }
 
 fn overlaps_any(site: &Import, sites: &[Import]) -> bool {
@@ -349,14 +388,20 @@ fn overlaps_any(site: &Import, sites: &[Import]) -> bool {
 pub(super) fn rebuild(
     restored: &mut Vec<u8>,
     model: &PeModel,
-    sites: &[Import],
+    found: &Found,
     msvc: bool,
     origin: &Origin<'_>,
 ) -> Option<PackerImports> {
-    (!sites.is_empty()).then_some(())?;
+    let sites = &found.resolved;
+    let targets: Vec<u64> = sites
+        .iter()
+        .map(|site| site.target)
+        .chain(found.virtualized.iter().copied())
+        .collect();
+    (!targets.is_empty()).then_some(())?;
+
     let base = origin.base;
     let width = model.kind.pointer_width();
-    let targets: Vec<u64> = sites.iter().map(|site| site.target).collect();
     let table = table_layout(&targets, msvc, origin.exports);
 
     let iat_size = table.slots.len().checked_mul(width)?;

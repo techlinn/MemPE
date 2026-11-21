@@ -5,6 +5,7 @@ use iced_x86::Instruction;
 
 use super::execute::Width;
 use crate::pe::process_memory::ProcessMemory;
+use crate::process::os_version;
 use crate::unpack::x86::branches::decode_one;
 use crate::unpack::x86::branches::{MAX_CALL_PADDING, REL32_LEN};
 use crate::unpack::x86::opcodes::MAX_INSTRUCTION;
@@ -42,6 +43,7 @@ struct TebFields {
     stack_top: u64,
     stack_limit: u64,
     peb_image_base: u64,
+    peb_os_version: u64,
 }
 
 const TEB_64: TebFields = TebFields {
@@ -50,6 +52,7 @@ const TEB_64: TebFields = TebFields {
     stack_top: 0x08,
     stack_limit: 0x10,
     peb_image_base: 0x10,
+    peb_os_version: 0x118,
 };
 const TEB_32: TebFields = TebFields {
     own_address: 0x18,
@@ -57,6 +60,7 @@ const TEB_32: TebFields = TebFields {
     stack_top: 0x04,
     stack_limit: 0x08,
     peb_image_base: 0x08,
+    peb_os_version: 0xA4,
 };
 
 const TEB_BASE_64: u64 = 0x7FFE_0000_0000;
@@ -531,6 +535,12 @@ impl<'a> Cpu<'a> {
         cpu.write_mem(teb_base + teb.stack_limit, ptr, stack_base);
         cpu.write_mem(peb_base + PEB_BEING_DEBUGGED, 1, 0);
         cpu.write_mem(peb_base + teb.peb_image_base, ptr, image_base);
+        if let Some(version) = os_version() {
+            let fields = (peb_base + teb.peb_os_version..).step_by(4);
+            for (at, field) in fields.zip(version.as_chunks::<4>().0) {
+                cpu.write_mem(at, 4, u64::from(u32::from_le_bytes(*field)));
+            }
+        }
         if bits == 32 {
             cpu.write_mem(teb_base, ptr, SEH_CHAIN_END); // fs:[0]
         }

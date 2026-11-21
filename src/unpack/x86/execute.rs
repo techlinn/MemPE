@@ -353,6 +353,16 @@ impl Cpu<'_> {
                 }
                 Some(())
             }
+            Mnemonic::Cpuid => {
+                // the program ran on this machine, so this cpu's answer is the one it got
+                let answer =
+                    std::arch::x86_64::__cpuid_count(self.gpr[RAX] as u32, self.gpr[RCX] as u32);
+                self.gpr[RAX] = u64::from(answer.eax);
+                self.gpr[RBX] = u64::from(answer.ebx);
+                self.gpr[RCX] = u64::from(answer.ecx);
+                self.gpr[RDX] = u64::from(answer.edx);
+                Some(())
+            }
             Mnemonic::Pause | Mnemonic::Lfence | Mnemonic::Mfence | Mnemonic::Sfence => Some(()),
             _ if insn.is_string_instruction() => self.string_op(insn),
             Mnemonic::Leave => {

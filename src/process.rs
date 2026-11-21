@@ -26,6 +26,7 @@ use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, MODULEENTRY32W, Module32FirstW, Module32NextW, PROCESSENTRY32W,
     Process32FirstW, Process32NextW, TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32, TH32CS_SNAPPROCESS,
+    TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
 use windows::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQueryEx};
 use windows::Win32::System::ProcessStatus::K32GetMappedFileNameW;
@@ -34,9 +35,9 @@ use windows::Win32::System::SystemInformation::{
     IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_I386, IMAGE_FILE_MACHINE_UNKNOWN,
 };
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, GetProcessTimes, IsWow64Process2, OpenProcess, OpenProcessToken,
+    GetCurrentProcess, GetProcessTimes, IsWow64Process2, OpenProcess, OpenProcessToken, OpenThread,
     PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_VM_READ, QueryFullProcessImageNameW,
+    PROCESS_VM_READ, QueryFullProcessImageNameW, THREAD_QUERY_INFORMATION,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -201,29 +202,57 @@ unsafe extern "system" {
         length: u32,
         returned: *mut u32,
     ) -> i32;
+
+    fn NtQueryInformationThread(
+        thread: HANDLE,
+        class: u32,
+        information: *mut c_void,
+        length: u32,
+        returned: *mut u32,
+    ) -> i32;
 }
+
+const THREAD_START_ADDRESS: u32 = 9; // ThreadQuerySetWin32StartAddress
 
 const BASIC_INFORMATION: u32 = 0; // peb address is the second field
 const WOW64_INFORMATION: u32 = 26; // 32-bit peb, zero when native
 const PEB_IMAGE_BASE_64: usize = 0x10;
 const PEB_IMAGE_BASE_32: usize = 0x08;
+const PEB_OS_VERSION_64: usize = 0x118;
+pub(crate) const OS_VERSION_SIZE: usize = 16; // major, minor, build, service pack, platform
+
+fn ask(process: HANDLE, class: u32, answer: &mut [usize]) -> Option<()> {
+    let length = u32::try_from(size_of_val(answer)).ok()?;
+    let status = unsafe {
+        NtQueryInformationProcess(
+            process,
+            class,
+            answer.as_mut_ptr().cast(),
+            length,
+            std::ptr::null_mut(),
+        )
+    };
+    (status >= 0).then_some(())
+}
+
+pub(crate) fn os_version() -> Option<[u8; OS_VERSION_SIZE]> {
+    static OS_VERSION: OnceLock<Option<[u8; OS_VERSION_SIZE]>> = OnceLock::new();
+
+    *OS_VERSION.get_or_init(|| {
+        let process = unsafe { GetCurrentProcess() };
+        let mut basic = [0usize; 6];
+        ask(process, BASIC_INFORMATION, &mut basic)?;
+
+        let mut fields = [0u8; OS_VERSION_SIZE];
+        let at = basic[1].checked_add(PEB_OS_VERSION_64)?;
+        read_memory(process, at, &mut fields).then_some(fields)
+    })
+}
 
 fn peb_image_base(pid: ProcessId) -> Option<usize> {
     let process =
         OwnedHandle::open(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ).ok()?;
-    let ask = |class: u32, answer: &mut [usize]| {
-        let length = u32::try_from(size_of_val(answer)).ok()?;
-        let status = unsafe {
-            NtQueryInformationProcess(
-                process.raw(),
-                class,
-                answer.as_mut_ptr().cast(),
-                length,
-                std::ptr::null_mut(),
-            )
-        };
-        (status >= 0).then_some(())
-    };
+    let ask = |class: u32, answer: &mut [usize]| ask(process.raw(), class, answer);
 
     let mut wow64 = [0usize; 1];
     ask(WOW64_INFORMATION, &mut wow64)?;
@@ -784,4 +813,52 @@ pub(crate) fn system_folder(kind: PeKind) -> Option<PathBuf> {
 
     let folder = buffer.get(..length).filter(|_| length != 0)?;
     Some(PathBuf::from(OsString::from_wide(folder)))
+}
+
+pub(crate) fn threads(pid: u32) -> AppResult<Vec<u32>> {
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }
+        .map(OwnedHandle::adopt)
+        .map_err(|error| windows_error("CreateToolhelp32Snapshot", error))?;
+
+    let mut entry = THREADENTRY32 {
+        dwSize: size_of::<THREADENTRY32>() as u32,
+        ..Default::default()
+    };
+    let mut found = Vec::new();
+    let mut more = unsafe { Thread32First(snapshot.raw(), &mut entry) }.is_ok();
+
+    while more {
+        if entry.th32OwnerProcessID == pid {
+            found.push(entry.th32ThreadID);
+        }
+        more = unsafe { Thread32Next(snapshot.raw(), &mut entry) }.is_ok();
+    }
+
+    Ok(found)
+}
+
+// where each thread began, as windows recorded it at creation
+pub(crate) fn thread_starts(pid: u32) -> Vec<usize> {
+    let Ok(ids) = threads(pid) else {
+        return Vec::new();
+    };
+
+    ids.into_iter()
+        .filter_map(|id| {
+            let thread = unsafe { OpenThread(THREAD_QUERY_INFORMATION, false, id) }
+                .map(OwnedHandle::adopt)
+                .ok()?;
+            let mut start = 0usize;
+            let status = unsafe {
+                NtQueryInformationThread(
+                    thread.raw(),
+                    THREAD_START_ADDRESS,
+                    (&raw mut start).cast(),
+                    size_of::<usize>() as u32,
+                    std::ptr::null_mut(),
+                )
+            };
+            (status >= 0 && start != 0).then_some(start)
+        })
+        .collect()
 }

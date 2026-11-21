@@ -596,6 +596,19 @@ fn capture_findings(findings: &mut Findings, capture: &dump::CaptureCounts) {
         );
     }
 
+    if !capture.headerless_live_code.is_empty() {
+        let bases = capture
+            .headerless_live_code
+            .iter()
+            .map(|base| format!("0x{base:016X}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        findings.push(
+            Level::Warn,
+            format!("Threads began in executable memory holding no PE, so its code is not in the dump: {bases} (--raw-regions writes it)"),
+        );
+    }
+
     if capture.locked_bytes > 0 {
         findings.push(
             Level::Note,

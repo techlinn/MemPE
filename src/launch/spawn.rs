@@ -6,9 +6,6 @@ use windows::Win32::Foundation::ERROR_ELEVATION_REQUIRED;
 use windows::Win32::System::Diagnostics::Debug::{
     DebugActiveProcessStop, DebugSetProcessKillOnExit,
 };
-use windows::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
-};
 use windows::Win32::System::JobObjects::{
     CreateJobObjectW, JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
@@ -24,7 +21,7 @@ use windows::Win32::System::Threading::{
 use windows::core::{PCWSTR, PWSTR};
 
 use crate::pe::PeKind;
-use crate::process::{OwnedHandle, system_folder};
+use crate::process::{OwnedHandle, system_folder, threads};
 use crate::windows_error;
 use crate::{AppError, AppResult};
 
@@ -105,28 +102,6 @@ pub(super) fn start(path: &Path, library: Option<PeKind>) -> AppResult<ChildProc
         .map_err(|error| windows_error("DebugSetProcessKillOnExit", error))?;
     unsafe { ResumeThread(thread.raw()) };
     Ok(child)
-}
-
-fn threads(pid: u32) -> AppResult<Vec<u32>> {
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }
-        .map(OwnedHandle::adopt)
-        .map_err(|error| windows_error("CreateToolhelp32Snapshot", error))?;
-
-    let mut entry = THREADENTRY32 {
-        dwSize: size_of::<THREADENTRY32>() as u32,
-        ..Default::default()
-    };
-    let mut found = Vec::new();
-    let mut more = unsafe { Thread32First(snapshot.raw(), &mut entry) }.is_ok();
-
-    while more {
-        if entry.th32OwnerProcessID == pid {
-            found.push(entry.th32ThreadID);
-        }
-        more = unsafe { Thread32Next(snapshot.raw(), &mut entry) }.is_ok();
-    }
-
-    Ok(found)
 }
 
 fn host(kind: PeKind) -> AppResult<PathBuf> {

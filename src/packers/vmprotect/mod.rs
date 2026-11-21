@@ -80,7 +80,7 @@ fn unpack(image: &PeImage<'_>, origin: &Origin<'_>) -> Option<Unpacked> {
         .chain(demutated.code.clone())
         .collect();
     let linked = imported_dlls(image);
-    let found = imports::resolve(&restored, bits, &layout, &code, &payload, origin, linked);
+    let mut found = imports::resolve(&restored, bits, &layout, &code, &payload, origin, linked);
 
     let stubs_confirmed = !found.resolved.is_empty(); // a branch into them reached an export
     let confirmed = stubs_confirmed
@@ -97,7 +97,10 @@ fn unpack(image: &PeImage<'_>, origin: &Origin<'_>) -> Option<Unpacked> {
     let x64 = model.kind == PeKind::Pe32Plus;
     let msvc = compiler_entry(&restored, model, &layout.code, origin.base)
         .is_some_and(|entry| !msvc_startup_slots(&restored, entry, x64, origin.base).is_empty());
-    let rebuilt = imports::rebuild(&mut restored, model, &found.resolved, msvc, origin);
+    let entries = found.vm_entries.iter().chain(&demutated.relocated.rejected);
+    found.virtualized =
+        imports::virtualized_calls(&restored, bits, &layout, origin, &found, entries);
+    let rebuilt = imports::rebuild(&mut restored, model, &found, msvc, origin);
     describe_imports(&mut report, &found, rebuilt.is_some());
 
     recover_directories(
@@ -186,9 +189,10 @@ impl Demutated {
                 ),
             });
         }
-        if *rejected > 0 {
+        if !rejected.is_empty() {
             report.notes.push(format!(
-                "{rejected} jumps into vmp's code left as they are: what they reach did not decode whole, ends in an indirect jump, or cleans to under {} instructions",
+                "{} jumps into vmp's code left as they are: what they reach did not decode whole, ends in an indirect jump, or cleans to under {} instructions",
+                rejected.len(),
                 demutation::MIN_REAL_INSNS
             ));
         }
@@ -204,7 +208,7 @@ impl Demutated {
             ));
         }
 
-        let uncleaned = *rejected > 0 || *unencodable > 0 || *truncated;
+        let uncleaned = !rejected.is_empty() || *unencodable > 0 || *truncated;
         if uncleaned {
             report.lost_with(
                 Part::MutatedCode,
@@ -312,6 +316,12 @@ fn describe_imports(report: &mut PackerReport, found: &imports::Found, rebuilt: 
         report.notes.push(format!(
             "{} tail jumps with a nop in front placed where no branch lands on the byte they cover (inferred: their stub never returns)",
             found.placed_by_branches
+        ));
+    }
+    if !found.virtualized.is_empty() {
+        report.notes.push(format!(
+            "{} imports only virtualized code calls were added to the table; those calls stay inside the virtual machine",
+            found.virtualized.len()
         ));
     }
     let left = found.unresolved.describe();

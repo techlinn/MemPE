@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::ops::Range;
 
 use iced_x86::{FlowControl, Instruction, Mnemonic};
@@ -14,6 +14,7 @@ use crate::pe::process_memory::ProcessMemory;
 const WRAPPER_BUDGET: usize = 1_000_000; // newer wrappers walk a module's whole export table before they jump
 const TRAMPOLINE_BUDGET: usize = 200_000;
 const VM_BUDGET: usize = 20_000_000;
+const VIRTUALIZED_BUDGET: usize = 2_000_000;
 const MAX_STUB_DATA: usize = 4_096;
 const LOCALS_SPACE: u64 = 0x1000;
 const MAX_API_CALLS: usize = 16;
@@ -77,6 +78,14 @@ impl StubRunner<'_> {
     // the vm runs its own api calls on its own deeper stack; the wrapped api is the one it jumps to on the caller's frame
     pub(crate) fn through_vm(&self, start: u64) -> Option<u64> {
         self.agreed(|cpu, seed| cpu.through_vm(start, seed))
+    }
+
+    pub(crate) fn virtualized_calls(
+        &self,
+        start: u64,
+        packer: &Range<u64>,
+    ) -> Option<BTreeSet<u64>> {
+        self.agreed(|cpu, seed| cpu.virtualized_calls(start, packer, seed))
     }
 
     pub(crate) fn stub_value(&self, site: u64, length: u64) -> Option<HiddenValue> {
@@ -286,6 +295,47 @@ impl Cpu<'_> {
                 let result = self.fresh_buffer()?; // non-zero for a flag, usable memory for an allocation
                 self.skip_api_call_returning(frame, result)?;
                 continue;
+            }
+
+            let insn = self.fetch()?;
+            self.step(&insn)?;
+        }
+
+        None
+    }
+
+    fn virtualized_calls(
+        &mut self,
+        start: u64,
+        packer: &Range<u64>,
+        seed: u64,
+    ) -> Option<BTreeSet<u64>> {
+        self.poison_registers(seed);
+        let frame = self.gpr[RSP];
+        self.gpr[RBP] = frame.checked_add(LOCALS_SPACE)?; // mid function locals
+        let mut apis = BTreeSet::new();
+        self.rip = start;
+
+        for _ in 0..VIRTUALIZED_BUDGET {
+            let outside = !self.in_image(self.rip);
+            let sp = self.gpr[RSP];
+            if outside && sp > frame {
+                return Some(apis); // the function the region ends in returned to its caller
+            }
+
+            if outside {
+                apis.insert(self.rip);
+                if apis.len() > MAX_VM_API_CALLS {
+                    return None;
+                }
+
+                let result = self.fresh_buffer()?;
+                self.skip_api_call_returning(frame, result)?;
+                continue;
+            }
+
+            if !packer.contains(&self.rip) && sp == frame {
+                return Some(apis);
             }
 
             let insn = self.fetch()?;

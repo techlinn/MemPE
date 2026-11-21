@@ -274,9 +274,9 @@ fn has_indirect_branch(cleaned: &Cleaned) -> bool {
 pub(super) struct Relocated {
     pub(super) code: Vec<u8>, // new section; vmp reuses emptied space
     pub(super) moved: Vec<Moved>,
-    pub(super) rejected: usize, // jumps into the payload that did not clean
-    pub(super) unencodable: usize, // cleaned, but the encoder refused them
-    pub(super) truncated: bool, // more targets than MAX_TARGETS
+    pub(super) rejected: Vec<usize>, // jump targets in the payload that did not clean: vm entries or junk
+    pub(super) unencodable: usize,   // cleaned, but the encoder refused them
+    pub(super) truncated: bool,      // more targets than MAX_TARGETS
 }
 
 pub(super) struct Moved {
@@ -305,7 +305,7 @@ pub(super) fn reencode(
 
         let cleaned = clean(image, base, bits, base + target as u64, payload);
         if !cleanable(&cleaned) {
-            relocated.rejected += 1;
+            relocated.rejected.push(target);
             continue;
         }
 

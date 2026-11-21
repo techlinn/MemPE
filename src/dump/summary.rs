@@ -106,6 +106,7 @@ pub(crate) struct DumpSummary {
 
 pub(crate) struct CaptureCounts {
     pub(crate) executable_non_image_allocations: usize,
+    pub(crate) headerless_live_code: Vec<usize>,
     pub(crate) unscanned_bytes: usize,
     pub(crate) locked_bytes: usize, // no access, and the snapshot would not lift it
     pub(crate) skipped: SkippedImages,
