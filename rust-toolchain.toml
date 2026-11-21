@@ -1,0 +1,4 @@
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt", "rust-analyzer"]
+targets = ["x86_64-pc-windows-msvc"]

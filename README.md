@@ -25,23 +25,27 @@
 
 Packers can hide a program on disk all they want. The moment it runs, the real thing has to be sitting in memory, and that's where mempe grabs it.
 
-It takes every module in the process, lays each one back out the way a file on disk expects, rebuilds the imports, and writes PE files that IDA, Ghidra or your favorite debugger will open without complaining. If it knows the packer, it goes a step further and hands you the original program back.
+Give it a packed file and it starts it, lets the packer do its work and stops at the original entry point. Or point it at a process that's already running. Either way it takes every module in the process, lays each one back out the way a file on disk expects, rebuilds the imports, and writes PE files that IDA, Ghidra or your favorite debugger will open without complaining. If it knows the packer, it goes a step further and hands you the original program back.
 
-Here it is on a UPX-packed crackme that's sitting at its password prompt:
+Here it is on a UPX-packed crackme:
 
 ```text
-> mempe.exe -p 28884
+> mempe.exe upx_crackme.exe
+
+LAUNCH
+  Stopped    at the original entry point, 0x00002700
+  Method     debugger
 
 TARGET
-  Name       upx_packed_binary.exe
+  Name       upx_crackme.exe
   Arch       x64
 
 OUTPUT
-  Main       .\mempe\upx_packed_binary.exe
+  Main       .\mempe\upx_crackme.exe
   Entry      0x00002700 (.text, unwind-covered)
-  Packer     UPX 5.30, restored headers, entry point, imports, relocations, resources, debug directory (CodeView entry)
+  Packer     UPX 5.30, restored headers, original entry point, imports, relocations, resources
   Lost       debug entries the packer erased
-  DLLs       29
+  DLLs       30
 
 DONE  Analysis-ready memory images
 ```
@@ -51,7 +55,7 @@ DONE  Analysis-ready memory images
 ## What you get
 
 - Every EXE and DLL in an x86 or x64 process, rebuilt from its in-memory layout into a normal PE file
-- Imports put back together, even when the packer trashed the import table
+- Imports put back together, even when the packer trashed the import table or swapped every call for a stub
 - PEs that were mapped by hand or stashed in random memory, the kind the module list never shows you
 - Packers undone when mempe knows them (see [the table](#supported-packers))
 - For UPX, ASPack, MPRESS, PECompact, FSG and MEW, a second copy that starts on its own, built with the data the program began with
@@ -61,7 +65,9 @@ DONE  Analysis-ready memory images
 
 ```mermaid
 flowchart TB
-    process(["Running process"]) --> capture["Snapshot memory and<br/>find every PE in it"]
+    file(["Packed file"]) --> launch["Start it, stop at<br/>the original entry point"]
+    process(["Running process"]) --> capture
+    launch --> capture["Snapshot memory and<br/>find every PE in it"]
     capture --> known{"Known packer?"}
     known -- yes --> module["Packer module puts<br/>the original back"]
     known -- no --> repair["Headers repaired<br/>from memory evidence"]
@@ -73,14 +79,16 @@ flowchart TB
     classDef step fill:#8b949e1a,stroke:#8b949e,stroke-width:1px
     classDef decision fill:#d299221a,stroke:#d29922,stroke-width:2px
     classDef packer fill:#3fb9501a,stroke:#3fb950,stroke-width:2px
-    class process,output endpoint
-    class capture,repair,rebuild step
+    class file,process,output endpoint
+    class launch,capture,repair,rebuild step
     class known decision
     class module packer
     linkStyle default stroke:#8b949e,stroke-width:2px
 ```
 
-mempe snapshots the process, finds every module plus any PE hiding in non-image memory, and checks each one against its packer modules. A packer it knows gets undone properly. Anything else is repaired from what the memory shows. Either way, the image is rebuilt into file layout, its imports are recovered, and you get a PE file plus a report.
+When mempe starts a file, it runs it under a debugger that hides itself from the usual anti-debug checks, takes execute rights away from the program's code, and stops on the first instruction that runs there. VMProtect asks the kernel directly whether it's being debugged, so for those files mempe puts a small exception handler in the process instead.
+
+From there it snapshots the process, finds every module plus any PE hiding in non-image memory, and checks each one against its packer modules. A packer it knows gets undone properly, with its own decompressors and an x86/x64 emulator for the stubs that hide imports. Anything else is repaired from what the memory shows. Either way, the image is rebuilt into file layout, its imports are recovered, and you get a PE file plus a report.
 
 ## Supported packers
 
@@ -92,21 +100,25 @@ mempe snapshots the process, finds every module plus any PE hiding in non-image 
 | PECompact | Supported | 2.3, 2.67 and 3.11, plus five other 2.x builds from 2005 and 2006 |
 | FSG | Supported | 1.0, 1.1, 1.2, 1.3, 1.31, 1.33, 2.0 and modified stubs |
 | MEW | Supported | 5, 10, 11 SE 1.2 and modified stubs |
-| VMProtect | Supported | 3.9.4 and 3.9.6 |
+| Themida / WinLicense | Supported | 3.1.8 and 3.2.4, x86 and x64 |
+| VMProtect | Supported | 3.9.4 and 3.9.6, x86 and x64 |
 | Enigma Protector | Planned | - |
 | Enigma Virtual Box | Planned | - |
 | Obsidium | Planned | - |
-| Themida / WinLicense | Supported | 3.1.8 and 3.2.4, x86 and x64 |
 | Code Virtualizer | Planned | - |
 | Anything else | Generic dump | Any |
 
 Anything missing? [Open an issue](https://github.com/techlinn/MemPE/issues) and I'll add it.
 
-Each packer lives in its own file under [`src/pe/packers/`](src/pe/packers), so adding one doesn't touch the rest of the tool.
-
 ## Usage
 
-Grab `mempe-windows-x86_64.zip` from the [latest release](https://github.com/techlinn/MemPE/releases/latest). It's one exe with nothing to install, and it dumps 32-bit and 64-bit processes alike.
+Grab `mempe-windows-x86_64.zip` from the [latest release](https://github.com/techlinn/MemPE/releases/latest). It's one exe with nothing to install, and it handles 32-bit and 64-bit targets alike.
+
+Start a packed file and dump it at its entry point (DLLs work too):
+
+```text
+mempe.exe target.exe
+```
 
 Dump a running process by PID (hex works too, like `0x1078`):
 
@@ -122,14 +134,16 @@ mempe.exe -w target.exe
 
 | Option | What it does |
 |---|---|
-| `-e`, `--entry-point <rva>` | You already found the OEP? Tell mempe and it uses that |
+| `-e`, `--entry-point <rva>` | You already found the OEP? Give its RVA in hex and mempe uses that |
 | `--only <name or base>` | Only write the images you care about. Everything is still captured, so imports resolve the same |
 | `--raw-regions` | Also save executable memory with no PE in it, like shellcode |
+| `-o`, `--output <folder>` | Write somewhere other than the `mempe` folder |
+| `--timeout <seconds>` | How long a started file gets to reach its entry point (60 by default) |
 | `-h`, `--help` | Shows the help |
 
-Everything lands in a `mempe` folder in the current directory.
+Everything lands in a `mempe` folder in the current directory, with a `report.txt` next to the dumps.
 
-A dump keeps the data exactly as it was while the program ran, decrypted strings and all, so a program that sets itself up at startup usually crashes if you start the dump. For UPX, ASPack, MPRESS, PECompact, FSG and MEW, mempe can read the data the program started with out of the packed file. When the running data differs, it asks once whether to also save a copy like `target.fresh.exe` that starts on its own. The main dump never changes. When nobody is there to answer, like in a script, it saves the copy.
+A dump keeps the data exactly as it was while the program ran, so a program that sets itself up at startup usually crashes if you start the dump. For UPX, ASPack, MPRESS, PECompact, FSG and MEW, mempe can read the data the program started with out of the packed file, and offers to save a copy like `target.fresh.exe` that starts on its own. The main dump never changes.
 
 To build it yourself, you need Windows 10 or later and stable Rust:
 
@@ -138,11 +152,11 @@ cargo build --release
 ```
 
 > [!CAUTION]
-> mempe dumps a process that's already running, so whatever you're dumping has to run first. If it's malware, do this in a VM.
+> When mempe starts a file, the packer's code runs. With `-p` and `-w` the whole program has already run. If it's malware, do this in a VM.
 
 ## Limitations
 
-- Let the program unpack itself before you dump it. Go too early and you'll get the packed bytes back, though mempe will warn you when a section looks like it was never decrypted.
+- With `-p` and `-w`, let the program unpack itself before you dump it. Go too early and you'll get the packed bytes back, though mempe will warn you when a section looks like it was never decrypted.
 - Only x86 and x64 Windows PE files are supported.
 - mempe needs permission to read the target. Elevated targets need an elevated terminal, and protected processes can still say no.
 - Heavy API hashing or custom loaders can leave some imports unresolved. mempe counts those instead of dropping them quietly.
@@ -156,15 +170,15 @@ mempe is about getting clean files out of a process. If you want to sweep proces
 
 | Code | Meaning |
 |---|---|
-| `0` | The main image and all known DLLs were rebuilt |
-| `1` | Invalid arguments, cancelled output, or output setup failed |
-| `2` | The target could not be queried, captured, or written |
-| `3` | Some output was written, but the main image or one or more DLLs failed |
+| `0` | Done |
+| `1` | Invalid arguments, or you cancelled |
+| `2` | Nothing was written |
+| `3` | Something was written, but not everything; the last line says what's missing |
 
 ## Issues and contributing
 
-Hit a bug, a dump that came out wrong, or a packer mempe should know about? [Open an issue](https://github.com/techlinn/MemPE/issues) and I'll take a look. If you're reporting a bad dump, the console output helps a lot, and so does the packer the target was built with.
+Hit a bug, a dump that came out wrong, or a packer mempe should know about? [Open an issue](https://github.com/techlinn/MemPE/issues) and I'll take a look. If you're reporting a bad dump, `report.txt` helps a lot, and so does the packer the target was built with.
 
-Pull requests are welcome too. A new packer is a good place to start, since each one lives in its own file under [`src/pe/packers/`](src/pe/packers).
+Pull requests are welcome too. A new packer is a good place to start, since each one lives in its own file or folder under [`src/packers/`](src/packers).
 
 MIT licensed. See [LICENSE](LICENSE).

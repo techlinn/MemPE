@@ -5,29 +5,27 @@ on:
     branches:
       - main
   pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
 
 jobs:
-  build:
+  check:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-msvc
-          components: clippy, rustfmt
+        run: rustup show # rust-toolchain.toml pins the version and components
+
+      - uses: Swatinem/rust-cache@v2
 
       - name: Format
         run: cargo fmt --check
 
-      - name: Build
-        run: cargo build --release --target x86_64-pc-windows-msvc
-        env:
-          RUSTFLAGS: "-C target-feature=+crt-static"
-
-      - name: Test
-        run: cargo test --target x86_64-pc-windows-msvc
-
       - name: Clippy
-        run: cargo clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings
+        run: cargo clippy --locked --release --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --locked --release

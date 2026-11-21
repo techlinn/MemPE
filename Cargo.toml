@@ -1,12 +1,15 @@
 [package]
 name = "mempe"
-version = "0.5.23"
+version = "0.6.0"
 edition = "2024"
+rust-version = "1.96"
 license = "MIT"
 description = "Windows PE memory dumper and rebuilder for reverse engineering"
+repository = "https://github.com/techlinn/MemPE"
+publish = false
 
 [dependencies]
-iced-x86 = { version = "1.22.0", default-features = false, features = ["std", "decoder", "instr_info", "encoder", "block_encoder"] }
+iced-x86 = { version = "1.22.0", default-features = false, features = ["std", "decoder", "instr_info", "encoder", "block_encoder", "code_asm"] }
 windows = { version = "0.62.2", default-features = false, features = [
     "Win32_Foundation",
     "Win32_Security",
@@ -15,6 +18,8 @@ windows = { version = "0.62.2", default-features = false, features = [
     "Win32_System_Diagnostics_ProcessSnapshotting",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Console",
+    "Win32_System_JobObjects",
+    "Win32_System_Kernel",
     "Win32_System_Memory",
     "Win32_System_ProcessStatus",
     "Win32_System_SystemInformation",

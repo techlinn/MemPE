@@ -1,0 +1,140 @@
+pub(crate) const RELOCS_STRIPPED: u16 = 0x0001;
+pub(crate) const FILE_CHARACTERISTICS_OFFSET: usize = 22; // from the nt signature
+pub(crate) const DOS_MAGIC: u16 = 0x5A4D; // "MZ"
+pub(crate) const DOS_HEADER_SIZE: usize = 64;
+pub(crate) const DOS_LFANEW_OFFSET: usize = 0x3C;
+pub(crate) const PE_SIGNATURE: &[u8; 4] = b"PE\0\0";
+pub(crate) const TIMESTAMP_OFFSET: usize = 8; // in the file header
+pub(crate) const IMAGE_FILE_EXECUTABLE_IMAGE: u16 = 0x0002;
+pub(crate) const FILE_HEADER_SIZE: usize = 20;
+pub(crate) const MACHINE_OFFSET: usize = 4; // from the nt signature
+pub(crate) const SECTION_COUNT_OFFSET: usize = 6;
+pub(crate) const OPTIONAL_SIZE_OFFSET: usize = 20;
+
+pub(crate) const DYNAMIC_BASE: u16 = 0x0040;
+pub(crate) const PE32_MAGIC: u16 = 0x010B;
+pub(crate) const PE32_PLUS_MAGIC: u16 = 0x020B;
+pub(crate) const SIZE_OF_CODE_OFFSET: usize = 4; // in the optional header, both widths
+pub(crate) const SIZE_OF_INITIALIZED_DATA_OFFSET: usize = 8;
+pub(crate) const SIZE_OF_UNINITIALIZED_DATA_OFFSET: usize = 12;
+pub(crate) const ENTRY_POINT_OFFSET: usize = 16;
+pub(crate) const BASE_OF_CODE_OFFSET: usize = 20;
+pub(crate) const SECTION_ALIGNMENT_OFFSET: usize = 32;
+pub(crate) const FILE_ALIGNMENT_OFFSET: usize = 36;
+pub(crate) const SIZE_OF_IMAGE_OFFSET: usize = 56;
+pub(crate) const SIZE_OF_HEADERS_OFFSET: usize = 60;
+pub(crate) const CHECKSUM_OFFSET: usize = 64;
+pub(crate) const SUBSYSTEM_OFFSET: usize = 68;
+pub(crate) const DLL_CHARACTERISTICS_OFFSET: usize = 70;
+
+pub(crate) const EXPORT_DIRECTORY: usize = 0;
+pub(crate) const IMPORT_DIRECTORY: usize = 1;
+pub(crate) const RESOURCE_DIRECTORY: usize = 2;
+pub(crate) const EXCEPTION_DIRECTORY: usize = 3;
+pub(crate) const SECURITY_DIRECTORY: usize = 4;
+pub(crate) const BASERELOC_DIRECTORY: usize = 5;
+pub(crate) const DEBUG_DIRECTORY: usize = 6;
+pub(crate) const TLS_DIRECTORY: usize = 9;
+pub(crate) const LOAD_CONFIG_DIRECTORY: usize = 10;
+pub(crate) const BOUND_IMPORT_DIRECTORY: usize = 11;
+pub(crate) const IAT_DIRECTORY: usize = 12;
+pub(crate) const DELAY_IMPORT_DIRECTORY: usize = 13;
+pub(crate) const CLR_DIRECTORY: usize = 14;
+pub(crate) const RESERVED_DIRECTORY: usize = 15;
+pub(crate) const DIRECTORY_COUNT: usize = 16;
+pub(crate) const DIRECTORY_ENTRY_SIZE: usize = 8;
+
+pub(crate) const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+pub(crate) const IMAGE_SCN_MEM_READ: u32 = 0x4000_0000;
+pub(crate) const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
+pub(crate) const SECTION_HEADER_SIZE: usize = 40;
+pub(crate) const IMAGE_SCN_MEM_DISCARDABLE: u32 = 0x0200_0000;
+pub(crate) const IMAGE_SCN_CNT_CODE: u32 = 0x0000_0020;
+pub(crate) const IMAGE_SCN_CNT_INITIALIZED_DATA: u32 = 0x0000_0040;
+pub(crate) const IMAGE_SCN_CNT_UNINITIALIZED_DATA: u32 = 0x0000_0080;
+pub(crate) const SECTION_NAME_SIZE: usize = 8;
+pub(crate) const SECTION_VIRTUAL_SIZE_OFFSET: usize = 8; // in a section header
+pub(crate) const SECTION_RVA_OFFSET: usize = 12;
+pub(crate) const SECTION_RAW_SIZE_OFFSET: usize = 16;
+pub(crate) const SECTION_RAW_POINTER_OFFSET: usize = 20;
+pub(crate) const SECTION_CHARACTERISTICS_OFFSET: usize = 36;
+
+pub(crate) const IMPORT_DESCRIPTOR_SIZE: usize = 20;
+pub(crate) const HINT_SIZE: usize = 2; // before an import's name
+pub(crate) const IMPORT_LOOKUP_OFFSET: usize = 0; // in an import descriptor
+pub(crate) const IMPORT_NAME_OFFSET: usize = 12;
+pub(crate) const IMPORT_IAT_OFFSET: usize = 16;
+
+pub(crate) const DELAY_DESCRIPTOR_SIZE: usize = 32;
+pub(crate) const DELAY_ATTRIBUTES_OFFSET: usize = 0; // in a delay descriptor
+pub(crate) const DELAY_NAME_OFFSET: usize = 4;
+pub(crate) const DELAY_IAT_OFFSET: usize = 12;
+pub(crate) const DELAY_HANDLE_OFFSET: usize = 8;
+pub(crate) const DELAY_INT_OFFSET: usize = 16;
+pub(crate) const DELAY_BOUND_IAT_OFFSET: usize = 20;
+pub(crate) const DELAY_UNLOAD_OFFSET: usize = 24;
+pub(crate) const DELAY_ATTRIBUTES_RVA_BASED: u32 = 1;
+
+pub(crate) const EXPORT_DIRECTORY_SIZE: usize = 40;
+pub(crate) const EXPORT_NAME_OFFSET: usize = 12; // in the export directory
+pub(crate) const EXPORT_ORDINAL_BASE_OFFSET: usize = 16;
+pub(crate) const EXPORT_FUNCTION_COUNT_OFFSET: usize = 20;
+pub(crate) const EXPORT_NAME_COUNT_OFFSET: usize = 24;
+pub(crate) const EXPORT_FUNCTIONS_OFFSET: usize = 28;
+pub(crate) const EXPORT_NAMES_OFFSET: usize = 32;
+pub(crate) const EXPORT_ORDINALS_OFFSET: usize = 36;
+pub(crate) const EXPORT_ENTRY_SIZE: usize = 4;
+pub(crate) const EXPORT_ORDINAL_SIZE: usize = 2;
+
+pub(crate) const RELOCATION_ABSOLUTE: u16 = 0;
+pub(crate) const RELOCATION_HIGH: u16 = 1;
+pub(crate) const RELOCATION_LOW: u16 = 2;
+pub(crate) const RELOCATION_HIGHLOW: u16 = 3;
+pub(crate) const RELOCATION_HIGH_ADJUST: u16 = 4; // takes two entries
+pub(crate) const RELOCATION_DIR64: u16 = 10;
+pub(crate) const RELOCATION_OFFSET_MASK: u16 = 0x0FFF;
+pub(crate) const RELOCATION_BLOCK_HEADER: usize = 8; // page rva and block size
+pub(crate) const RELOCATION_KIND_SHIFT: u16 = 12;
+
+pub(crate) const RUNTIME_FUNCTION_SIZE: usize = 12;
+pub(crate) const FUNCTION_END_OFFSET: usize = 4; // in a runtime function
+pub(crate) const UNWIND_VERSION_MASK: u8 = 0x07; // in the first byte of the unwind info
+pub(crate) const UNWIND_CHAINED: u32 = 1; // the rva names another runtime function, not unwind info
+pub(crate) const UNWIND_INFO_OFFSET: usize = 8; // in a runtime function
+
+pub(crate) const DEBUG_ENTRY_SIZE: usize = 28;
+pub(crate) const DEBUG_TYPE_OFFSET: usize = 12; // in a debug entry
+pub(crate) const DEBUG_SIZE_OFFSET: usize = 16;
+pub(crate) const DEBUG_ADDRESS_OFFSET: usize = 20;
+pub(crate) const DEBUG_POINTER_OFFSET: usize = 24;
+
+pub(crate) const TLS_POINTER_FIELDS: usize = 4; // raw data start and end, index, callbacks
+pub(crate) const TLS_START_FIELD: usize = 0; // in pointer widths
+pub(crate) const TLS_END_FIELD: usize = 1;
+pub(crate) const TLS_INDEX_FIELD: usize = 2;
+pub(crate) const TLS_CALLBACKS_FIELD: usize = 3;
+pub(crate) const TLS_DIRECTORY_PE32: usize = 24;
+pub(crate) const TLS_DIRECTORY_PE32_PLUS: usize = 40;
+
+pub(crate) const GUARD_FLAGS_PE32: usize = 0x58; // in the load config
+pub(crate) const GUARD_FLAGS_PE32_PLUS: usize = 0x90;
+pub(crate) const GUARD_CHECK_PE32: usize = 0x48;
+pub(crate) const GUARD_CHECK_PE32_PLUS: usize = 0x70;
+pub(crate) const LOAD_CONFIG_HANDLERS_PE32: usize = 0x40; // safeseh table, then its count
+pub(crate) const SAFESEH_HANDLER_SIZE: usize = 4;
+
+pub(crate) const PAGE_SHIFT: u32 = 12;
+pub(crate) const PAGE_SIZE: usize = 1 << PAGE_SHIFT;
+pub(crate) const PAGE_RESIDENT: u8 = 0b01;
+pub(crate) const PAGE_PRIVATE: u8 = 0b10;
+pub(crate) const MODULE_ALIGNMENT: u32 = 0x1_0000; // image bases and module handles
+pub(crate) const NTDLL: &str = "ntdll.dll";
+
+pub(crate) const MAX_RELOCATIONS: usize = 1 << 22;
+pub(crate) const MAX_SAFESEH_HANDLERS: u32 = 0x1_0000;
+pub(crate) const MAX_IMPORTS: usize = 65_536;
+pub(crate) const MAX_EXPORTS: usize = 1 << 16; // name ordinals and import ordinals are 16 bits
+pub(crate) const MAX_IMAGE_SIZE: usize = 1 << 30;
+pub(crate) const MAX_NAME_LENGTH: usize = 4_096;
+pub(crate) const MAX_DEBUG_ENTRIES: usize = 256;
+pub(crate) const MAX_IMPORT_DESCRIPTORS: usize = 4_096;
